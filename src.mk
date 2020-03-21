@@ -59,6 +59,7 @@ LIB_SOURCES =                                                   \
   db/trim_history_scheduler.cc                                  \
   db/version_builder.cc                                         \
   db/version_edit.cc                                            \
+  db/version_edit_handler.cc                                    \
   db/version_set.cc                                             \
   db/wal_manager.cc                                             \
   db/write_batch.cc                                             \
@@ -395,6 +396,7 @@ MAIN_SOURCES =                                                          \
   env/env_test.cc                                                       \
   env/io_posix_test.cc                                                  \
   env/mock_env_test.cc                                                  \
+  file/random_access_file_reader_test.cc                                \
   logging/auto_roll_logger_test.cc                                      \
   logging/env_logger_test.cc                                            \
   logging/event_logger_test.cc                                          \
