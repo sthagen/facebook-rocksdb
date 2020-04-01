@@ -57,9 +57,6 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
           cf_options.purge_redundant_kvs_while_flush),
       use_fsync(db_options.use_fsync),
       compression_per_level(cf_options.compression_per_level),
-      bottommost_compression(cf_options.bottommost_compression),
-      bottommost_compression_opts(cf_options.bottommost_compression_opts),
-      compression_opts(cf_options.compression_opts),
       level_compaction_dynamic_level_bytes(
           cf_options.level_compaction_dynamic_level_bytes),
       access_hint_on_compaction_start(
@@ -78,7 +75,7 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
           cf_options.memtable_insert_with_hint_prefix_extractor.get()),
       cf_paths(cf_options.cf_paths),
       compaction_thread_limiter(cf_options.compaction_thread_limiter),
-      sst_file_checksum_func(db_options.sst_file_checksum_func.get()) {}
+      file_checksum_gen_factory(db_options.file_checksum_gen_factory.get()) {}
 
 // Multiple two operands. If they overflow, return op1.
 uint64_t MultiplyCheckOverflow(uint64_t op1, double op2) {

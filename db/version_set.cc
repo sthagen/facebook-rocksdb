@@ -1897,8 +1897,8 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
     get_ctx.emplace_back(
         user_comparator(), merge_operator_, info_log_, db_statistics_,
         iter->s->ok() ? GetContext::kNotFound : GetContext::kMerge, iter->ukey,
-        iter->value, /*timestamp*/ nullptr, nullptr, &(iter->merge_context),
-        true, &iter->max_covering_tombstone_seq, this->env_, nullptr,
+        iter->value, iter->timestamp, nullptr, &(iter->merge_context), true,
+        &iter->max_covering_tombstone_seq, this->env_, nullptr,
         merge_operator_ ? &pinned_iters_mgr : nullptr, callback, is_blob,
         tracing_mget_id);
     // MergeInProgress status, if set, has been transferred to the get_context
@@ -2597,6 +2597,19 @@ void VersionStorageInfo::AddFile(int level, FileMetaData* f, Logger* info_log) {
 #endif
   f->refs++;
   level_files->push_back(f);
+}
+
+void VersionStorageInfo::AddBlobFile(
+    std::shared_ptr<BlobFileMetaData> blob_file_meta) {
+  assert(blob_file_meta);
+
+  const uint64_t blob_file_number = blob_file_meta->GetBlobFileNumber();
+
+  auto it = blob_files_.lower_bound(blob_file_number);
+  assert(it == blob_files_.end() || it->first != blob_file_number);
+
+  blob_files_.insert(
+      it, BlobFiles::value_type(blob_file_number, std::move(blob_file_meta)));
 }
 
 // Version::PrepareApply() need to be called before calling the function, or
@@ -3441,6 +3454,21 @@ std::string Version::DebugString(bool hex, bool print_stats) const {
       r.append("\n");
     }
   }
+
+  const auto& blob_files = storage_info_.GetBlobFiles();
+  if (!blob_files.empty()) {
+    r.append("--- blob files --- version# ");
+    AppendNumberTo(&r, version_number_);
+    r.append(" ---\n");
+    for (const auto& pair : blob_files) {
+      const auto& blob_file_meta = pair.second;
+      assert(blob_file_meta);
+
+      r.append(blob_file_meta->DebugString());
+      r.push_back('\n');
+    }
+  }
+
   return r;
 }
 
@@ -3768,6 +3796,7 @@ Status VersionSet::ProcessManifestWrites(
 
   uint64_t new_manifest_file_size = 0;
   Status s;
+  IOStatus io_s;
 
   assert(pending_manifest_file_number_ == 0);
   if (!descriptor_log_ ||
@@ -3811,7 +3840,7 @@ Status VersionSet::ProcessManifestWrites(
                builder_guards.size() == versions.size());
         ColumnFamilyData* cfd = versions[i]->cfd_;
         s = builder_guards[i]->version_builder()->LoadTableHandlers(
-            cfd->internal_stats(), cfd->ioptions()->optimize_filters_for_hits,
+            cfd->internal_stats(), 1 /* max_threads */,
             true /* prefetch_index_and_filter_in_cache */,
             false /* is_initial_load */,
             mutable_cf_options_ptrs[i]->prefix_extractor.get());
@@ -3878,15 +3907,19 @@ Status VersionSet::ProcessManifestWrites(
         }
         ++idx;
 #endif /* !NDEBUG */
-        s = descriptor_log_->AddRecord(record);
-        if (!s.ok()) {
+        io_s = descriptor_log_->AddRecord(record);
+        if (!io_s.ok()) {
+          io_status_ = io_s;
+          s = io_s;
           break;
         }
       }
       if (s.ok()) {
-        s = SyncManifest(env_, db_options_, descriptor_log_->file());
+        io_s = SyncManifest(env_, db_options_, descriptor_log_->file());
       }
-      if (!s.ok()) {
+      if (!io_s.ok()) {
+        io_status_ = io_s;
+        s = io_s;
         ROCKS_LOG_ERROR(db_options_->info_log, "MANIFEST write %s\n",
                         s.ToString().c_str());
       }
@@ -3895,8 +3928,12 @@ Status VersionSet::ProcessManifestWrites(
     // If we just created a new descriptor file, install it by writing a
     // new CURRENT file that points to it.
     if (s.ok() && new_descriptor_log) {
-      s = SetCurrentFile(env_, dbname_, pending_manifest_file_number_,
-                         db_directory);
+      io_s = SetCurrentFile(fs_, dbname_, pending_manifest_file_number_,
+                            db_directory);
+      if (!io_s.ok()) {
+        io_status_ = io_s;
+        s = io_s;
+      }
       TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:AfterNewManifest");
     }
 
@@ -4928,9 +4965,10 @@ Status VersionSet::DumpManifest(Options& options, std::string& dscname,
   Status s;
   {
     std::unique_ptr<FSSequentialFile> file;
-    s = options.file_system->NewSequentialFile(
+    const std::shared_ptr<FileSystem>& fs = options.env->GetFileSystem();
+    s = fs->NewSequentialFile(
         dscname,
-        options.file_system->OptimizeForManifestRead(file_options_), &file,
+        fs->OptimizeForManifestRead(file_options_), &file,
         nullptr);
     if (!s.ok()) {
       return s;
@@ -5160,15 +5198,15 @@ Status VersionSet::WriteCurrentStateToManifest(
     VersionEdit edit_for_db_id;
     assert(!db_id_.empty());
     edit_for_db_id.SetDBId(db_id_);
-    edit_for_db_id.SetStateUponManifestSwitch(true);
     std::string db_id_record;
     if (!edit_for_db_id.EncodeTo(&db_id_record)) {
       return Status::Corruption("Unable to Encode VersionEdit:" +
                                 edit_for_db_id.DebugString(true));
     }
-    Status add_record = log->AddRecord(db_id_record);
-    if (!add_record.ok()) {
-      return add_record;
+    IOStatus io_s = log->AddRecord(db_id_record);
+    if (!io_s.ok()) {
+      io_status_ = io_s;
+      return std::move(io_s);
     }
   }
 
@@ -5186,7 +5224,6 @@ Status VersionSet::WriteCurrentStateToManifest(
         edit.AddColumnFamily(cfd->GetName());
         edit.SetColumnFamily(cfd->GetID());
       }
-      edit.SetStateUponManifestSwitch(true);
       edit.SetComparatorName(
           cfd->internal_comparator().user_comparator()->Name());
       std::string record;
@@ -5194,9 +5231,10 @@ Status VersionSet::WriteCurrentStateToManifest(
         return Status::Corruption(
             "Unable to Encode VersionEdit:" + edit.DebugString(true));
       }
-      Status s = log->AddRecord(record);
-      if (!s.ok()) {
-        return s;
+      IOStatus io_s = log->AddRecord(record);
+      if (!io_s.ok()) {
+        io_status_ = io_s;
+        return std::move(io_s);
       }
     }
 
@@ -5204,7 +5242,6 @@ Status VersionSet::WriteCurrentStateToManifest(
       // Save files
       VersionEdit edit;
       edit.SetColumnFamily(cfd->GetID());
-      edit.SetStateUponManifestSwitch(true);
 
       for (int level = 0; level < cfd->NumberLevels(); level++) {
         for (const auto& f :
@@ -5226,22 +5263,14 @@ Status VersionSet::WriteCurrentStateToManifest(
         return Status::Corruption(
             "Unable to Encode VersionEdit:" + edit.DebugString(true));
       }
-      Status s = log->AddRecord(record);
-      if (!s.ok()) {
-        return s;
+      IOStatus io_s = log->AddRecord(record);
+      if (!io_s.ok()) {
+        io_status_ = io_s;
+        return std::move(io_s);
       }
     }
   }
-  VersionEdit end_flag;
-  end_flag.SetStateUponManifestSwitch(true);
-  end_flag.SetManifestSwitched(true);
-  std::string end_record;
-  if (!end_flag.EncodeTo(&end_record)) {
-    return Status::Corruption("Unable to Encode VersionEdit:" +
-                              end_flag.DebugString(true));
-  }
-  Status s_end_record = log->AddRecord(end_record);
-  return  s_end_record;
+  return Status::OK();
 }
 
 // TODO(aekmekji): in CompactionJob::GenSubcompactionBoundaries(), this
