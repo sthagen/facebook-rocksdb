@@ -599,6 +599,7 @@ struct TestArgs {
   bool reverse_compare;
   int restart_interval;
   CompressionType compression;
+  uint32_t compression_parallel_threads;
   uint32_t format_version;
   bool use_mmap;
 };
@@ -616,6 +617,7 @@ static std::vector<TestArgs> GenerateArgList() {
       MEMTABLE_TEST, DB_TEST};
   std::vector<bool> reverse_compare_types = {false, true};
   std::vector<int> restart_intervals = {16, 1, 1024};
+  std::vector<uint32_t> compression_parallel_threads = {1, 4};
 
   // Only add compression if it is supported
   std::vector<std::pair<CompressionType, bool>> compression_types;
@@ -658,6 +660,7 @@ static std::vector<TestArgs> GenerateArgList() {
         one_arg.reverse_compare = reverse_compare;
         one_arg.restart_interval = restart_intervals[0];
         one_arg.compression = compression_types[0].first;
+        one_arg.compression_parallel_threads = 1;
         one_arg.use_mmap = true;
         test_args.push_back(one_arg);
         one_arg.use_mmap = false;
@@ -668,14 +671,17 @@ static std::vector<TestArgs> GenerateArgList() {
 
       for (auto restart_interval : restart_intervals) {
         for (auto compression_type : compression_types) {
-          TestArgs one_arg;
-          one_arg.type = test_type;
-          one_arg.reverse_compare = reverse_compare;
-          one_arg.restart_interval = restart_interval;
-          one_arg.compression = compression_type.first;
-          one_arg.format_version = compression_type.second ? 2 : 1;
-          one_arg.use_mmap = false;
-          test_args.push_back(one_arg);
+          for (auto num_threads : compression_parallel_threads) {
+            TestArgs one_arg;
+            one_arg.type = test_type;
+            one_arg.reverse_compare = reverse_compare;
+            one_arg.restart_interval = restart_interval;
+            one_arg.compression = compression_type.first;
+            one_arg.format_version = compression_type.second ? 2 : 1;
+            one_arg.compression_parallel_threads = num_threads;
+            one_arg.use_mmap = false;
+            test_args.push_back(one_arg);
+          }
         }
       }
     }
@@ -727,6 +733,8 @@ class HarnessTest : public testing::Test {
     constructor_ = nullptr;
     options_ = Options();
     options_.compression = args.compression;
+    options_.compression_opts.parallel_threads =
+        args.compression_parallel_threads;
     // Use shorter block size for tests to exercise block boundary
     // conditions more.
     if (args.reverse_compare) {
@@ -1112,51 +1120,53 @@ class BlockBasedTableTest
       const std::vector<BlockCacheTraceRecord>& expected_records) {
     c->block_cache_tracer_.EndTrace();
 
-    std::unique_ptr<TraceReader> trace_reader;
-    Status s =
-        NewFileTraceReader(env_, EnvOptions(), trace_file_path_, &trace_reader);
-    EXPECT_OK(s);
-    BlockCacheTraceReader reader(std::move(trace_reader));
-    BlockCacheTraceHeader header;
-    EXPECT_OK(reader.ReadHeader(&header));
-    uint32_t index = 0;
-    while (s.ok()) {
-      BlockCacheTraceRecord access;
-      s = reader.ReadAccess(&access);
-      if (!s.ok()) {
-        break;
-      }
-      ASSERT_LT(index, expected_records.size());
-      EXPECT_NE("", access.block_key);
-      EXPECT_EQ(access.block_type, expected_records[index].block_type);
-      EXPECT_GT(access.block_size, 0);
-      EXPECT_EQ(access.caller, expected_records[index].caller);
-      EXPECT_EQ(access.no_insert, expected_records[index].no_insert);
-      EXPECT_EQ(access.is_cache_hit, expected_records[index].is_cache_hit);
-      // Get
-      if (access.caller == TableReaderCaller::kUserGet) {
-        EXPECT_EQ(access.referenced_key,
-                  expected_records[index].referenced_key);
-        EXPECT_EQ(access.get_id, expected_records[index].get_id);
-        EXPECT_EQ(access.get_from_user_specified_snapshot,
-                  expected_records[index].get_from_user_specified_snapshot);
-        if (access.block_type == TraceType::kBlockTraceDataBlock) {
-          EXPECT_GT(access.referenced_data_size, 0);
-          EXPECT_GT(access.num_keys_in_block, 0);
-          EXPECT_EQ(access.referenced_key_exist_in_block,
-                    expected_records[index].referenced_key_exist_in_block);
+    {
+      std::unique_ptr<TraceReader> trace_reader;
+      Status s =
+          NewFileTraceReader(env_, EnvOptions(), trace_file_path_, &trace_reader);
+      EXPECT_OK(s);
+      BlockCacheTraceReader reader(std::move(trace_reader));
+      BlockCacheTraceHeader header;
+      EXPECT_OK(reader.ReadHeader(&header));
+      uint32_t index = 0;
+      while (s.ok()) {
+        BlockCacheTraceRecord access;
+        s = reader.ReadAccess(&access);
+        if (!s.ok()) {
+          break;
         }
-      } else {
-        EXPECT_EQ(access.referenced_key, "");
-        EXPECT_EQ(access.get_id, 0);
-        EXPECT_TRUE(access.get_from_user_specified_snapshot == Boolean::kFalse);
-        EXPECT_EQ(access.referenced_data_size, 0);
-        EXPECT_EQ(access.num_keys_in_block, 0);
-        EXPECT_TRUE(access.referenced_key_exist_in_block == Boolean::kFalse);
+        ASSERT_LT(index, expected_records.size());
+        EXPECT_NE("", access.block_key);
+        EXPECT_EQ(access.block_type, expected_records[index].block_type);
+        EXPECT_GT(access.block_size, 0);
+        EXPECT_EQ(access.caller, expected_records[index].caller);
+        EXPECT_EQ(access.no_insert, expected_records[index].no_insert);
+        EXPECT_EQ(access.is_cache_hit, expected_records[index].is_cache_hit);
+        // Get
+        if (access.caller == TableReaderCaller::kUserGet) {
+          EXPECT_EQ(access.referenced_key,
+                    expected_records[index].referenced_key);
+          EXPECT_EQ(access.get_id, expected_records[index].get_id);
+          EXPECT_EQ(access.get_from_user_specified_snapshot,
+                    expected_records[index].get_from_user_specified_snapshot);
+          if (access.block_type == TraceType::kBlockTraceDataBlock) {
+            EXPECT_GT(access.referenced_data_size, 0);
+            EXPECT_GT(access.num_keys_in_block, 0);
+            EXPECT_EQ(access.referenced_key_exist_in_block,
+                      expected_records[index].referenced_key_exist_in_block);
+          }
+        } else {
+          EXPECT_EQ(access.referenced_key, "");
+          EXPECT_EQ(access.get_id, 0);
+          EXPECT_TRUE(access.get_from_user_specified_snapshot == Boolean::kFalse);
+          EXPECT_EQ(access.referenced_data_size, 0);
+          EXPECT_EQ(access.num_keys_in_block, 0);
+          EXPECT_TRUE(access.referenced_key_exist_in_block == Boolean::kFalse);
+        }
+        index++;
       }
-      index++;
+      EXPECT_EQ(index, expected_records.size());
     }
-    EXPECT_EQ(index, expected_records.size());
     EXPECT_OK(env_->DeleteFile(trace_file_path_));
     EXPECT_OK(env_->DeleteDir(test_path_));
   }

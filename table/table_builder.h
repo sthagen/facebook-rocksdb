@@ -152,9 +152,20 @@ class TableBuilder {
   // Number of calls to Add() so far.
   virtual uint64_t NumEntries() const = 0;
 
+  // Whether the output file is completely empty. It has neither entries
+  // or tombstones.
+  virtual bool IsEmpty() const {
+    return NumEntries() == 0 && GetTableProperties().num_range_deletions == 0;
+  }
+
   // Size of the file generated so far.  If invoked after a successful
   // Finish() call, returns the size of the final generated file.
   virtual uint64_t FileSize() const = 0;
+
+  // Estimated size of the file generated so far. This is used when
+  // FileSize() cannot estimate final SST size, e.g. parallel compression
+  // is enabled.
+  virtual uint64_t EstimatedFileSize() const { return FileSize(); }
 
   // If the user defined table properties collector suggest the file to
   // be further compacted.
