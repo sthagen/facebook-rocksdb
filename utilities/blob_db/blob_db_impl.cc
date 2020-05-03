@@ -209,7 +209,7 @@ Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {
   if (!s.ok()) {
     return s;
   }
-  db_impl_ = static_cast_with_check<DBImpl, DB>(db_->GetRootDB());
+  db_impl_ = static_cast_with_check<DBImpl>(db_->GetRootDB());
 
   // Initialize SST file <-> oldest blob file mapping if garbage collection
   // is enabled.
@@ -1491,12 +1491,14 @@ Status BlobDBImpl::GetRawBlobFromFile(const Slice& key, uint64_t file_number,
   {
     StopWatch read_sw(env_, statistics_, BLOB_DB_BLOB_FILE_READ_MICROS);
     if (reader->use_direct_io()) {
-      s = reader->Read(record_offset, static_cast<size_t>(record_size),
-                       &blob_record, nullptr, &aligned_buf);
+      s = reader->Read(IOOptions(), record_offset,
+                       static_cast<size_t>(record_size), &blob_record, nullptr,
+                       &aligned_buf);
     } else {
       buf.reserve(static_cast<size_t>(record_size));
-      s = reader->Read(record_offset, static_cast<size_t>(record_size),
-                       &blob_record, &buf[0], nullptr);
+      s = reader->Read(IOOptions(), record_offset,
+                       static_cast<size_t>(record_size), &blob_record, &buf[0],
+                       nullptr);
     }
     RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, blob_record.size());
   }
