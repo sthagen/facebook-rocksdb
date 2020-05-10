@@ -2101,7 +2101,7 @@ TEST_F(OptionsParserTest, Comment) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_OK(
       parser.Parse(kTestFileName, fs_.get(), false, 4096 /* readahead_size */));
@@ -2132,7 +2132,7 @@ TEST_F(OptionsParserTest, ExtraSpace) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_OK(
       parser.Parse(kTestFileName, fs_.get(), false, 4096 /* readahead_size */));
@@ -2150,7 +2150,7 @@ TEST_F(OptionsParserTest, MissingDBOptions) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(
       parser.Parse(kTestFileName, fs_.get(), false, 4096 /* readahead_size */));
@@ -2180,7 +2180,7 @@ TEST_F(OptionsParserTest, DoubleDBOptions) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(
       parser.Parse(kTestFileName, fs_.get(), false, 4096 /* readahead_size */));
@@ -2208,7 +2208,7 @@ TEST_F(OptionsParserTest, NoDefaultCFOptions) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(
       parser.Parse(kTestFileName, fs_.get(), false, 4096 /* readahead_size */));
@@ -2238,7 +2238,7 @@ TEST_F(OptionsParserTest, DefaultCFOptionsMustBeTheFirst) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(
       parser.Parse(kTestFileName, fs_.get(), false, 4096 /* readahead_size */));
@@ -2267,7 +2267,7 @@ TEST_F(OptionsParserTest, DuplicateCFOptions) {
       "[CFOptions \"something_else\"]\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(
       parser.Parse(kTestFileName, fs_.get(), false, 4096 /* readahead_size */));
@@ -2335,8 +2335,12 @@ TEST_F(OptionsParserTest, IgnoreUnknownOptions) {
         "  # if a section is blank, we will use the default\n";
 
     const std::string kTestFileName = "test-rocksdb-options.ini";
-    env_->DeleteFile(kTestFileName);
-    env_->WriteToNewFile(kTestFileName, options_file_content);
+    auto s = env_->FileExists(kTestFileName);
+    ASSERT_TRUE(s.ok() || s.IsNotFound());
+    if (s.ok()) {
+      ASSERT_OK(env_->DeleteFile(kTestFileName));
+    }
+    ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
     RocksDBOptionsParser parser;
     ASSERT_NOK(parser.Parse(kTestFileName, fs_.get(), false,
                             4096 /* readahead_size */));
@@ -2384,7 +2388,7 @@ TEST_F(OptionsParserTest, ParseVersion) {
     snprintf(buffer, kLength - 1, file_template.c_str(), iv.c_str());
 
     parser.Reset();
-    env_->WriteToNewFile(iv, buffer);
+    ASSERT_OK(env_->WriteToNewFile(iv, buffer));
     ASSERT_NOK(parser.Parse(iv, fs_.get(), false, 0 /* readahead_size */));
   }
 
@@ -2393,7 +2397,7 @@ TEST_F(OptionsParserTest, ParseVersion) {
   for (auto vv : valid_versions) {
     snprintf(buffer, kLength - 1, file_template.c_str(), vv.c_str());
     parser.Reset();
-    env_->WriteToNewFile(vv, buffer);
+    ASSERT_OK(env_->WriteToNewFile(vv, buffer));
     ASSERT_OK(parser.Parse(vv, fs_.get(), false, 0 /* readahead_size */));
   }
 }
@@ -3004,6 +3008,17 @@ static void TestAndCompareOption(const ConfigOptions& config_options,
                                      comp_addr, &mismatch));
 }
 
+static void TestAndCompareOption(const ConfigOptions& config_options,
+                                 const OptionTypeInfo& opt_info,
+                                 const std::string& opt_name,
+                                 const std::string& opt_value, void* base_ptr,
+                                 void* comp_ptr) {
+  char* base_addr = reinterpret_cast<char*>(base_ptr) + opt_info.offset;
+  ASSERT_OK(
+      opt_info.ParseOption(config_options, opt_name, opt_value, base_addr));
+  TestAndCompareOption(config_options, opt_info, opt_name, base_ptr, comp_ptr);
+}
+
 template <typename T>
 void TestOptInfo(const ConfigOptions& config_options, OptionType opt_type,
                  T* base, T* comp) {
@@ -3264,6 +3279,87 @@ TEST_F(OptionTypeInfoTest, TestOptionFlags) {
   ASSERT_NE(base, comp);
 }
 
+TEST_F(OptionTypeInfoTest, TestCustomEnum) {
+  enum TestEnum { kA, kB, kC };
+  std::unordered_map<std::string, TestEnum> enum_map = {
+      {"A", TestEnum::kA},
+      {"B", TestEnum::kB},
+      {"C", TestEnum::kC},
+  };
+  OptionTypeInfo opt_info = OptionTypeInfo::Enum<TestEnum>(0, &enum_map);
+  TestEnum e1, e2;
+  ConfigOptions config_options;
+  std::string result, mismatch;
+
+  e2 = TestEnum::kA;
+
+  ASSERT_OK(opt_info.ParseOption(config_options, "", "B",
+                                 reinterpret_cast<char*>(&e1)));
+  ASSERT_OK(opt_info.SerializeOption(config_options, "",
+                                     reinterpret_cast<char*>(&e1), &result));
+  ASSERT_EQ(e1, TestEnum::kB);
+  ASSERT_EQ(result, "B");
+
+  ASSERT_FALSE(opt_info.MatchesOption(config_options, "Enum",
+                                      reinterpret_cast<char*>(&e1),
+                                      reinterpret_cast<char*>(&e2), &mismatch));
+  ASSERT_EQ(mismatch, "Enum");
+
+  TestAndCompareOption(config_options, opt_info, "", "C",
+                       reinterpret_cast<char*>(&e1),
+                       reinterpret_cast<char*>(&e2));
+  ASSERT_EQ(e2, TestEnum::kC);
+
+  ASSERT_NOK(opt_info.ParseOption(config_options, "", "D",
+                                  reinterpret_cast<char*>(&e1)));
+  ASSERT_EQ(e1, TestEnum::kC);
+}
+
+TEST_F(OptionTypeInfoTest, TestBuiltinEnum) {
+  ConfigOptions config_options;
+  for (auto iter : OptionsHelper::compaction_style_string_map) {
+    CompactionStyle e1, e2;
+    TestAndCompareOption(config_options,
+                         OptionTypeInfo(0, OptionType::kCompactionStyle),
+                         "CompactionStyle", iter.first, &e1, &e2);
+    ASSERT_EQ(e1, iter.second);
+  }
+  for (auto iter : OptionsHelper::compaction_pri_string_map) {
+    CompactionPri e1, e2;
+    TestAndCompareOption(config_options,
+                         OptionTypeInfo(0, OptionType::kCompactionPri),
+                         "CompactionPri", iter.first, &e1, &e2);
+    ASSERT_EQ(e1, iter.second);
+  }
+  for (auto iter : OptionsHelper::compression_type_string_map) {
+    CompressionType e1, e2;
+    TestAndCompareOption(config_options,
+                         OptionTypeInfo(0, OptionType::kCompressionType),
+                         "CompressionType", iter.first, &e1, &e2);
+    ASSERT_EQ(e1, iter.second);
+  }
+  for (auto iter : OptionsHelper::compaction_stop_style_string_map) {
+    CompactionStopStyle e1, e2;
+    TestAndCompareOption(config_options,
+                         OptionTypeInfo(0, OptionType::kCompactionStopStyle),
+                         "CompactionStopStyle", iter.first, &e1, &e2);
+    ASSERT_EQ(e1, iter.second);
+  }
+  for (auto iter : OptionsHelper::checksum_type_string_map) {
+    ChecksumType e1, e2;
+    TestAndCompareOption(config_options,
+                         OptionTypeInfo(0, OptionType::kChecksumType),
+                         "CheckSumType", iter.first, &e1, &e2);
+    ASSERT_EQ(e1, iter.second);
+  }
+  for (auto iter : OptionsHelper::encoding_type_string_map) {
+    EncodingType e1, e2;
+    TestAndCompareOption(config_options,
+                         OptionTypeInfo(0, OptionType::kEncodingType),
+                         "EncodingType", iter.first, &e1, &e2);
+    ASSERT_EQ(e1, iter.second);
+  }
+}
 #endif  // !ROCKSDB_LITE
 }  // namespace ROCKSDB_NAMESPACE
 

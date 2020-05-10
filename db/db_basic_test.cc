@@ -1295,14 +1295,18 @@ TEST_F(DBBasicTest, MultiGetBatchedSimpleUnsorted) {
   } while (ChangeCompactOptions());
 }
 
-TEST_F(DBBasicTest, MultiGetBatchedSimpleSorted) {
+TEST_F(DBBasicTest, MultiGetBatchedSortedMultiFile) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     SetPerfLevel(kEnableCount);
+    // To expand the power of this test, generate > 1 table file and
+    // mix with memtable
     ASSERT_OK(Put(1, "k1", "v1"));
     ASSERT_OK(Put(1, "k2", "v2"));
+    Flush(1);
     ASSERT_OK(Put(1, "k3", "v3"));
     ASSERT_OK(Put(1, "k4", "v4"));
+    Flush(1);
     ASSERT_OK(Delete(1, "k4"));
     ASSERT_OK(Put(1, "k5", "v5"));
     ASSERT_OK(Delete(1, "no_key"));
@@ -1333,7 +1337,7 @@ TEST_F(DBBasicTest, MultiGetBatchedSimpleSorted) {
     ASSERT_TRUE(s[5].IsNotFound());
 
     SetPerfLevel(kDisable);
-  } while (ChangeCompactOptions());
+  } while (ChangeOptions());
 }
 
 TEST_F(DBBasicTest, MultiGetBatchedMultiLevel) {
@@ -1774,6 +1778,28 @@ TEST_F(DBBasicTest, IncrementalRecoveryNoCorrupt) {
   }
 }
 
+TEST_F(DBBasicTest, BestEffortsRecoveryWithVersionBuildingFailure) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("foo", "value"));
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        ASSERT_NE(nullptr, arg);
+        *(reinterpret_cast<Status*>(arg)) =
+            Status::Corruption("Inject corruption");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  options.best_efforts_recovery = true;
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsCorruption());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 #ifndef ROCKSDB_LITE
 namespace {
 class TableFileListener : public EventListener {
@@ -1814,11 +1840,16 @@ TEST_F(DBBasicTest, RecoverWithMissingFiles) {
     ASSERT_OK(Flush(static_cast<int>(cf)));
   }
 
-  // Delete files
+  // Delete and corrupt files
   for (size_t i = 0; i < all_cf_names.size(); ++i) {
     std::vector<std::string>& files = listener->GetFiles(all_cf_names[i]);
     ASSERT_EQ(3, files.size());
-    for (int j = static_cast<int>(files.size() - 1); j >= static_cast<int>(i);
+    std::string corrupted_data;
+    ASSERT_OK(ReadFileToString(env_, files[files.size() - 1], &corrupted_data));
+    ASSERT_OK(WriteStringToFile(
+        env_, corrupted_data.substr(0, corrupted_data.size() - 2),
+        files[files.size() - 1], /*should_sync=*/true));
+    for (int j = static_cast<int>(files.size() - 2); j >= static_cast<int>(i);
          --j) {
       ASSERT_OK(env_->DeleteFile(files[j]));
     }
@@ -1848,6 +1879,32 @@ TEST_F(DBBasicTest, RecoverWithMissingFiles) {
     iter->Next();
     ASSERT_FALSE(iter->Valid());
   }
+}
+
+TEST_F(DBBasicTest, BestEffortsRecoveryTryMultipleManifests) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("foo", "value0"));
+  ASSERT_OK(Flush());
+  Close();
+  {
+    // Hack by adding a new MANIFEST with high file number
+    std::string garbage(10, '\0');
+    ASSERT_OK(WriteStringToFile(env_, garbage, dbname_ + "/MANIFEST-001000",
+                                /*should_sync=*/true));
+  }
+  {
+    // Hack by adding a corrupted SST not referenced by any MANIFEST
+    std::string garbage(10, '\0');
+    ASSERT_OK(WriteStringToFile(env_, garbage, dbname_ + "/001001.sst",
+                                /*should_sync=*/true));
+  }
+
+  options.best_efforts_recovery = true;
+
+  Reopen(options);
+  ASSERT_OK(Put("bar", "value"));
 }
 
 TEST_F(DBBasicTest, RecoverWithNoCurrentFile) {
@@ -2511,9 +2568,8 @@ TEST_F(DBBasicTestMultiGetDeadline, MultiGetDeadlineExceeded) {
   std::shared_ptr<DBBasicTestMultiGetDeadline::DeadlineFS> fs(
       new DBBasicTestMultiGetDeadline::DeadlineFS(env_));
   std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
-  env_->no_slowdown_ = true;
-  env_->time_elapse_only_sleep_.store(true);
   Options options = CurrentOptions();
+  env_->SetTimeElapseOnlySleep(&options);
 
   std::shared_ptr<Cache> cache = NewLRUCache(1048576);
   BlockBasedTableOptions table_options;
