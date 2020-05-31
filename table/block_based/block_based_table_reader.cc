@@ -609,7 +609,8 @@ Status BlockBasedTable::Open(
     const SliceTransform* prefix_extractor,
     const bool prefetch_index_and_filter_in_cache, const bool skip_filters,
     const int level, const bool immortal_table,
-    const SequenceNumber largest_seqno, TailPrefetchStats* tail_prefetch_stats,
+    const SequenceNumber largest_seqno, const bool force_direct_prefetch,
+    TailPrefetchStats* tail_prefetch_stats,
     BlockCacheTracer* const block_cache_tracer) {
   table_reader->reset();
 
@@ -622,8 +623,9 @@ Status BlockBasedTable::Open(
   const bool preload_all = !table_options.cache_index_and_filter_blocks;
 
   if (!ioptions.allow_mmap_reads) {
-    s = PrefetchTail(file.get(), file_size, tail_prefetch_stats, prefetch_all,
-                     preload_all, &prefetch_buffer);
+    s = PrefetchTail(file.get(), file_size, force_direct_prefetch,
+                     tail_prefetch_stats, prefetch_all, preload_all,
+                     &prefetch_buffer);
   } else {
     // Should not prefetch for mmap mode.
     prefetch_buffer.reset(new FilePrefetchBuffer(
@@ -724,8 +726,8 @@ Status BlockBasedTable::Open(
 
 Status BlockBasedTable::PrefetchTail(
     RandomAccessFileReader* file, uint64_t file_size,
-    TailPrefetchStats* tail_prefetch_stats, const bool prefetch_all,
-    const bool preload_all,
+    bool force_direct_prefetch, TailPrefetchStats* tail_prefetch_stats,
+    const bool prefetch_all, const bool preload_all,
     std::unique_ptr<FilePrefetchBuffer>* prefetch_buffer) {
   size_t tail_prefetch_size = 0;
   if (tail_prefetch_stats != nullptr) {
@@ -755,7 +757,7 @@ Status BlockBasedTable::PrefetchTail(
                            &tail_prefetch_size);
   Status s;
   // TODO should not have this special logic in the future.
-  if (!file->use_direct_io()) {
+  if (!file->use_direct_io() && !force_direct_prefetch) {
     prefetch_buffer->reset(new FilePrefetchBuffer(
         nullptr, 0, 0, false /* enable */, true /* track_min_offset */));
     s = file->Prefetch(prefetch_off, prefetch_len);
@@ -767,7 +769,6 @@ Status BlockBasedTable::PrefetchTail(
 
   return s;
 }
-
 
 Status BlockBasedTable::TryReadPropertiesWithGlobalSeqno(
     FilePrefetchBuffer* prefetch_buffer, const Slice& handle_value,
@@ -1593,7 +1594,7 @@ void BlockBasedTable::RetrieveMultipleBlocks(
   size_t read_amp_bytes_per_bit = rep_->table_options.read_amp_bytes_per_bit;
   MemoryAllocator* memory_allocator = GetMemoryAllocator(rep_->table_options);
 
-  if (file->use_direct_io() || ioptions.allow_mmap_reads) {
+  if (ioptions.allow_mmap_reads) {
     size_t idx_in_batch = 0;
     for (auto mget_iter = batch->begin(); mget_iter != batch->end();
          ++mget_iter, ++idx_in_batch) {
@@ -1612,6 +1613,10 @@ void BlockBasedTable::RetrieveMultipleBlocks(
     }
     return;
   }
+
+  // In direct IO mode, blocks share the direct io buffer.
+  // Otherwise, blocks share the scratch buffer.
+  const bool use_shared_buffer = file->use_direct_io() || scratch != nullptr;
 
   autovector<FSReadRequest, MultiGetContext::MAX_BATCH_SIZE> read_reqs;
   size_t buf_offset = 0;
@@ -1633,7 +1638,11 @@ void BlockBasedTable::RetrieveMultipleBlocks(
     // If current block is adjacent to the previous one, at the same time,
     // compression is enabled and there is no compressed cache, we combine
     // the two block read as one.
-    if (scratch != nullptr && prev_end == handle.offset()) {
+    // We don't combine block reads here in direct IO mode, because when doing
+    // direct IO read, the block requests will be realigned and merged when
+    // necessary.
+    if (use_shared_buffer && !file->use_direct_io() &&
+        prev_end == handle.offset()) {
       req_offset_for_block.emplace_back(prev_len);
       prev_len += block_size(handle);
     } else {
@@ -1643,11 +1652,13 @@ void BlockBasedTable::RetrieveMultipleBlocks(
         FSReadRequest req;
         req.offset = prev_offset;
         req.len = prev_len;
-        if (scratch == nullptr) {
-          req.scratch = new char[req.len];
-        } else {
+        if (file->use_direct_io()) {
+          req.scratch = nullptr;
+        } else if (use_shared_buffer) {
           req.scratch = scratch + buf_offset;
           buf_offset += req.len;
+        } else {
+          req.scratch = new char[req.len];
         }
         read_reqs.emplace_back(req);
       }
@@ -1664,14 +1675,17 @@ void BlockBasedTable::RetrieveMultipleBlocks(
     FSReadRequest req;
     req.offset = prev_offset;
     req.len = prev_len;
-    if (scratch == nullptr) {
-      req.scratch = new char[req.len];
-    } else {
+    if (file->use_direct_io()) {
+      req.scratch = nullptr;
+    } else if (use_shared_buffer) {
       req.scratch = scratch + buf_offset;
+    } else {
+      req.scratch = new char[req.len];
     }
     read_reqs.emplace_back(req);
   }
 
+  AlignedBuf direct_io_buf;
   {
     IOOptions opts;
     IOStatus s = PrepareIOFromReadOptions(options, file->env(), opts);
@@ -1680,7 +1694,7 @@ void BlockBasedTable::RetrieveMultipleBlocks(
         req.status = s;
       }
     } else {
-      file->MultiRead(opts, &read_reqs[0], read_reqs.size(), nullptr);
+      file->MultiRead(opts, &read_reqs[0], read_reqs.size(), &direct_io_buf);
     }
   }
 
@@ -1703,7 +1717,8 @@ void BlockBasedTable::RetrieveMultipleBlocks(
     FSReadRequest& req = read_reqs[req_idx];
     Status s = req.status;
     if (s.ok()) {
-      if (req.result.size() != req.len) {
+      if ((req.result.size() != req.len) ||
+          (req_offset + block_size(handle) > req.result.size())) {
         s = Status::Corruption(
             "truncated block read from " + rep_->file->file_name() +
             " offset " + ToString(handle.offset()) + ", expected " +
@@ -1712,60 +1727,51 @@ void BlockBasedTable::RetrieveMultipleBlocks(
     }
 
     BlockContents raw_block_contents;
-    size_t cur_read_end = req_offset + block_size(handle);
-    if (cur_read_end > req.result.size()) {
-      s = Status::Corruption(
-          "truncated block read from " + rep_->file->file_name() + " offset " +
-          ToString(handle.offset()) + ", expected " + ToString(req.len) +
-          " bytes, got " + ToString(req.result.size()));
+    if (!use_shared_buffer) {
+      // We allocated a buffer for this block. Give ownership of it to
+      // BlockContents so it can free the memory
+      assert(req.result.data() == req.scratch);
+      assert(req.result.size() == block_size(handle));
+      assert(req_offset == 0);
+      std::unique_ptr<char[]> raw_block(req.scratch);
+      raw_block_contents = BlockContents(std::move(raw_block), handle.size());
+    } else {
+      // We used the scratch buffer or direct io buffer
+      // which are shared by the blocks.
+      // raw_block_contents does not have the ownership.
+      raw_block_contents =
+          BlockContents(Slice(req.result.data() + req_offset, handle.size()));
     }
-
-    bool blocks_share_read_buffer = (req.result.size() != block_size(handle));
-    if (s.ok()) {
-      if (scratch == nullptr && !blocks_share_read_buffer) {
-        // We allocated a buffer for this block. Give ownership of it to
-        // BlockContents so it can free the memory
-        assert(req.result.data() == req.scratch);
-        std::unique_ptr<char[]> raw_block(req.scratch + req_offset);
-        raw_block_contents = BlockContents(std::move(raw_block), handle.size());
-      } else {
-        // We used the scratch buffer which are shared by the blocks.
-        // raw_block_contents does not have the ownership.
-        raw_block_contents =
-            BlockContents(Slice(req.scratch + req_offset, handle.size()));
-      }
-
 #ifndef NDEBUG
       raw_block_contents.is_raw_block = true;
 #endif
-      if (options.verify_checksums) {
-        PERF_TIMER_GUARD(block_checksum_time);
-        const char* data = req.result.data();
-        uint32_t expected =
-            DecodeFixed32(data + req_offset + handle.size() + 1);
-        // Since the scratch might be shared. the offset of the data block in
-        // the buffer might not be 0. req.result.data() only point to the
-        // begin address of each read request, we need to add the offset
-        // in each read request. Checksum is stored in the block trailer,
-        // which is handle.size() + 1.
-        s = ROCKSDB_NAMESPACE::VerifyChecksum(footer.checksum(),
-                                              data + req_offset,
-                                              handle.size() + 1, expected);
-        TEST_SYNC_POINT_CALLBACK("RetrieveMultipleBlocks:VerifyChecksum", &s);
-      }
+
+    if (s.ok() && options.verify_checksums) {
+      PERF_TIMER_GUARD(block_checksum_time);
+      const char* data = req.result.data();
+      uint32_t expected =
+          DecodeFixed32(data + req_offset + handle.size() + 1);
+      // Since the scratch might be shared. the offset of the data block in
+      // the buffer might not be 0. req.result.data() only point to the
+      // begin address of each read request, we need to add the offset
+      // in each read request. Checksum is stored in the block trailer,
+      // which is handle.size() + 1.
+      s = ROCKSDB_NAMESPACE::VerifyChecksum(footer.checksum(),
+                                            data + req_offset,
+                                            handle.size() + 1, expected);
+      TEST_SYNC_POINT_CALLBACK("RetrieveMultipleBlocks:VerifyChecksum", &s);
     }
 
     if (s.ok()) {
-      // It handles a rare case: compression is set and these is no compressed
-      // cache (enable combined read). In this case, the scratch != nullptr.
-      // At the same time, some blocks are actually not compressed,
-      // since its compression space saving is smaller than the threshold. In
-      // this case, if the block shares the scratch memory, we need to copy it
-      // to the heap such that it can be added to the regular block cache.
+      // When the blocks share the same underlying buffer (scratch or direct io
+      // buffer), if the block is compressed, the shared buffer will be
+      // uncompressed into heap during uncompressing; otherwise, we need to
+      // manually copy the block into heap before inserting the block to block
+      // cache.
       CompressionType compression_type =
           raw_block_contents.get_compression_type();
-      if (scratch != nullptr && compression_type == kNoCompression) {
-        Slice raw = Slice(req.scratch + req_offset, block_size(handle));
+      if (use_shared_buffer && compression_type == kNoCompression) {
+        Slice raw = Slice(req.result.data() + req_offset, block_size(handle));
         raw_block_contents = BlockContents(
             CopyBufferToHeap(GetMemoryAllocator(rep_->table_options), raw),
             handle.size());
@@ -1807,8 +1813,10 @@ void BlockBasedTable::RetrieveMultipleBlocks(
                                     handle.size(), &contents, footer.version(),
                                     rep_->ioptions, memory_allocator);
       } else {
-        // There are two cases here: 1) caller uses the scratch buffer; 2) we
-        // use the requst buffer. If scratch buffer is used, we ensure that
+        // There are two cases here:
+        // 1) caller uses the shared buffer (scratch or direct io buffer);
+        // 2) we use the requst buffer.
+        // If scratch buffer or direct io buffer is used, we ensure that
         // all raw blocks are copyed to the heap as single blocks. If scratch
         // buffer is not used, we also have no combined read, so the raw
         // block can be used directly.
@@ -2511,6 +2519,7 @@ void BlockBasedTable::MultiGet(const ReadOptions& read_options,
 
       if (total_len) {
         char* scratch = nullptr;
+        // If using direct IO, then scratch is not used, so keep it nullptr.
         // If the blocks need to be uncompressed and we don't need the
         // compressed blocks, then we can use a contiguous block of
         // memory to read in all the blocks as it will be temporary
@@ -2520,7 +2529,8 @@ void BlockBasedTable::MultiGet(const ReadOptions& read_options,
         // 2. If blocks are uncompressed, alloc heap bufs
         // 3. If blocks are compressed and no compressed block cache, use
         //    stack buf
-        if (rep_->table_options.block_cache_compressed == nullptr &&
+        if (!rep_->file->use_direct_io() &&
+            rep_->table_options.block_cache_compressed == nullptr &&
             rep_->blocks_maybe_compressed) {
           if (total_len <= kMultiGetReadStackBufSize) {
             scratch = stack_buf;

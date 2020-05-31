@@ -15,7 +15,7 @@ namespace ROCKSDB_NAMESPACE {
 class RandomAccessFileReaderTest : public testing::Test {
  public:
   void SetUp() override {
-    test::ResetTmpDirForDirectIO();
+    test::SetupSyncPointsToMockDirectIO();
     env_ = Env::Default();
     fs_ = FileSystem::Default();
     test_dir_ = test::PerThreadDBPath("random_access_file_reader_test");
@@ -25,15 +25,6 @@ class RandomAccessFileReaderTest : public testing::Test {
 
   void TearDown() override {
     EXPECT_OK(test::DestroyDir(env_, test_dir_));
-  }
-
-  bool IsDirectIOSupported() {
-    Write(".direct", "");
-    FileOptions opt;
-    opt.use_direct_reads = true;
-    std::unique_ptr<FSRandomAccessFile> f;
-    auto s = fs_->NewRandomAccessFile(Path(".direct"), opt, &f, nullptr);
-    return s.ok();
   }
 
   void Write(const std::string& fname, const std::string& content) {
@@ -83,12 +74,10 @@ class RandomAccessFileReaderTest : public testing::Test {
   }
 };
 
-TEST_F(RandomAccessFileReaderTest, ReadDirectIO) {
-  if (!IsDirectIOSupported()) {
-    printf("Direct IO is not supported, skip this test\n");
-    return;
-  }
+// Skip the following tests in lite mode since direct I/O is unsupported.
+#ifndef ROCKSDB_LITE
 
+TEST_F(RandomAccessFileReaderTest, ReadDirectIO) {
   std::string fname = "read-direct-io";
   Random rand(0);
   std::string content;
@@ -113,11 +102,6 @@ TEST_F(RandomAccessFileReaderTest, ReadDirectIO) {
 }
 
 TEST_F(RandomAccessFileReaderTest, MultiReadDirectIO) {
-  if (!IsDirectIOSupported()) {
-    printf("Direct IO is not supported, skip this test\n");
-    return;
-  }
-
   // Creates a file with 3 pages.
   std::string fname = "multi-read-direct-io";
   Random rand(0);
@@ -265,6 +249,8 @@ TEST_F(RandomAccessFileReaderTest, MultiReadDirectIO) {
     AssertResult(content, reqs);
   }
 }
+
+#endif  // ROCKSDB_LITE
 
 }  // namespace ROCKSDB_NAMESPACE
 
