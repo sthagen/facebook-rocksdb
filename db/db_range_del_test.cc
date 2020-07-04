@@ -189,7 +189,7 @@ TEST_F(DBRangeDelTest, MaxCompactionBytesCutsOutputFiles) {
   std::vector<std::vector<FileMetaData>> files;
   dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &files);
 
-  for (size_t i = 0; i < files[1].size() - 1; ++i) {
+  for (size_t i = 0; i + 1 < files[1].size(); ++i) {
     ASSERT_TRUE(InternalKeyComparator(opts.comparator)
                     .Compare(files[1][i].largest, files[1][i + 1].smallest) <
                 0);
@@ -459,7 +459,7 @@ TEST_F(DBRangeDelTest, ValidUniversalSubcompactionBoundaries) {
   // probably means universal compaction + subcompaction + range deletion are
   // compatible.
   ASSERT_OK(dbfull()->RunManualCompaction(
-      reinterpret_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
           ->cfd(),
       1 /* input_level */, 2 /* output_level */, CompactRangeOptions(),
       nullptr /* begin */, nullptr /* end */, true /* exclusive */,

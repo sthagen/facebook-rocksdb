@@ -89,7 +89,7 @@ TEST_F(DBFlushTest, SyncFail) {
   CreateAndReopenWithCF({"pikachu"}, options);
   Put("key", "value");
   auto* cfd =
-      reinterpret_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
           ->cfd();
   FlushOptions flush_options;
   flush_options.wait = false;
@@ -379,9 +379,9 @@ TEST_F(DBFlushTest, FireOnFlushCompletedAfterCommittedResult) {
       DBImpl* db_impl = static_cast_with_check<DBImpl>(db);
       InstrumentedMutex* mutex = db_impl->mutex();
       mutex->Lock();
-      auto* cfd =
-          reinterpret_cast<ColumnFamilyHandleImpl*>(db->DefaultColumnFamily())
-              ->cfd();
+      auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                      db->DefaultColumnFamily())
+                      ->cfd();
       ASSERT_LT(seq, cfd->imm()->current()->GetEarliestSequenceNumber());
       mutex->Unlock();
     }
@@ -499,13 +499,13 @@ TEST_P(DBAtomicFlushTest, AtomicFlushTriggeredByMemTableFull) {
   TEST_SYNC_POINT(
       "DBAtomicFlushTest::AtomicFlushTriggeredByMemTableFull:BeforeCheck");
   if (options.atomic_flush) {
-    for (size_t i = 0; i != num_cfs - 1; ++i) {
+    for (size_t i = 0; i + 1 != num_cfs; ++i) {
       auto cfh = static_cast<ColumnFamilyHandleImpl*>(handles_[i]);
       ASSERT_EQ(0, cfh->cfd()->imm()->NumNotFlushed());
       ASSERT_TRUE(cfh->cfd()->mem()->IsEmpty());
     }
   } else {
-    for (size_t i = 0; i != num_cfs - 1; ++i) {
+    for (size_t i = 0; i + 1 != num_cfs; ++i) {
       auto cfh = static_cast<ColumnFamilyHandleImpl*>(handles_[i]);
       ASSERT_EQ(0, cfh->cfd()->imm()->NumNotFlushed());
       ASSERT_FALSE(cfh->cfd()->mem()->IsEmpty());
