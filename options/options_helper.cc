@@ -146,6 +146,10 @@ DBOptions BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.file_checksum_gen_factory =
       immutable_db_options.file_checksum_gen_factory;
   options.best_efforts_recovery = immutable_db_options.best_efforts_recovery;
+  options.max_bgerror_resume_count =
+      immutable_db_options.max_bgerror_resume_count;
+  options.bgerror_resume_retry_interval =
+      immutable_db_options.bgerror_resume_retry_interval;
   return options;
 }
 
@@ -930,7 +934,7 @@ Status GetTableFactoryFromMap(
     const std::unordered_map<std::string, std::string>& opt_map,
     std::shared_ptr<TableFactory>* table_factory) {
   Status s;
-  if (factory_name == BlockBasedTableFactory().Name()) {
+  if (factory_name == BlockBasedTableFactory::kName) {
     BlockBasedTableOptions bbt_opt;
     s = GetBlockBasedTableOptionsFromMap(
         config_options, BlockBasedTableOptions(), opt_map, &bbt_opt);
@@ -939,7 +943,7 @@ Status GetTableFactoryFromMap(
     }
     table_factory->reset(new BlockBasedTableFactory(bbt_opt));
     return s;
-  } else if (factory_name == PlainTableFactory().Name()) {
+  } else if (factory_name == PlainTableFactory::kName) {
     PlainTableOptions pt_opt;
     s = GetPlainTableOptionsFromMap(config_options, PlainTableOptions(),
                                     opt_map, &pt_opt);
