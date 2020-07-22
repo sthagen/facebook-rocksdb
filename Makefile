@@ -363,8 +363,13 @@ ifndef USE_FOLLY_DISTRIBUTED_MUTEX
 	USE_FOLLY_DISTRIBUTED_MUTEX=0
 endif
 
-export GTEST_THROW_ON_FAILURE=1
-export GTEST_HAS_EXCEPTIONS=1
+ifndef GTEST_THROW_ON_FAILURE
+	export GTEST_THROW_ON_FAILURE=1
+endif
+ifndef GTEST_HAS_EXCEPTIONS
+	export GTEST_HAS_EXCEPTIONS=1
+endif
+
 GTEST_DIR = third-party/gtest-1.8.1/fused-src
 # AIX: pre-defined system headers are surrounded by an extern "C" block
 ifeq ($(PLATFORM), OS_AIX)
@@ -512,8 +517,10 @@ PARALLEL_TEST = \
 	db_merge_operator_test \
 	db_sst_test \
 	db_test \
+	db_test2 \
 	db_universal_compaction_test \
 	db_wal_test \
+	column_family_test \
 	external_sst_file_test \
 	import_column_family_test \
 	fault_injection_test \
