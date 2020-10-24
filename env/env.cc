@@ -140,6 +140,16 @@ Status Env::GetChildrenFileAttributes(const std::string& dir,
   return Status::OK();
 }
 
+Status Env::GetHostNameString(std::string* result) {
+  std::array<char, kMaxHostNameLen> hostname_buf;
+  Status s = GetHostName(hostname_buf.data(), hostname_buf.size());
+  if (s.ok()) {
+    hostname_buf[hostname_buf.size() - 1] = '\0';
+    result->assign(hostname_buf.data());
+  }
+  return s;
+}
+
 SequentialFile::~SequentialFile() {
 }
 
@@ -207,6 +217,14 @@ void Logger::Logv(const InfoLogLevel log_level, const char* format, va_list ap) 
     snprintf(new_format, sizeof(new_format) - 1, "[%s] %s",
       kInfoLogLevelNames[log_level], format);
     Logv(new_format, ap);
+  }
+
+  if (log_level >= InfoLogLevel::WARN_LEVEL &&
+      log_level != InfoLogLevel::HEADER_LEVEL) {
+    // Log messages with severity of warning or higher should be rare and are
+    // sometimes followed by an unclean crash. We want to be sure important
+    // messages are not lost in an application buffer when that happens.
+    Flush();
   }
 }
 
