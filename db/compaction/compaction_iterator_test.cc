@@ -156,22 +156,31 @@ class LoggingForwardVectorIterator : public InternalIterator {
 
 class FakeCompaction : public CompactionIterator::CompactionProxy {
  public:
-  FakeCompaction() = default;
+  int level() const override { return 0; }
 
-  int level(size_t /*compaction_input_level*/) const override { return 0; }
   bool KeyNotExistsBeyondOutputLevel(
       const Slice& /*user_key*/,
       std::vector<size_t>* /*level_ptrs*/) const override {
     return is_bottommost_level || key_not_exists_beyond_output_level;
   }
+
   bool bottommost_level() const override { return is_bottommost_level; }
+
   int number_levels() const override { return 1; }
+
   Slice GetLargestUserKey() const override {
     return "\xff\xff\xff\xff\xff\xff\xff\xff\xff";
   }
+
   bool allow_ingest_behind() const override { return is_allow_ingest_behind; }
 
   bool preserve_deletes() const override { return false; }
+
+  bool enable_blob_garbage_collection() const override { return false; }
+
+  double blob_garbage_collection_age_cutoff() const override { return 0.0; }
+
+  Version* input_version() const override { return nullptr; }
 
   bool key_not_exists_beyond_output_level = false;
 
@@ -271,7 +280,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
         earliest_write_conflict_snapshot, snapshot_checker_.get(),
         Env::Default(), false /* report_detailed_time */, false,
         range_del_agg_.get(), nullptr /* blob_file_builder */,
-        false /*allow_data_in_errors*/, std::move(compaction), filter,
+        true /*allow_data_in_errors*/, std::move(compaction), filter,
         &shutting_down_, /*preserve_deletes_seqnum=*/0,
         /*manual_compaction_paused=*/nullptr, /*info_log=*/nullptr,
         full_history_ts_low));
@@ -1062,12 +1071,13 @@ class CompactionIteratorTsGcTest : public CompactionIteratorTest {
 };
 
 TEST_P(CompactionIteratorTsGcTest, NoKeyEligibleForGC) {
-  constexpr char user_key[] = "a";
+  constexpr char user_key[][2] = {{'a', '\0'}, {'b', '\0'}};
   const std::vector<std::string> input_keys = {
-      test::KeyStr(/*ts=*/103, user_key, /*seq=*/4, kTypeValue),
-      test::KeyStr(/*ts=*/102, user_key, /*seq=*/3,
-                   kTypeDeletionWithTimestamp)};
-  const std::vector<std::string> input_values = {"a3", ""};
+      test::KeyStr(/*ts=*/103, user_key[0], /*seq=*/4, kTypeValue),
+      test::KeyStr(/*ts=*/102, user_key[0], /*seq=*/3,
+                   kTypeDeletionWithTimestamp),
+      test::KeyStr(/*ts=*/104, user_key[1], /*seq=*/5, kTypeValue)};
+  const std::vector<std::string> input_values = {"a3", "", "b2"};
   std::string full_history_ts_low;
   // All keys' timestamps are newer than or equal to 102, thus none of them
   // will be eligible for GC.
@@ -1089,22 +1099,23 @@ TEST_P(CompactionIteratorTsGcTest, NoKeyEligibleForGC) {
 }
 
 TEST_P(CompactionIteratorTsGcTest, AllKeysOlderThanThreshold) {
-  constexpr char user_key[] = "a";
+  constexpr char user_key[][2] = {{'a', '\0'}, {'b', '\0'}};
   const std::vector<std::string> input_keys = {
-      test::KeyStr(/*ts=*/103, user_key, /*seq=*/4, kTypeDeletionWithTimestamp),
-      test::KeyStr(/*ts=*/102, user_key, /*seq=*/3, kTypeValue),
-      test::KeyStr(/*ts=*/101, user_key, /*seq=*/2, kTypeValue)};
-  const std::vector<std::string> input_values = {"", "a2", "a1"};
+      test::KeyStr(/*ts=*/103, user_key[0], /*seq=*/4,
+                   kTypeDeletionWithTimestamp),
+      test::KeyStr(/*ts=*/102, user_key[0], /*seq=*/3, kTypeValue),
+      test::KeyStr(/*ts=*/101, user_key[0], /*seq=*/2, kTypeValue),
+      test::KeyStr(/*ts=*/104, user_key[1], /*seq=*/5, kTypeValue)};
+  const std::vector<std::string> input_values = {"", "a2", "a1", "b5"};
   std::string full_history_ts_low;
-  // All keys' timestamps are older than 104.
-  PutFixed64(&full_history_ts_low, 104);
+  PutFixed64(&full_history_ts_low, std::numeric_limits<uint64_t>::max());
   {
     // With a snapshot at seq 3, both the deletion marker and the key at 3 must
     // be preserved.
     AddSnapshot(3);
-    const std::vector<std::string> expected_keys = {input_keys[0],
-                                                    input_keys[1]};
-    const std::vector<std::string> expected_values = {"", "a2"};
+    const std::vector<std::string> expected_keys = {
+        input_keys[0], input_keys[1], input_keys[3]};
+    const std::vector<std::string> expected_values = {"", "a2", "b5"};
     RunTest(input_keys, input_values, expected_keys, expected_values,
             /*last_committed_seq=*/kMaxSequenceNumber,
             /*merge_operator=*/nullptr, /*compaction_filter=*/nullptr,
@@ -1116,8 +1127,9 @@ TEST_P(CompactionIteratorTsGcTest, AllKeysOlderThanThreshold) {
   {
     // No snapshot, the deletion marker should be preserved because the user
     // key may appear beyond output level.
-    const std::vector<std::string> expected_keys = {input_keys[0]};
-    const std::vector<std::string> expected_values = {""};
+    const std::vector<std::string> expected_keys = {input_keys[0],
+                                                    input_keys[3]};
+    const std::vector<std::string> expected_values = {"", "b5"};
     RunTest(input_keys, input_values, expected_keys, expected_values,
             /*last_committed_seq=*/kMaxSequenceNumber,
             /*merge_operator=*/nullptr, /*compaction_filter=*/nullptr,
@@ -1128,8 +1140,8 @@ TEST_P(CompactionIteratorTsGcTest, AllKeysOlderThanThreshold) {
   {
     // No snapshot, the deletion marker can be dropped because the user key
     // does not appear in higher levels.
-    const std::vector<std::string> expected_keys = {};
-    const std::vector<std::string> expected_values = {};
+    const std::vector<std::string> expected_keys = {input_keys[3]};
+    const std::vector<std::string> expected_values = {"b5"};
     RunTest(input_keys, input_values, expected_keys, expected_values,
             /*last_committed_seq=*/kMaxSequenceNumber,
             /*merge_operator=*/nullptr, /*compaction_filter=*/nullptr,

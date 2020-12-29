@@ -375,6 +375,9 @@ DEFINE_bool(use_block_based_filter, false,
             "use block based filter"
             "instead of full filter for block based table");
 
+DEFINE_bool(use_ribbon_filter, false,
+            "Use Ribbon filter instead of Bloom filter");
+
 DEFINE_bool(partition_filters, false,
             "use partitioned filters "
             "for block-based table");
@@ -753,5 +756,8 @@ DEFINE_bool(paranoid_file_checks, true,
 DEFINE_string(file_checksum_impl, "none",
               "Name of an implementation for file_checksum_gen_factory, or "
               "\"none\" for null.");
+
+DEFINE_int32(write_fault_one_in, 0,
+             "On non-zero, enables fault injection on write");
 
 #endif  // GFLAGS

@@ -147,7 +147,8 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
     // DeleteScheduler::CleanupDirectory on the same dir later, it will be
     // safe
     std::vector<std::string> filenames;
-    result.env->GetChildren(result.wal_dir, &filenames).PermitUncheckedError();
+    Status s = result.env->GetChildren(result.wal_dir, &filenames);
+    s.PermitUncheckedError();  //**TODO: What to do on error?
     for (std::string& filename : filenames) {
       if (filename.find(".log.trash", filename.length() -
                                           std::string(".log.trash").length()) !=
@@ -163,7 +164,8 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
   // was not used)
   auto sfm = static_cast<SstFileManagerImpl*>(result.sst_file_manager.get());
   for (size_t i = 0; i < result.db_paths.size(); i++) {
-    DeleteScheduler::CleanupDirectory(result.env, sfm, result.db_paths[i].path);
+    DeleteScheduler::CleanupDirectory(result.env, sfm, result.db_paths[i].path)
+        .PermitUncheckedError();
   }
 
   // Create a default SstFileManager for purposes of tracking compaction size
@@ -479,42 +481,14 @@ Status DBImpl::Recover(
       // TryRecover may delete previous column_family_set_.
       column_family_memtables_.reset(
           new ColumnFamilyMemTablesImpl(versions_->GetColumnFamilySet()));
-      s = FinishBestEffortsRecovery();
     }
   }
   if (!s.ok()) {
     return s;
   }
-  // Happens when immutable_db_options_.write_dbid_to_manifest is set to true
-  // the very first time.
-  if (db_id_.empty()) {
-    // Check for the IDENTITY file and create it if not there.
-    s = fs_->FileExists(IdentityFileName(dbname_), IOOptions(), nullptr);
-    // Typically Identity file is created in NewDB() and for some reason if
-    // it is no longer available then at this point DB ID is not in Identity
-    // file or Manifest.
-    if (s.IsNotFound()) {
-      s = SetIdentityFile(env_, dbname_);
-      if (!s.ok()) {
-        return s;
-      }
-    } else if (!s.ok()) {
-      assert(s.IsIOError());
-      return s;
-    }
-    s = GetDbIdentityFromIdentityFile(&db_id_);
-    if (immutable_db_options_.write_dbid_to_manifest && s.ok()) {
-      VersionEdit edit;
-      edit.SetDBId(db_id_);
-      Options options;
-      MutableCFOptions mutable_cf_options(options);
-      versions_->db_id_ = db_id_;
-      s = versions_->LogAndApply(versions_->GetColumnFamilySet()->GetDefault(),
-                             mutable_cf_options, &edit, &mutex_, nullptr,
-                             false);
-    }
-  } else {
-    s = SetIdentityFile(env_, dbname_, db_id_);
+  s = SetDBId();
+  if (s.ok() && !read_only) {
+    s = DeleteUnreferencedSstFiles();
   }
 
   if (immutable_db_options_.paranoid_checks && s.ok()) {
@@ -589,18 +563,20 @@ Status DBImpl::Recover(
     }
 
     if (immutable_db_options_.track_and_verify_wals_in_manifest) {
-      // Verify WALs in MANIFEST.
-      s = versions_->GetWalSet().CheckWals(env_, wal_files);
+      if (!immutable_db_options_.best_efforts_recovery) {
+        // Verify WALs in MANIFEST.
+        s = versions_->GetWalSet().CheckWals(env_, wal_files);
+      }  // else since best effort recovery does not recover from WALs, no need
+         // to check WALs.
     } else if (!versions_->GetWalSet().GetWals().empty()) {
       // Tracking is disabled, clear previously tracked WALs from MANIFEST,
       // otherwise, in the future, if WAL tracking is enabled again,
       // since the WALs deleted when WAL tracking is disabled are not persisted
       // into MANIFEST, WAL check may fail.
       VersionEdit edit;
-      for (const auto& wal : versions_->GetWalSet().GetWals()) {
-        WalNumber number = wal.first;
-        edit.DeleteWal(number);
-      }
+      WalNumber max_wal_number =
+          versions_->GetWalSet().GetWals().rbegin()->first;
+      edit.DeleteWalsBefore(max_wal_number + 1);
       s = versions_->LogAndApplyToDefaultColumnFamily(&edit, &mutex_);
     }
     if (!s.ok()) {
@@ -1169,7 +1145,7 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
   if (!read_only) {
     // no need to refcount since client still doesn't have access
     // to the DB and can not drop column families while we iterate
-    auto max_wal_number = wal_numbers.back();
+    const WalNumber max_wal_number = wal_numbers.back();
     for (auto cfd : *versions_->GetColumnFamilySet()) {
       auto iter = version_edits.find(cfd->GetID());
       assert(iter != version_edits.end());
@@ -1236,6 +1212,14 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
         assert(iter != version_edits.end());
         edit_lists.push_back({&iter->second});
       }
+
+      std::unique_ptr<VersionEdit> wal_deletion;
+      if (immutable_db_options_.track_and_verify_wals_in_manifest) {
+        wal_deletion.reset(new VersionEdit);
+        wal_deletion->DeleteWalsBefore(max_wal_number + 1);
+        edit_lists.back().push_back(wal_deletion.get());
+      }
+
       // write MANIFEST with update
       status = versions_->LogAndApply(cfds, cf_opts, edit_lists, &mutex_,
                                       directories_.GetDbDir(),
@@ -1365,7 +1349,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
 
       IOStatus io_s;
       s = BuildTable(
-          dbname_, versions_.get(), env_, fs_.get(), *cfd->ioptions(),
+          dbname_, versions_.get(), immutable_db_options_, *cfd->ioptions(),
           mutable_cf_options, file_options_for_compaction_, cfd->table_cache(),
           iter.get(), std::move(range_del_iters), &meta, &blob_file_additions,
           cfd->internal_comparator(), cfd->int_tbl_prop_collector_factories(),
@@ -1386,6 +1370,9 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
                       cfd->GetName().c_str(), meta.fd.GetNumber(),
                       meta.fd.GetFileSize(), s.ToString().c_str());
       mutex_.Lock();
+
+      io_s.PermitUncheckedError();  // TODO(AR) is this correct, or should we
+                                    // return io_s if not ok()?
     }
   }
   ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
@@ -1393,7 +1380,6 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
   // Note that if file_size is zero, the file has been deleted and
   // should not be added to the manifest.
   const bool has_output = meta.fd.GetFileSize() > 0;
-  assert(has_output || blob_file_additions.empty());
 
   constexpr int level = 0;
 
@@ -1413,14 +1399,15 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
 
   if (has_output) {
     stats.bytes_written = meta.fd.GetFileSize();
-
-    const auto& blobs = edit->GetBlobFileAdditions();
-    for (const auto& blob : blobs) {
-      stats.bytes_written += blob.GetTotalBlobBytes();
-    }
-
-    stats.num_output_files = static_cast<int>(blobs.size()) + 1;
+    stats.num_output_files = 1;
   }
+
+  const auto& blobs = edit->GetBlobFileAdditions();
+  for (const auto& blob : blobs) {
+    stats.bytes_written += blob.GetTotalBlobBytes();
+  }
+
+  stats.num_output_files += static_cast<int>(blobs.size());
 
   cfd->internal_stats()->AddCompactionStats(level, Env::Priority::USER, stats);
   cfd->internal_stats()->AddCFStats(InternalStats::BYTES_FLUSHED,
@@ -1581,6 +1568,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       InstrumentedMutexLock wl(&impl->log_write_mutex_);
       impl->logfile_number_ = new_log_number;
       assert(new_log != nullptr);
+      assert(impl->logs_.empty());
       impl->logs_.emplace_back(new_log_number, new_log);
     }
 
@@ -1753,9 +1741,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
     for (auto& path : paths) {
       std::vector<std::string> existing_files;
-      // TODO: Check for errors here?
       impl->immutable_db_options_.env->GetChildren(path, &existing_files)
-          .PermitUncheckedError();
+          .PermitUncheckedError();  //**TODO: What do to on error?
       for (auto& file_name : existing_files) {
         uint64_t file_number;
         FileType file_type;

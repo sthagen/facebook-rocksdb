@@ -16,9 +16,6 @@
 #include <errno.h>
 #include <fcntl.h>
 
-#if defined(OS_LINUX)
-#include <linux/fs.h>
-#endif
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -29,7 +26,6 @@
 #include <sys/stat.h>
 #if defined(OS_LINUX) || defined(OS_SOLARIS) || defined(OS_ANDROID)
 #include <sys/statfs.h>
-#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #endif
 #include <sys/statvfs.h>
@@ -52,7 +48,6 @@
 
 #include "env/composite_env_wrapper.h"
 #include "env/io_posix.h"
-#include "logging/logging.h"
 #include "logging/posix_logger.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/thread_status_updater.h"
@@ -771,9 +766,9 @@ class PosixFileSystem : public FileSystem {
     // closed, all locks the process holds for that *file* are released
     const auto it_success = locked_files.insert({fname, lhi});
     if (it_success.second == false) {
+      LockHoldingInfo prev_info = it_success.first->second;
       mutex_locked_files.Unlock();
       errno = ENOLCK;
-      LockHoldingInfo& prev_info = it_success.first->second;
       // Note that the thread ID printed is the same one as the one in
       // posix logger, but posix logger prints it hex format.
       return IOError("lock hold by current process, acquire time " +

@@ -21,7 +21,6 @@
 
 #include "db/dbformat.h"
 #include "index_builder.h"
-#include "port/lang.h"
 
 #include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
@@ -56,7 +55,6 @@ namespace ROCKSDB_NAMESPACE {
 extern const std::string kHashIndexPrefixesBlock;
 extern const std::string kHashIndexPrefixesMetadataBlock;
 
-typedef BlockBasedTableOptions::IndexType IndexType;
 
 // Without anonymous namespace here, we fail the warning -Wmissing-prototypes
 namespace {
@@ -79,8 +77,9 @@ FilterBlockBuilder* CreateFilterBlockBuilder(
     if (table_opt.partition_filters) {
       assert(p_index_builder != nullptr);
       // Since after partition cut request from filter builder it takes time
-      // until index builder actully cuts the partition, we take the lower bound
-      // as partition size.
+      // until index builder actully cuts the partition, until the end of a
+      // data block potentially with many keys, we take the lower bound as
+      // partition size.
       assert(table_opt.block_size_deviation <= 100);
       auto partition_size =
           static_cast<uint32_t>(((table_opt.metadata_block_size *

@@ -26,6 +26,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -59,6 +60,7 @@ namespace log {
 class Writer;
 }
 
+class BlobIndex;
 class Compaction;
 class LogBuffer;
 class LookupKey;
@@ -680,7 +682,19 @@ class Version {
            bool* is_blob = nullptr, bool do_merge = true);
 
   void MultiGet(const ReadOptions&, MultiGetRange* range,
-                ReadCallback* callback = nullptr, bool* is_blob = nullptr);
+                ReadCallback* callback = nullptr);
+
+  // Interprets blob_index_slice as a blob reference, and (assuming the
+  // corresponding blob file is part of this Version) retrieves the blob and
+  // saves it in *value.
+  // REQUIRES: blob_index_slice stores an encoded blob reference
+  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
+                 const Slice& blob_index_slice, PinnableSlice* value) const;
+
+  // Retrieves a blob using a blob reference and saves it in *value,
+  // assuming the corresponding blob file is part of this Version.
+  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
+                 const BlobIndex& blob_index, PinnableSlice* value) const;
 
   // Loads some stats information from files. Call without mutex held. It needs
   // to be called before applying the version to the version set.
@@ -776,13 +790,6 @@ class Version {
   const Comparator* user_comparator() const {
     return storage_info_.user_comparator_;
   }
-
-  // Interprets *value as a blob reference, and (assuming the corresponding
-  // blob file is part of this Version) retrieves the blob and saves it in
-  // *value, replacing the blob reference.
-  // REQUIRES: *value stores an encoded blob reference
-  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
-                 PinnableSlice* value) const;
 
   // Returns true if the filter blocks in the specified level will not be
   // checked during read operations. In certain cases (trivial move or preload),
@@ -958,7 +965,8 @@ class VersionSet {
       const MutableCFOptions& mutable_cf_options,
       const autovector<VersionEdit*>& edit_list, InstrumentedMutex* mu,
       FSDirectory* db_directory = nullptr, bool new_descriptor_log = false,
-      const ColumnFamilyOptions* column_family_options = nullptr) {
+      const ColumnFamilyOptions* column_family_options = nullptr,
+      const std::function<void(const Status&)>& manifest_wcb = {}) {
     autovector<ColumnFamilyData*> cfds;
     cfds.emplace_back(column_family_data);
     autovector<const MutableCFOptions*> mutable_cf_options_list;
@@ -966,7 +974,8 @@ class VersionSet {
     autovector<autovector<VersionEdit*>> edit_lists;
     edit_lists.emplace_back(edit_list);
     return LogAndApply(cfds, mutable_cf_options_list, edit_lists, mu,
-                       db_directory, new_descriptor_log, column_family_options);
+                       db_directory, new_descriptor_log, column_family_options,
+                       {manifest_wcb});
   }
 
   // The across-multi-cf batch version. If edit_lists contain more than
@@ -978,7 +987,9 @@ class VersionSet {
       const autovector<autovector<VersionEdit*>>& edit_lists,
       InstrumentedMutex* mu, FSDirectory* db_directory = nullptr,
       bool new_descriptor_log = false,
-      const ColumnFamilyOptions* new_cf_options = nullptr);
+      const ColumnFamilyOptions* new_cf_options = nullptr,
+      const std::vector<std::function<void(const Status&)>>& manifest_wcbs =
+          {});
 
   static Status GetCurrentManifestPath(const std::string& dbname,
                                        FileSystem* fs,
@@ -1116,12 +1127,47 @@ class VersionSet {
     return PreComputeMinLogNumberWithUnflushedData(nullptr);
   }
   // Returns the minimum log number which still has data not flushed to any SST
+  // file.
+  // Empty column families' log number is considered to be
+  // new_log_number_for_empty_cf.
+  uint64_t PreComputeMinLogNumberWithUnflushedData(
+      uint64_t new_log_number_for_empty_cf) const {
+    uint64_t min_log_num = port::kMaxUint64;
+    for (auto cfd : *column_family_set_) {
+      // It's safe to ignore dropped column families here:
+      // cfd->IsDropped() becomes true after the drop is persisted in MANIFEST.
+      uint64_t num =
+          cfd->IsEmpty() ? new_log_number_for_empty_cf : cfd->GetLogNumber();
+      if (min_log_num > num && !cfd->IsDropped()) {
+        min_log_num = num;
+      }
+    }
+    return min_log_num;
+  }
+  // Returns the minimum log number which still has data not flushed to any SST
   // file, except data from `cfd_to_skip`.
   uint64_t PreComputeMinLogNumberWithUnflushedData(
       const ColumnFamilyData* cfd_to_skip) const {
-    uint64_t min_log_num = std::numeric_limits<uint64_t>::max();
+    uint64_t min_log_num = port::kMaxUint64;
     for (auto cfd : *column_family_set_) {
       if (cfd == cfd_to_skip) {
+        continue;
+      }
+      // It's safe to ignore dropped column families here:
+      // cfd->IsDropped() becomes true after the drop is persisted in MANIFEST.
+      if (min_log_num > cfd->GetLogNumber() && !cfd->IsDropped()) {
+        min_log_num = cfd->GetLogNumber();
+      }
+    }
+    return min_log_num;
+  }
+  // Returns the minimum log number which still has data not flushed to any SST
+  // file, except data from `cfds_to_skip`.
+  uint64_t PreComputeMinLogNumberWithUnflushedData(
+      const std::unordered_set<const ColumnFamilyData*>& cfds_to_skip) const {
+    uint64_t min_log_num = port::kMaxUint64;
+    for (auto cfd : *column_family_set_) {
+      if (cfds_to_skip.count(cfd)) {
         continue;
       }
       // It's safe to ignore dropped column families here:
@@ -1223,6 +1269,7 @@ class VersionSet {
   friend class Version;
   friend class VersionEditHandler;
   friend class VersionEditHandlerPointInTime;
+  friend class DumpManifestHandler;
   friend class DBImpl;
   friend class DBImplReadOnly;
 
@@ -1249,6 +1296,11 @@ class VersionSet {
 
   struct MutableCFState {
     uint64_t log_number;
+    std::string full_history_ts_low;
+
+    explicit MutableCFState() = default;
+    explicit MutableCFState(uint64_t _log_number, std::string ts_low)
+        : log_number(_log_number), full_history_ts_low(std::move(ts_low)) {}
   };
 
   // Save current contents to *log
@@ -1298,7 +1350,7 @@ class VersionSet {
   std::string db_id_;
   const ImmutableDBOptions* const db_options_;
   std::atomic<uint64_t> next_file_number_;
-  // Any log number equal or lower than this should be ignored during recovery,
+  // Any WAL number smaller than this should be ignored during recovery,
   // and is qualified for being deleted in 2PC mode. In non-2PC mode, this
   // number is ignored.
   std::atomic<uint64_t> min_log_number_to_keep_2pc_ = {0};
@@ -1419,8 +1471,9 @@ class ReactiveVersionSet : public VersionSet {
       const autovector<const MutableCFOptions*>& /*mutable_cf_options_list*/,
       const autovector<autovector<VersionEdit*>>& /*edit_lists*/,
       InstrumentedMutex* /*mu*/, FSDirectory* /*db_directory*/,
-      bool /*new_descriptor_log*/,
-      const ColumnFamilyOptions* /*new_cf_option*/) override {
+      bool /*new_descriptor_log*/, const ColumnFamilyOptions* /*new_cf_option*/,
+      const std::vector<std::function<void(const Status&)>>& /*manifest_wcbs*/)
+      override {
     return Status::NotSupported("not supported in reactive mode");
   }
 

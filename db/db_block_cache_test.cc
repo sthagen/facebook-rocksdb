@@ -677,7 +677,7 @@ TEST_F(DBBlockCacheTest, ParanoidFileChecks) {
   // Create a new SST file. This will further trigger a compaction
   // and generate another file.
   ASSERT_OK(Flush(1));
-  dbfull()->TEST_WaitForCompact();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ASSERT_EQ(3, /* Totally 3 files created up to now */
             TestGetTickerCount(options, BLOCK_CACHE_ADD));
 
@@ -692,7 +692,7 @@ TEST_F(DBBlockCacheTest, ParanoidFileChecks) {
   ASSERT_OK(Put(1, "1_key4", "val4"));
   ASSERT_OK(Put(1, "9_key4", "val4"));
   ASSERT_OK(Flush(1));
-  dbfull()->TEST_WaitForCompact();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ASSERT_EQ(3, /* Totally 3 files created up to now */
             TestGetTickerCount(options, BLOCK_CACHE_ADD));
 }
@@ -837,8 +837,9 @@ TEST_F(DBBlockCacheTest, CacheCompressionDict) {
   Random rnd(301);
   for (auto compression_type : compression_types) {
     Options options = CurrentOptions();
-    options.compression = compression_type;
-    options.compression_opts.max_dict_bytes = 4096;
+    options.bottommost_compression = compression_type;
+    options.bottommost_compression_opts.max_dict_bytes = 4096;
+    options.bottommost_compression_opts.enabled = true;
     options.create_if_missing = true;
     options.num_levels = 2;
     options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
@@ -859,7 +860,7 @@ TEST_F(DBBlockCacheTest, CacheCompressionDict) {
       }
       ASSERT_OK(Flush());
     }
-    dbfull()->TEST_WaitForCompact();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
     ASSERT_EQ(0, NumTableFilesAtLevel(0));
     ASSERT_EQ(kNumFiles, NumTableFilesAtLevel(1));
 
@@ -990,6 +991,9 @@ TEST_P(DBBlockCachePinningTest, TwoLevelDB) {
       ++expected_filter_misses;
       ++expected_index_misses;
     }
+  }
+  if (unpartitioned_pinning_ == PinningTier::kNone) {
+    ++expected_compression_dict_misses;
   }
   ASSERT_EQ(expected_filter_misses,
             TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS));

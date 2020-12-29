@@ -89,13 +89,14 @@ void VersionEdit::Clear() {
   blob_file_additions_.clear();
   blob_file_garbages_.clear();
   wal_additions_.clear();
-  wal_deletions_.clear();
+  wal_deletion_.Reset();
   column_family_ = 0;
   is_column_family_add_ = false;
   is_column_family_drop_ = false;
   column_family_name_.clear();
   is_in_atomic_group_ = false;
   remaining_entries_ = 0;
+  full_history_ts_low_.clear();
 }
 
 bool VersionEdit::EncodeTo(std::string* dst) const {
@@ -229,9 +230,9 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
     wal_addition.EncodeTo(dst);
   }
 
-  for (const auto& wal_deletion : wal_deletions_) {
+  if (!wal_deletion_.IsEmpty()) {
     PutVarint32(dst, kWalDeletion);
-    wal_deletion.EncodeTo(dst);
+    wal_deletion_.EncodeTo(dst);
   }
 
   // 0 is default and does not need to be explicitly written
@@ -251,6 +252,11 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
   if (is_in_atomic_group_) {
     PutVarint32(dst, kInAtomicGroup);
     PutVarint32(dst, remaining_entries_);
+  }
+
+  if (HasFullHistoryTsLow()) {
+    PutVarint32(dst, kFullHistoryTsLow);
+    PutLengthPrefixedSlice(dst, full_history_ts_low_);
   }
   return true;
 }
@@ -576,7 +582,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           return s;
         }
 
-        wal_deletions_.emplace_back(std::move(wal_deletion));
+        wal_deletion_ = std::move(wal_deletion);
         break;
       }
 
@@ -609,6 +615,16 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           if (!msg) {
             msg = "remaining entries";
           }
+        }
+        break;
+
+      case kFullHistoryTsLow:
+        if (!GetLengthPrefixedSlice(&input, &str)) {
+          msg = "full_history_ts_low";
+        } else if (str.empty()) {
+          msg = "full_history_ts_low: empty";
+        } else {
+          full_history_ts_low_.assign(str.data(), str.size());
         }
         break;
 
@@ -725,9 +741,9 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append(wal_addition.DebugString());
   }
 
-  for (const auto& wal_deletion : wal_deletions_) {
+  if (!wal_deletion_.IsEmpty()) {
     r.append("\n  WalDeletion: ");
-    r.append(wal_deletion.DebugString());
+    r.append(wal_deletion_.DebugString());
   }
 
   r.append("\n  ColumnFamily: ");
@@ -743,6 +759,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append("\n  AtomicGroup: ");
     AppendNumberTo(&r, remaining_entries_);
     r.append(" entries remains");
+  }
+  if (HasFullHistoryTsLow()) {
+    r.append("\n FullHistoryTsLow: ");
+    r.append(Slice(full_history_ts_low_).ToString(hex_key));
   }
   r.append("\n}\n");
   return r;
@@ -854,18 +874,11 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
     jw.EndArray();
   }
 
-  if (!wal_deletions_.empty()) {
-    jw << "WalDeletions";
-
-    jw.StartArray();
-
-    for (const auto& wal_deletion : wal_deletions_) {
-      jw.StartArrayedObject();
-      jw << wal_deletion;
-      jw.EndArrayedObject();
-    }
-
-    jw.EndArray();
+  if (!wal_deletion_.IsEmpty()) {
+    jw << "WalDeletion";
+    jw.StartObject();
+    jw << wal_deletion_;
+    jw.EndObject();
   }
 
   jw << "ColumnFamily" << column_family_;
@@ -878,6 +891,10 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
   }
   if (is_in_atomic_group_) {
     jw << "AtomicGroup" << remaining_entries_;
+  }
+
+  if (HasFullHistoryTsLow()) {
+    jw << "FullHistoryTsLow" << Slice(full_history_ts_low_).ToString(hex_key);
   }
 
   jw.EndObject();

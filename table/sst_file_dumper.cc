@@ -177,8 +177,10 @@ Status SstFileDumper::VerifyChecksum() {
 Status SstFileDumper::DumpTable(const std::string& out_filename) {
   std::unique_ptr<WritableFile> out_file;
   Env* env = options_.env;
-  env->NewWritableFile(out_filename, &out_file, soptions_);
-  Status s = table_reader_->DumpTable(out_file.get());
+  Status s = env->NewWritableFile(out_filename, &out_file, soptions_);
+  if (s.ok()) {
+    s = table_reader_->DumpTable(out_file.get());
+  }
   if (!s.ok()) {
     // close the file before return error, ignore the close error if there's any
     out_file->Close().PermitUncheckedError();
@@ -441,9 +443,9 @@ Status SstFileDumper::ReadSequential(bool print_kv, uint64_t read_num,
     if (read_num > 0 && i > read_num) break;
 
     ParsedInternalKey ikey;
-    if (ParseInternalKey(key, &ikey) != Status::OK()) {
-      std::cerr << "Internal Key [" << key.ToString(true /* in hex*/)
-                << "] parse error!\n";
+    Status pik_status = ParseInternalKey(key, &ikey, true /* log_err_key */);
+    if (!pik_status.ok()) {
+      std::cerr << pik_status.getState() << "\n";
       continue;
     }
 
@@ -459,7 +461,8 @@ Status SstFileDumper::ReadSequential(bool print_kv, uint64_t read_num,
 
     if (print_kv) {
       if (!decode_blob_index_ || ikey.type != kTypeBlobIndex) {
-        fprintf(stdout, "%s => %s\n", ikey.DebugString(output_hex_).c_str(),
+        fprintf(stdout, "%s => %s\n",
+                ikey.DebugString(true, output_hex_).c_str(),
                 value.ToString(output_hex_).c_str());
       } else {
         BlobIndex blob_index;
@@ -467,11 +470,12 @@ Status SstFileDumper::ReadSequential(bool print_kv, uint64_t read_num,
         const Status s = blob_index.DecodeFrom(value);
         if (!s.ok()) {
           fprintf(stderr, "%s => error decoding blob index\n",
-                  ikey.DebugString(output_hex_).c_str());
+                  ikey.DebugString(true, output_hex_).c_str());
           continue;
         }
 
-        fprintf(stdout, "%s => %s\n", ikey.DebugString(output_hex_).c_str(),
+        fprintf(stdout, "%s => %s\n",
+                ikey.DebugString(true, output_hex_).c_str(),
                 blob_index.DebugString(output_hex_).c_str());
       }
     }

@@ -200,28 +200,28 @@ bool DBTestBase::ChangeCompactOptions() {
     Destroy(last_options_);
     auto options = CurrentOptions();
     options.create_if_missing = true;
-    TryReopen(options);
+    Reopen(options);
     return true;
   } else if (option_config_ == kUniversalCompaction) {
     option_config_ = kUniversalCompactionMultiLevel;
     Destroy(last_options_);
     auto options = CurrentOptions();
     options.create_if_missing = true;
-    TryReopen(options);
+    Reopen(options);
     return true;
   } else if (option_config_ == kUniversalCompactionMultiLevel) {
     option_config_ = kLevelSubcompactions;
     Destroy(last_options_);
     auto options = CurrentOptions();
     assert(options.max_subcompactions > 1);
-    TryReopen(options);
+    Reopen(options);
     return true;
   } else if (option_config_ == kLevelSubcompactions) {
     option_config_ = kUniversalSubcompactions;
     Destroy(last_options_);
     auto options = CurrentOptions();
     assert(options.max_subcompactions > 1);
-    TryReopen(options);
+    Reopen(options);
     return true;
   } else {
     return false;
@@ -236,7 +236,7 @@ bool DBTestBase::ChangeWalOptions() {
     auto options = CurrentOptions();
     Destroy(options);
     options.create_if_missing = true;
-    TryReopen(options);
+    Reopen(options);
     return true;
   } else if (option_config_ == kDBLogDir) {
     option_config_ = kWalDirAndMmapReads;
@@ -244,14 +244,14 @@ bool DBTestBase::ChangeWalOptions() {
     auto options = CurrentOptions();
     Destroy(options);
     options.create_if_missing = true;
-    TryReopen(options);
+    Reopen(options);
     return true;
   } else if (option_config_ == kWalDirAndMmapReads) {
     option_config_ = kRecycleLogFiles;
     Destroy(last_options_);
     auto options = CurrentOptions();
     Destroy(options);
-    TryReopen(options);
+    Reopen(options);
     return true;
   } else {
     return false;
@@ -331,7 +331,7 @@ Options DBTestBase::CurrentOptions(
   return GetOptions(option_config_, default_options, options_override);
 }
 
-Options DBTestBase::GetDefaultOptions() {
+Options DBTestBase::GetDefaultOptions() const {
   Options options;
   options.write_buffer_size = 4090 * 4096;
   options.target_file_size_base = 2 * 1024 * 1024;
@@ -339,6 +339,10 @@ Options DBTestBase::GetDefaultOptions() {
   options.max_open_files = 5000;
   options.wal_recovery_mode = WALRecoveryMode::kTolerateCorruptedTailRecords;
   options.compaction_pri = CompactionPri::kByCompensatedSize;
+  options.env = env_;
+  if (!env_->skip_fsync_) {
+    options.track_and_verify_wals_in_manifest = true;
+  }
   return options;
 }
 
@@ -367,28 +371,28 @@ Options DBTestBase::GetOptions(
       options.unordered_write = false;
       break;
     case kPlainTableFirstBytePrefix:
-      options.table_factory.reset(new PlainTableFactory());
+      options.table_factory.reset(NewPlainTableFactory());
       options.prefix_extractor.reset(NewFixedPrefixTransform(1));
       options.allow_mmap_reads = can_allow_mmap;
       options.max_sequential_skip_in_iterations = 999999;
       set_block_based_table_factory = false;
       break;
     case kPlainTableCappedPrefix:
-      options.table_factory.reset(new PlainTableFactory());
+      options.table_factory.reset(NewPlainTableFactory());
       options.prefix_extractor.reset(NewCappedPrefixTransform(8));
       options.allow_mmap_reads = can_allow_mmap;
       options.max_sequential_skip_in_iterations = 999999;
       set_block_based_table_factory = false;
       break;
     case kPlainTableCappedPrefixNonMmap:
-      options.table_factory.reset(new PlainTableFactory());
+      options.table_factory.reset(NewPlainTableFactory());
       options.prefix_extractor.reset(NewCappedPrefixTransform(8));
       options.allow_mmap_reads = false;
       options.max_sequential_skip_in_iterations = 999999;
       set_block_based_table_factory = false;
       break;
     case kPlainTableAllBytesPrefix:
-      options.table_factory.reset(new PlainTableFactory());
+      options.table_factory.reset(NewPlainTableFactory());
       options.prefix_extractor.reset(NewNoopTransform());
       options.allow_mmap_reads = can_allow_mmap;
       options.max_sequential_skip_in_iterations = 999999;
@@ -676,7 +680,7 @@ void DBTestBase::Close() {
 void DBTestBase::DestroyAndReopen(const Options& options) {
   // Destroy using last options
   Destroy(last_options_);
-  ASSERT_OK(TryReopen(options));
+  Reopen(options);
 }
 
 void DBTestBase::Destroy(const Options& options, bool delete_cf_paths) {
@@ -704,9 +708,9 @@ Status DBTestBase::TryReopen(const Options& options) {
   // Note: operator= is an unsafe approach here since it destructs
   // std::shared_ptr in the same order of their creation, in contrast to
   // destructors which destructs them in the opposite order of creation. One
-  // particular problme is that the cache destructor might invoke callback
+  // particular problem is that the cache destructor might invoke callback
   // functions that use Option members such as statistics. To work around this
-  // problem, we manually call destructor of table_facotry which eventually
+  // problem, we manually call destructor of table_factory which eventually
   // clears the block cache.
   last_options_ = options;
   MaybeInstallTimeElapseOnlySleep(options);
@@ -963,7 +967,8 @@ std::string DBTestBase::AllEntriesFor(const Slice& user_key, int cf) {
     bool first = true;
     while (iter->Valid()) {
       ParsedInternalKey ikey(Slice(), 0, kTypeValue);
-      if (ParseInternalKey(iter->key(), &ikey) != Status::OK()) {
+      if (ParseInternalKey(iter->key(), &ikey, true /* log_err_key */) !=
+          Status::OK()) {
         result += "CORRUPTED";
       } else {
         if (!last_options_.comparator->Equal(ikey.user_key, user_key)) {
@@ -1124,11 +1129,12 @@ std::string DBTestBase::FilesPerLevel(int cf) {
 
 size_t DBTestBase::CountFiles() {
   std::vector<std::string> files;
-  env_->GetChildren(dbname_, &files);
+  EXPECT_OK(env_->GetChildren(dbname_, &files));
 
   std::vector<std::string> logfiles;
   if (dbname_ != last_options_.wal_dir) {
-    env_->GetChildren(last_options_.wal_dir, &logfiles);
+    Status s = env_->GetChildren(last_options_.wal_dir, &logfiles);
+    EXPECT_TRUE(s.ok() || s.IsNotFound());
   }
 
   return files.size() + logfiles.size();
@@ -1261,8 +1267,8 @@ void DBTestBase::GenerateNewRandomFile(Random* rnd, bool nowait) {
   }
   ASSERT_OK(Put("key" + rnd->RandomString(7), rnd->RandomString(200)));
   if (!nowait) {
-    dbfull()->TEST_WaitForFlushMemTable();
-    dbfull()->TEST_WaitForCompact();
+    ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
   }
 }
 
@@ -1370,12 +1376,12 @@ void DBTestBase::validateNumberOfEntries(int numValues, int cf) {
                                            kMaxSequenceNumber));
   }
   iter->SeekToFirst();
-  ASSERT_EQ(iter->status().ok(), true);
+  ASSERT_OK(iter->status());
   int seq = numValues;
   while (iter->Valid()) {
     ParsedInternalKey ikey;
     ikey.clear();
-    ASSERT_OK(ParseInternalKey(iter->key(), &ikey));
+    ASSERT_OK(ParseInternalKey(iter->key(), &ikey, true /* log_err_key */));
 
     // checks sequence number for updates
     ASSERT_EQ(ikey.sequence, (unsigned)seq--);
@@ -1580,7 +1586,7 @@ void DBTestBase::VerifyDBInternal(
   for (auto p : true_data) {
     ASSERT_TRUE(iter->Valid());
     ParsedInternalKey ikey;
-    ASSERT_OK(ParseInternalKey(iter->key(), &ikey));
+    ASSERT_OK(ParseInternalKey(iter->key(), &ikey, true /* log_err_key */));
     ASSERT_EQ(p.first, ikey.user_key);
     ASSERT_EQ(p.second, iter->value());
     iter->Next();

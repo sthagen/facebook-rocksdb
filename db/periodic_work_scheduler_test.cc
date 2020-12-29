@@ -13,8 +13,9 @@ namespace ROCKSDB_NAMESPACE {
 class PeriodicWorkSchedulerTest : public DBTestBase {
  public:
   PeriodicWorkSchedulerTest()
-      : DBTestBase("/periodic_work_scheduler_test", /*env_do_fsync=*/true),
-        mock_env_(new MockTimeEnv(Env::Default())) {}
+      : DBTestBase("/periodic_work_scheduler_test", /*env_do_fsync=*/true) {
+    mock_env_.reset(new MockTimeEnv(env_));
+  }
 
  protected:
   std::unique_ptr<MockTimeEnv> mock_env_;
@@ -184,7 +185,7 @@ TEST_F(PeriodicWorkSchedulerTest, MultiInstances) {
   ASSERT_EQ(expected_run, pst_st_counter);
 
   for (int i = half; i < kInstanceNum; i++) {
-    dbs[i]->Close();
+    ASSERT_OK(dbs[i]->Close());
     delete dbs[i];
   }
 }
@@ -216,7 +217,7 @@ TEST_F(PeriodicWorkSchedulerTest, MultiEnv) {
   ASSERT_EQ(dbi->TEST_GetPeriodicWorkScheduler(),
             dbfull()->TEST_GetPeriodicWorkScheduler());
 
-  db->Close();
+  ASSERT_OK(db->Close());
   delete db;
   Close();
 }

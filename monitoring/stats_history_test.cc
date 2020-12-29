@@ -32,8 +32,9 @@ namespace ROCKSDB_NAMESPACE {
 class StatsHistoryTest : public DBTestBase {
  public:
   StatsHistoryTest()
-      : DBTestBase("/stats_history_test", /*env_do_fsync=*/true),
-        mock_env_(new MockTimeEnv(Env::Default())) {}
+      : DBTestBase("/stats_history_test", /*env_do_fsync=*/true) {
+    mock_env_.reset(new MockTimeEnv(env_));
+  }
 
  protected:
   std::unique_ptr<MockTimeEnv> mock_env_;
@@ -552,7 +553,7 @@ TEST_F(StatsHistoryTest, PersistentStatsReadOnly) {
 
   // Reopen and flush memtable.
   ASSERT_OK(TryReopen(options));
-  Flush();
+  ASSERT_OK(Flush());
   Close();
   // Now check keys in read only mode.
   ASSERT_OK(ReadOnlyReopen(options));

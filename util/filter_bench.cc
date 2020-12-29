@@ -80,7 +80,8 @@ DEFINE_bool(new_builder, false,
 
 DEFINE_uint32(impl, 0,
               "Select filter implementation. Without -use_plain_table_bloom:"
-              "0 = full filter, 1 = block-based filter. With "
+              "0 = legacy full Bloom filter, 1 = block-based Bloom filter, "
+              "2 = format_version 5 Bloom filter, 3 = Ribbon128 filter. With "
               "-use_plain_table_bloom: 0 = no locality, 1 = locality.");
 
 DEFINE_bool(net_includes_hashing, false,
@@ -306,9 +307,9 @@ void FilterBench::Go() {
       throw std::runtime_error(
           "Block-based filter not currently supported by filter_bench");
     }
-    if (FLAGS_impl > 2) {
+    if (FLAGS_impl > 3) {
       throw std::runtime_error(
-          "-impl must currently be 0 or 2 for Block-based table");
+          "-impl must currently be 0, 2, or 3 for Block-based table");
     }
   }
 
@@ -561,15 +562,25 @@ double FilterBench::RandomQueryTest(uint32_t inside_threshold, bool dry_run,
     // 100% of queries to 1 filter
     num_primary_filters = 1;
   } else if (mode == kFiftyOneFilter) {
+    if (num_infos < 50) {
+      return 0.0;  // skip
+    }
     // 50% of queries
     primary_filter_threshold /= 2;
     // to 1% of filters
     num_primary_filters = (num_primary_filters + 99) / 100;
   } else if (mode == kEightyTwentyFilter) {
+    if (num_infos < 5) {
+      return 0.0;  // skip
+    }
     // 80% of queries
     primary_filter_threshold = primary_filter_threshold / 5 * 4;
     // to 20% of filters
     num_primary_filters = (num_primary_filters + 4) / 5;
+  } else if (mode == kRandomFilter) {
+    if (num_infos == 1) {
+      return 0.0;  // skip
+    }
   }
   uint32_t batch_size = 1;
   std::unique_ptr<Slice[]> batch_slices;

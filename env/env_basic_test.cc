@@ -228,8 +228,8 @@ TEST_P(EnvBasicTestWithParam, Basics) {
   ASSERT_EQ(Status::NotFound(), env_->FileExists(test_dir_ + "/g"));
   ASSERT_OK(env_->GetChildren(test_dir_, &children));
   ASSERT_EQ(0U, children.size());
-  ASSERT_TRUE(
-      env_->GetChildren(test_dir_ + "/non_existent", &children).IsNotFound());
+  Status s = env_->GetChildren(test_dir_ + "/non_existent", &children);
+  ASSERT_TRUE(s.IsNotFound());
 }
 
 TEST_P(EnvBasicTestWithParam, ReadWrite) {
@@ -325,7 +325,7 @@ TEST_P(EnvMoreTestWithParam, MakeDir) {
   ASSERT_OK(env_->CreateDir(test_dir_ + "/j"));
   ASSERT_OK(env_->FileExists(test_dir_ + "/j"));
   std::vector<std::string> children;
-  env_->GetChildren(test_dir_, &children);
+  ASSERT_OK(env_->GetChildren(test_dir_, &children));
   ASSERT_EQ(1U, children.size());
   // fail because file already exists
   ASSERT_TRUE(!env_->CreateDir(test_dir_ + "/j").ok());

@@ -100,6 +100,7 @@ default_params = {
     "mock_direct_io": False,
     "use_full_merge_v1": lambda: random.randint(0, 1),
     "use_merge": lambda: random.randint(0, 1),
+    "use_ribbon_filter": lambda: random.randint(0, 1),
     "verify_checksum": 1,
     "write_buffer_size": 4 * 1024 * 1024,
     "writepercent": 35,
@@ -137,6 +138,8 @@ default_params = {
     "sync_fault_injection": False,
     "get_property_one_in": 1000000,
     "paranoid_file_checks": lambda: random.choice([0, 1, 1, 1]),
+    "max_write_buffer_size_to_maintain": lambda: random.choice(
+        [0, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024]),
 }
 
 _TEST_DIR_ENV_VAR = 'TEST_TMPDIR'
@@ -276,8 +279,11 @@ def finalize_and_sanitize(src_params):
             or dest_params["use_direct_reads"] == 1) and \
             not is_direct_io_supported(dest_params["db"]):
         if is_release_mode():
-            print("{} does not support direct IO".format(dest_params["db"]))
-            sys.exit(1)
+            print("{} does not support direct IO. Disabling use_direct_reads and "
+                    "use_direct_io_for_flush_and_compaction.\n".format(
+                        dest_params["db"]))
+            dest_params["use_direct_reads"] = 0
+            dest_params["use_direct_io_for_flush_and_compaction"] = 0
         else:
             dest_params["mock_direct_io"] = True
 
@@ -293,6 +299,7 @@ def finalize_and_sanitize(src_params):
     if dest_params.get("disable_wal", 0) == 1:
         dest_params["atomic_flush"] = 1
         dest_params["sync"] = 0
+        dest_params["write_fault_one_in"] = 0
     if dest_params.get("open_files", 1) != -1:
         # Compaction TTL and periodic compactions are only compatible
         # with open_files = -1

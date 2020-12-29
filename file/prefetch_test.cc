@@ -25,7 +25,7 @@ class MockRandomAccessFile : public FSRandomAccessFileWrapper {
       prefetch_count_.fetch_add(1);
       return target()->Prefetch(offset, n, options, dbg);
     } else {
-      return IOStatus::NotSupported();
+      return IOStatus::NotSupported("Prefetch not supported");
     }
   }
 
@@ -37,9 +37,9 @@ class MockRandomAccessFile : public FSRandomAccessFileWrapper {
 
 class MockFS : public FileSystemWrapper {
  public:
-  explicit MockFS(bool support_prefetch)
-      : FileSystemWrapper(FileSystem::Default()),
-        support_prefetch_(support_prefetch) {}
+  explicit MockFS(const std::shared_ptr<FileSystem>& wrapped,
+                  bool support_prefetch)
+      : FileSystemWrapper(wrapped), support_prefetch_(support_prefetch) {}
 
   IOStatus NewRandomAccessFile(const std::string& fname,
                                const FileOptions& opts,
@@ -79,9 +79,9 @@ TEST_P(PrefetchTest, Basic) {
 
   // Second param is if directIO is enabled or not
   bool use_direct_io = std::get<1>(GetParam());
-
   const int kNumKeys = 1100;
-  std::shared_ptr<MockFS> fs = std::make_shared<MockFS>(support_prefetch);
+  std::shared_ptr<MockFS> fs =
+      std::make_shared<MockFS>(env_->GetFileSystem(), support_prefetch);
   std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
   Options options = CurrentOptions();
   options.write_buffer_size = 1024;
@@ -109,21 +109,21 @@ TEST_P(PrefetchTest, Basic) {
   // create first key range
   WriteBatch batch;
   for (int i = 0; i < kNumKeys; i++) {
-    batch.Put(BuildKey(i), "value for range 1 key");
+    ASSERT_OK(batch.Put(BuildKey(i), "value for range 1 key"));
   }
   ASSERT_OK(db_->Write(WriteOptions(), &batch));
 
   // create second key range
   batch.Clear();
   for (int i = 0; i < kNumKeys; i++) {
-    batch.Put(BuildKey(i, "key2"), "value for range 2 key");
+    ASSERT_OK(batch.Put(BuildKey(i, "key2"), "value for range 2 key"));
   }
   ASSERT_OK(db_->Write(WriteOptions(), &batch));
 
   // delete second key range
   batch.Clear();
   for (int i = 0; i < kNumKeys; i++) {
-    batch.Delete(BuildKey(i, "key2"));
+    ASSERT_OK(batch.Delete(BuildKey(i, "key2")));
   }
   ASSERT_OK(db_->Write(WriteOptions(), &batch));
 
@@ -134,7 +134,7 @@ TEST_P(PrefetchTest, Basic) {
   Slice greatest(end_key.data(), end_key.size());
 
   // commenting out the line below causes the example to work correctly
-  db_->CompactRange(CompactRangeOptions(), &least, &greatest);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &least, &greatest));
 
   if (support_prefetch && !use_direct_io) {
     // If underline file system supports prefetch, and directIO is not enabled

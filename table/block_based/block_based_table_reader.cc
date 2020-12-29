@@ -62,7 +62,6 @@
 #include "util/crc32c.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
-#include "util/xxhash.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -70,7 +69,6 @@ extern const uint64_t kBlockBasedTableMagicNumber;
 extern const std::string kHashIndexPrefixesBlock;
 extern const std::string kHashIndexPrefixesMetadataBlock;
 
-typedef BlockBasedTable::IndexReader IndexReader;
 
 // Found that 256 KB readahead size provides the best performance, based on
 // experiments, for auto readahead. Experiment data is in PR #3282.
@@ -1770,6 +1768,9 @@ void BlockBasedTable::RetrieveMultipleBlocks(
     size_t& req_idx = req_idx_for_block[valid_batch_idx];
     size_t& req_offset = req_offset_for_block[valid_batch_idx];
     valid_batch_idx++;
+    if (mget_iter->get_context) {
+      ++(mget_iter->get_context->get_context_stats_.num_data_read);
+    }
     FSReadRequest& req = read_reqs[req_idx];
     Status s = req.status;
     if (s.ok()) {
@@ -1823,13 +1824,21 @@ void BlockBasedTable::RetrieveMultipleBlocks(
 
     if (s.ok()) {
       // When the blocks share the same underlying buffer (scratch or direct io
-      // buffer), if the block is compressed, the shared buffer will be
-      // uncompressed into heap during uncompressing; otherwise, we need to
-      // manually copy the block into heap before inserting the block to block
-      // cache.
+      // buffer), we may need to manually copy the block into heap if the raw
+      // block has to be inserted into a cache. That falls into th following
+      // cases -
+      // 1. Raw block is not compressed, it needs to be inserted into the
+      //    uncompressed block cache if there is one
+      // 2. If the raw block is compressed, it needs to be inserted into the
+      //    compressed block cache if there is one
+      //
+      // In all other cases, the raw block is either uncompressed into a heap
+      // buffer or there is no cache at all.
       CompressionType compression_type =
           raw_block_contents.get_compression_type();
-      if (use_shared_buffer && compression_type == kNoCompression) {
+      if (use_shared_buffer && (compression_type == kNoCompression ||
+                                (compression_type != kNoCompression &&
+                                 rep_->table_options.block_cache_compressed))) {
         Slice raw = Slice(req.result.data() + req_offset, block_size(handle));
         raw_block_contents = BlockContents(
             CopyBufferToHeap(GetMemoryAllocator(rep_->table_options), raw),
@@ -2066,8 +2075,10 @@ bool BlockBasedTable::PrefixMayMatch(
   } else {
     prefix_extractor = rep_->table_prefix_extractor.get();
   }
-  auto user_key = ExtractUserKey(internal_key);
-  if (!prefix_extractor->InDomain(user_key)) {
+  auto ts_sz = rep_->internal_comparator.user_comparator()->timestamp_size();
+  auto user_key_without_ts =
+      ExtractUserKeyAndStripTimestamp(internal_key, ts_sz);
+  if (!prefix_extractor->InDomain(user_key_without_ts)) {
     return true;
   }
 
@@ -2082,15 +2093,16 @@ bool BlockBasedTable::PrefixMayMatch(
     if (!filter->IsBlockBased()) {
       const Slice* const const_ikey_ptr = &internal_key;
       may_match = filter->RangeMayExist(
-          read_options.iterate_upper_bound, user_key, prefix_extractor,
-          rep_->internal_comparator.user_comparator(), const_ikey_ptr,
-          &filter_checked, need_upper_bound_check, no_io, lookup_context);
+          read_options.iterate_upper_bound, user_key_without_ts,
+          prefix_extractor, rep_->internal_comparator.user_comparator(),
+          const_ikey_ptr, &filter_checked, need_upper_bound_check, no_io,
+          lookup_context);
     } else {
       // if prefix_extractor changed for block based filter, skip filter
       if (need_upper_bound_check) {
         return true;
       }
-      auto prefix = prefix_extractor->Transform(user_key);
+      auto prefix = prefix_extractor->Transform(user_key_without_ts);
       InternalKey internal_key_prefix(prefix, kMaxSequenceNumber, kTypeValue);
       auto internal_prefix = internal_key_prefix.Encode();
 
@@ -2210,21 +2222,20 @@ bool BlockBasedTable::FullFilterKeyMayMatch(
   Slice user_key = ExtractUserKey(internal_key);
   const Slice* const const_ikey_ptr = &internal_key;
   bool may_match = true;
+  size_t ts_sz = rep_->internal_comparator.user_comparator()->timestamp_size();
+  Slice user_key_without_ts = StripTimestampFromUserKey(user_key, ts_sz);
   if (rep_->whole_key_filtering) {
-    size_t ts_sz =
-        rep_->internal_comparator.user_comparator()->timestamp_size();
-    Slice user_key_without_ts = StripTimestampFromUserKey(user_key, ts_sz);
     may_match =
         filter->KeyMayMatch(user_key_without_ts, prefix_extractor, kNotValid,
                             no_io, const_ikey_ptr, get_context, lookup_context);
   } else if (!read_options.total_order_seek && prefix_extractor &&
              rep_->table_properties->prefix_extractor_name.compare(
                  prefix_extractor->Name()) == 0 &&
-             prefix_extractor->InDomain(user_key) &&
-             !filter->PrefixMayMatch(prefix_extractor->Transform(user_key),
-                                     prefix_extractor, kNotValid, no_io,
-                                     const_ikey_ptr, get_context,
-                                     lookup_context)) {
+             prefix_extractor->InDomain(user_key_without_ts) &&
+             !filter->PrefixMayMatch(
+                 prefix_extractor->Transform(user_key_without_ts),
+                 prefix_extractor, kNotValid, no_io, const_ikey_ptr,
+                 get_context, lookup_context)) {
     may_match = false;
   }
   if (may_match) {
@@ -2394,8 +2405,10 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
         // Call the *saver function on each entry/block until it returns false
         for (; biter.Valid(); biter.Next()) {
           ParsedInternalKey parsed_key;
-          if (ParseInternalKey(biter.key(), &parsed_key) != Status::OK()) {
-            s = Status::Corruption(Slice());
+          Status pik_status = ParseInternalKey(
+              biter.key(), &parsed_key, false /* log_err_key */);  // TODO
+          if (!pik_status.ok()) {
+            s = pik_status;
           }
 
           if (!get_context->SaveValue(
@@ -2718,8 +2731,10 @@ void BlockBasedTable::MultiGet(const ReadOptions& read_options,
           ParsedInternalKey parsed_key;
           Cleanable dummy;
           Cleanable* value_pinner = nullptr;
-          if (ParseInternalKey(biter->key(), &parsed_key) != Status::OK()) {
-            s = Status::Corruption(Slice());
+          Status pik_status = ParseInternalKey(
+              biter->key(), &parsed_key, false /* log_err_key */);  // TODO
+          if (!pik_status.ok()) {
+            s = pik_status;
           }
           if (biter->IsValuePinned()) {
             if (reusing_block) {

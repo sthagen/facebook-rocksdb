@@ -335,7 +335,9 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   // was not used)
   auto sfm = static_cast<SstFileManagerImpl*>(db_options.sst_file_manager.get());
   for (size_t i = 0; i < result.cf_paths.size(); i++) {
-    DeleteScheduler::CleanupDirectory(db_options.env, sfm, result.cf_paths[i].path);
+    DeleteScheduler::CleanupDirectory(db_options.env, sfm,
+                                      result.cf_paths[i].path)
+        .PermitUncheckedError();
   }
 #endif
 
@@ -449,9 +451,7 @@ void SuperVersion::Cleanup() {
     to_delete.push_back(m);
   }
   current->Unref();
-  if (cfd->Unref()) {
-    delete cfd;
-  }
+  cfd->UnrefAndTryDelete(this);
 }
 
 void SuperVersion::Init(ColumnFamilyData* new_cfd, MemTable* new_mem,
@@ -660,7 +660,7 @@ ColumnFamilyData::~ColumnFamilyData() {
   }
 }
 
-bool ColumnFamilyData::UnrefAndTryDelete() {
+bool ColumnFamilyData::UnrefAndTryDelete(SuperVersion* sv_under_cleanup) {
   int old_refs = refs_.fetch_sub(1);
   assert(old_refs > 0);
 
@@ -670,7 +670,11 @@ bool ColumnFamilyData::UnrefAndTryDelete() {
     return true;
   }
 
-  if (old_refs == 2 && super_version_ != nullptr) {
+  // If called under SuperVersion::Cleanup, we should not re-enter Cleanup on
+  // the same SuperVersion. (But while installing a new SuperVersion, this
+  // cfd could be referenced only by two SuperVersions.)
+  if (old_refs == 2 && super_version_ != nullptr &&
+      super_version_ != sv_under_cleanup) {
     // Only the super_version_ holds me
     SuperVersion* sv = super_version_;
     super_version_ = nullptr;
@@ -708,9 +712,7 @@ uint64_t ColumnFamilyData::OldestLogToKeep() {
   auto current_log = GetLogNumber();
 
   if (allow_2pc_) {
-    autovector<MemTable*> empty_list;
-    auto imm_prep_log =
-        imm()->PrecomputeMinLogContainingPrepSection(empty_list);
+    auto imm_prep_log = imm()->PrecomputeMinLogContainingPrepSection();
     auto mem_prep_log = mem()->GetMinLogContainingPrepSection();
 
     if (imm_prep_log > 0 && imm_prep_log < current_log) {
@@ -1088,7 +1090,7 @@ bool ColumnFamilyData::RangeOverlapWithCompaction(
 
 Status ColumnFamilyData::RangesOverlapWithMemtables(
     const autovector<Range>& ranges, SuperVersion* super_version,
-    bool* overlap) {
+    bool allow_data_in_errors, bool* overlap) {
   assert(overlap != nullptr);
   *overlap = false;
   // Create an InternalIterator over all unflushed memtables
@@ -1121,13 +1123,12 @@ Status ColumnFamilyData::RangesOverlapWithMemtables(
     memtable_iter->Seek(range_start.Encode());
     status = memtable_iter->status();
     ParsedInternalKey seek_result;
-    if (status.ok()) {
-      if (memtable_iter->Valid() &&
-          ParseInternalKey(memtable_iter->key(), &seek_result) !=
-              Status::OK()) {
-        status = Status::Corruption("DB have corrupted keys");
-      }
+
+    if (status.ok() && memtable_iter->Valid()) {
+      status = ParseInternalKey(memtable_iter->key(), &seek_result,
+                                allow_data_in_errors);
     }
+
     if (status.ok()) {
       if (memtable_iter->Valid() &&
           ucmp->Compare(seek_result.user_key, ranges[i].limit) <= 0) {
@@ -1340,6 +1341,15 @@ Status ColumnFamilyData::ValidateOptions(
           "Block-Based Table format. ");
     }
   }
+
+  if (cf_options.enable_blob_garbage_collection &&
+      (cf_options.blob_garbage_collection_age_cutoff < 0.0 ||
+       cf_options.blob_garbage_collection_age_cutoff > 1.0)) {
+    return Status::InvalidArgument(
+        "The age cutoff for blob garbage collection should be in the range "
+        "[0.0, 1.0].");
+  }
+
   return s;
 }
 

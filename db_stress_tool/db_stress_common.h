@@ -144,6 +144,7 @@ DECLARE_bool(enable_write_thread_adaptive_yield);
 DECLARE_int32(reopen);
 DECLARE_double(bloom_bits);
 DECLARE_bool(use_block_based_filter);
+DECLARE_bool(use_ribbon_filter);
 DECLARE_bool(partition_filters);
 DECLARE_bool(optimize_filters_for_memory);
 DECLARE_int32(index_type);
@@ -251,7 +252,7 @@ const int kRandomValueMaxFactor = 3;
 const int kValueMaxLen = 100;
 
 // wrapped posix or hdfs environment
-extern ROCKSDB_NAMESPACE::DbStressEnvWrapper* db_stress_env;
+extern ROCKSDB_NAMESPACE::Env* db_stress_env;
 #ifndef NDEBUG
 namespace ROCKSDB_NAMESPACE {
 class FaultInjectionTestFS;

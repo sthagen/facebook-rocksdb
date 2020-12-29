@@ -1305,51 +1305,6 @@ TEST_F(DBTest, DISABLED_RepeatedWritesToSameKey) {
 }
 #endif  // ROCKSDB_LITE
 
-TEST_F(DBTest, SparseMerge) {
-  do {
-    Options options = CurrentOptions();
-    options.compression = kNoCompression;
-    CreateAndReopenWithCF({"pikachu"}, options);
-
-    FillLevels("A", "Z", 1);
-
-    // Suppose there is:
-    //    small amount of data with prefix A
-    //    large amount of data with prefix B
-    //    small amount of data with prefix C
-    // and that recent updates have made small changes to all three prefixes.
-    // Check that we do not do a compaction that merges all of B in one shot.
-    const std::string value(1000, 'x');
-    Put(1, "A", "va");
-    // Write approximately 100MB of "B" values
-    for (int i = 0; i < 100000; i++) {
-      char key[100];
-      snprintf(key, sizeof(key), "B%010d", i);
-      Put(1, key, value);
-    }
-    Put(1, "C", "vc");
-    ASSERT_OK(Flush(1));
-    dbfull()->TEST_CompactRange(0, nullptr, nullptr, handles_[1]);
-
-    // Make sparse update
-    Put(1, "A", "va2");
-    Put(1, "B100", "bvalue2");
-    Put(1, "C", "vc2");
-    ASSERT_OK(Flush(1));
-
-    // Compactions should not cause us to create a situation where
-    // a file overlaps too much data at the next level.
-    ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(handles_[1]),
-              20 * 1048576);
-    dbfull()->TEST_CompactRange(0, nullptr, nullptr);
-    ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(handles_[1]),
-              20 * 1048576);
-    dbfull()->TEST_CompactRange(1, nullptr, nullptr);
-    ASSERT_LE(dbfull()->TEST_MaxNextLevelOverlappingBytes(handles_[1]),
-              20 * 1048576);
-  } while (ChangeCompactOptions());
-}
-
 #ifndef ROCKSDB_LITE
 static bool Between(uint64_t val, uint64_t low, uint64_t high) {
   bool result = (val >= low) && (val <= high);
@@ -2391,6 +2346,7 @@ TEST_F(DBTest, PurgeInfoLogs) {
   Options options = CurrentOptions();
   options.keep_log_file_num = 5;
   options.create_if_missing = true;
+  options.env = env_;
   for (int mode = 0; mode <= 1; mode++) {
     if (mode == 1) {
       options.db_log_dir = dbname_ + "_logs";
@@ -3947,6 +3903,7 @@ TEST_F(DBTest, WriteSingleThreadEntry) {
 TEST_F(DBTest, ConcurrentFlushWAL) {
   const size_t cnt = 100;
   Options options;
+  options.env = env_;
   WriteOptions wopt;
   ReadOptions ropt;
   for (bool two_write_queues : {false, true}) {
@@ -4615,6 +4572,7 @@ TEST_F(DBTest, DynamicLevelCompressionPerLevel) {
 
   Random rnd(301);
   Options options;
+  options.env = env_;
   options.create_if_missing = true;
   options.db_write_buffer_size = 20480;
   options.write_buffer_size = 20480;
@@ -5017,6 +4975,7 @@ TEST_F(DBTest, DynamicFIFOCompactionOptions) {
   Options options;
   options.ttl = 0;
   options.create_if_missing = true;
+  options.env = env_;
   DestroyAndReopen(options);
 
   // Initial defaults
@@ -5078,6 +5037,7 @@ TEST_F(DBTest, DynamicFIFOCompactionOptions) {
 TEST_F(DBTest, DynamicUniversalCompactionOptions) {
   Options options;
   options.create_if_missing = true;
+  options.env = env_;
   DestroyAndReopen(options);
 
   // Initial defaults

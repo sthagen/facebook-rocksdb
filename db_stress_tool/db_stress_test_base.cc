@@ -15,6 +15,7 @@
 #include "db_stress_tool/db_stress_table_properties_collector.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/sst_file_manager.h"
+#include "rocksdb/types.h"
 #include "util/cast_util.h"
 #include "utilities/fault_injection_fs.h"
 
@@ -22,11 +23,14 @@ namespace ROCKSDB_NAMESPACE {
 StressTest::StressTest()
     : cache_(NewCache(FLAGS_cache_size)),
       compressed_cache_(NewLRUCache(FLAGS_compressed_cache_size)),
-      filter_policy_(FLAGS_bloom_bits >= 0
-                         ? FLAGS_use_block_based_filter
-                               ? NewBloomFilterPolicy(FLAGS_bloom_bits, true)
-                               : NewBloomFilterPolicy(FLAGS_bloom_bits, false)
-                         : nullptr),
+      filter_policy_(
+          FLAGS_bloom_bits >= 0
+              ? FLAGS_use_ribbon_filter
+                    ? NewExperimentalRibbonFilterPolicy(FLAGS_bloom_bits)
+                    : FLAGS_use_block_based_filter
+                          ? NewBloomFilterPolicy(FLAGS_bloom_bits, true)
+                          : NewBloomFilterPolicy(FLAGS_bloom_bits, false)
+              : nullptr),
       db_(nullptr),
 #ifndef ROCKSDB_LITE
       txn_db_(nullptr),
@@ -522,6 +526,16 @@ void StressTest::OperateDb(ThreadState* thread) {
     fault_fs_guard->SetThreadLocalReadErrorContext(thread->shared->GetSeed(),
                                             FLAGS_read_fault_one_in);
   }
+  if (FLAGS_write_fault_one_in) {
+    IOStatus error_msg = IOStatus::IOError("Retryable IO Error");
+    error_msg.SetRetryable(true);
+    std::vector<FileType> types;
+    types.push_back(FileType::kTableFile);
+    types.push_back(FileType::kDescriptorFile);
+    types.push_back(FileType::kCurrentFile);
+    fault_fs_guard->SetRandomWriteError(
+        thread->shared->GetSeed(), FLAGS_write_fault_one_in, error_msg, types);
+  }
 #endif // NDEBUG
   thread->stats.Start();
   for (int open_cnt = 0; open_cnt <= FLAGS_reopen; ++open_cnt) {
@@ -615,7 +629,8 @@ void StressTest::OperateDb(ThreadState* thread) {
 
 #ifndef ROCKSDB_LITE
       // Verify GetLiveFiles with a 1 in N chance.
-      if (thread->rand.OneInOpt(FLAGS_get_live_files_one_in)) {
+      if (thread->rand.OneInOpt(FLAGS_get_live_files_one_in) &&
+          !FLAGS_write_fault_one_in) {
         Status status = VerifyGetLiveFiles();
         if (!status.ok()) {
           VerificationAbort(shared, "VerifyGetLiveFiles status not OK", status);
@@ -1457,7 +1472,7 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
       FLAGS_db + "/.checkpoint" + ToString(thread->tid);
   Options tmp_opts(options_);
   tmp_opts.listeners.clear();
-  tmp_opts.env = db_stress_env->target();
+  tmp_opts.env = db_stress_env;
 
   DestroyDB(checkpoint_dir, tmp_opts);
 
@@ -1490,11 +1505,11 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
       }
     }
   }
+  delete checkpoint;
+  checkpoint = nullptr;
   std::vector<ColumnFamilyHandle*> cf_handles;
   DB* checkpoint_db = nullptr;
   if (s.ok()) {
-    delete checkpoint;
-    checkpoint = nullptr;
     Options options(options_);
     options.listeners.clear();
     std::vector<ColumnFamilyDescriptor> cf_descs;
@@ -1949,6 +1964,7 @@ void StressTest::PrintEnv() const {
   fprintf(stdout, "Use dynamic level         : %d\n",
           static_cast<int>(FLAGS_level_compaction_dynamic_level_bytes));
   fprintf(stdout, "Read fault one in         : %d\n", FLAGS_read_fault_one_in);
+  fprintf(stdout, "Write fault one in        : %d\n", FLAGS_write_fault_one_in);
   fprintf(stdout, "Sync fault injection      : %d\n", FLAGS_sync_fault_injection);
   fprintf(stdout, "Best efforts recovery     : %d\n",
           static_cast<int>(FLAGS_best_efforts_recovery));
@@ -2066,6 +2082,7 @@ void StressTest::Open() {
         FLAGS_level_compaction_dynamic_level_bytes;
     options_.file_checksum_gen_factory =
         GetFileChecksumImpl(FLAGS_file_checksum_impl);
+    options_.track_and_verify_wals_in_manifest = true;
   } else {
 #ifdef ROCKSDB_LITE
     fprintf(stderr, "--options_file not supported in lite mode\n");
