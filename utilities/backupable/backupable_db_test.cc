@@ -658,14 +658,18 @@ class BackupableDBTest : public testing::Test {
     return db;
   }
 
-  void CloseAndReopenDB() {
+  void CloseAndReopenDB(bool read_only = false) {
     // Close DB
     db_.reset();
 
     // Open DB
     test_db_env_->SetLimitWrittenFiles(1000000);
     DB* db;
-    ASSERT_OK(DB::Open(options_, dbname_, &db));
+    if (read_only) {
+      ASSERT_OK(DB::OpenForReadOnly(options_, dbname_, &db));
+    } else {
+      ASSERT_OK(DB::Open(options_, dbname_, &db));
+    }
     db_.reset(db);
   }
 
@@ -827,12 +831,19 @@ class BackupableDBTest : public testing::Test {
 
   Status GetDataFilesInDB(const FileType& file_type,
                           std::vector<FileAttributes>* files) {
+    std::vector<std::string> live;
+    uint64_t ignore_manifest_size;
+    Status s = db_->GetLiveFiles(live, &ignore_manifest_size, /*flush*/ false);
+    if (!s.ok()) {
+      return s;
+    }
     std::vector<FileAttributes> children;
-    Status s = test_db_env_->GetChildrenFileAttributes(dbname_, &children);
+    s = test_db_env_->GetChildrenFileAttributes(dbname_, &children);
     for (const auto& child : children) {
       FileType type;
       uint64_t number = 0;
-      if (ParseFileName(child.name, &number, &type) && type == file_type) {
+      if (ParseFileName(child.name, &number, &type) && type == file_type &&
+          std::find(live.begin(), live.end(), "/" + child.name) != live.end()) {
         files->push_back(child);
       }
     }
@@ -1469,7 +1480,7 @@ TEST_F(BackupableDBTest, TableFileCorruptedBeforeBackup) {
   OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
                         kNoShare);
   FillDB(db_.get(), 0, keys_iteration);
-  CloseAndReopenDB();
+  CloseAndReopenDB(/*read_only*/ true);
   // corrupt a random table file in the DB directory
   ASSERT_OK(CorruptRandomDataFileInDB(kTableFile));
   // file_checksum_gen_factory is null, and thus table checksum is not
@@ -1485,7 +1496,7 @@ TEST_F(BackupableDBTest, TableFileCorruptedBeforeBackup) {
   OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
                         kNoShare);
   FillDB(db_.get(), 0, keys_iteration);
-  CloseAndReopenDB();
+  CloseAndReopenDB(/*read_only*/ true);
   // corrupt a random table file in the DB directory
   ASSERT_OK(CorruptRandomDataFileInDB(kTableFile));
   // table file checksum is enabled so we should be able to detect any
@@ -1503,7 +1514,7 @@ TEST_F(BackupableDBTest, BlobFileCorruptedBeforeBackup) {
   OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
                         kNoShare);
   FillDB(db_.get(), 0, keys_iteration);
-  CloseAndReopenDB();
+  CloseAndReopenDB(/*read_only*/ true);
   // corrupt a random blob file in the DB directory
   ASSERT_OK(CorruptRandomDataFileInDB(kBlobFile));
   // file_checksum_gen_factory is null, and thus blob checksum is not
@@ -1519,7 +1530,7 @@ TEST_F(BackupableDBTest, BlobFileCorruptedBeforeBackup) {
   OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
                         kNoShare);
   FillDB(db_.get(), 0, keys_iteration);
-  CloseAndReopenDB();
+  CloseAndReopenDB(/*read_only*/ true);
   // corrupt a random blob file in the DB directory
   ASSERT_OK(CorruptRandomDataFileInDB(kBlobFile));
 
@@ -1537,7 +1548,7 @@ TEST_P(BackupableDBTestWithParam, TableFileCorruptedBeforeBackup) {
 
   OpenDBAndBackupEngine(true /* destroy_old_data */);
   FillDB(db_.get(), 0, keys_iteration);
-  CloseAndReopenDB();
+  CloseAndReopenDB(/*read_only*/ true);
   // corrupt a random table file in the DB directory
   ASSERT_OK(CorruptRandomDataFileInDB(kTableFile));
   // cannot detect corruption since DB manifest has no table checksums
@@ -1551,7 +1562,7 @@ TEST_P(BackupableDBTestWithParam, TableFileCorruptedBeforeBackup) {
   options_.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
   OpenDBAndBackupEngine(true /* destroy_old_data */);
   FillDB(db_.get(), 0, keys_iteration);
-  CloseAndReopenDB();
+  CloseAndReopenDB(/*read_only*/ true);
   // corrupt a random table file in the DB directory
   ASSERT_OK(CorruptRandomDataFileInDB(kTableFile));
   // corruption is detected
@@ -1567,7 +1578,7 @@ TEST_P(BackupableDBTestWithParam, BlobFileCorruptedBeforeBackup) {
   options_.enable_blob_files = true;
   OpenDBAndBackupEngine(true /* destroy_old_data */);
   FillDB(db_.get(), 0, keys_iteration);
-  CloseAndReopenDB();
+  CloseAndReopenDB(/*read_only*/ true);
   // corrupt a random blob file in the DB directory
   ASSERT_OK(CorruptRandomDataFileInDB(kBlobFile));
   // cannot detect corruption since DB manifest has no blob file checksums
@@ -1581,7 +1592,7 @@ TEST_P(BackupableDBTestWithParam, BlobFileCorruptedBeforeBackup) {
   options_.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
   OpenDBAndBackupEngine(true /* destroy_old_data */);
   FillDB(db_.get(), 0, keys_iteration);
-  CloseAndReopenDB();
+  CloseAndReopenDB(/*read_only*/ true);
   // corrupt a random blob file in the DB directory
   ASSERT_OK(CorruptRandomDataFileInDB(kBlobFile));
   // corruption is detected
@@ -2050,13 +2061,15 @@ TEST_F(BackupableDBTest, TableFileCorruptionBeforeIncremental) {
       ASSERT_OK(dbi->Put(WriteOptions(), "y", Random(42).RandomString(500)));
       ASSERT_OK(dbi->Flush(FlushOptions()));
       ASSERT_OK(dbi->TEST_WaitForFlushMemTable());
-      CloseDBAndBackupEngine();
+      CloseAndReopenDB(/*read_only*/ true);
 
       std::vector<FileAttributes> table_files;
       ASSERT_OK(GetDataFilesInDB(kTableFile, &table_files));
       ASSERT_EQ(table_files.size(), 2);
       std::string tf0 = dbname_ + "/" + table_files[0].name;
       std::string tf1 = dbname_ + "/" + table_files[1].name;
+
+      CloseDBAndBackupEngine();
 
       if (corrupt_before_first_backup) {
         // This corrupts a data block, which does not cause DB open
@@ -2599,6 +2612,66 @@ TEST_F(BackupableDBTest, ReadOnlyBackupEngine) {
   DB* db = OpenDB();
   AssertExists(db, 0, 200);
   delete db;
+}
+
+TEST_F(BackupableDBTest, OpenBackupAsReadOnlyDB) {
+  DestroyDB(dbname_, options_);
+  OpenDBAndBackupEngine(true);
+  FillDB(db_.get(), 0, 100);
+  ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), true));
+  FillDB(db_.get(), 100, 200);
+  ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), true));
+  db_.reset();  // CloseDB
+  DestroyDB(dbname_, options_);
+  std::vector<BackupInfo> backup_info;
+  // First, check that we get empty fields without include_file_details
+  backup_engine_->GetBackupInfo(&backup_info, /*with file details*/ false);
+  ASSERT_EQ(backup_info.size(), 2);
+  ASSERT_EQ(backup_info[0].name_for_open, "");
+  ASSERT_FALSE(backup_info[0].env_for_open);
+
+  // Now for the real test
+  backup_info.clear();
+  backup_engine_->GetBackupInfo(&backup_info, /*with file details*/ true);
+  ASSERT_EQ(backup_info.size(), 2);
+
+  // Caution: DBOptions only holds a raw pointer to Env, so something else
+  // must keep it alive.
+  // Case 1: Keeping BackupEngine open suffices to keep Env alive
+  DB* db = nullptr;
+  Options opts = options_;
+  // Ensure some key defaults are set
+  opts.wal_dir = "";
+  opts.create_if_missing = false;
+  opts.info_log.reset();
+
+  opts.env = backup_info[0].env_for_open.get();
+  std::string name = backup_info[0].name_for_open;
+  backup_info.clear();
+  ASSERT_OK(DB::OpenForReadOnly(opts, name, &db));
+
+  AssertExists(db, 0, 100);
+  AssertEmpty(db, 100, 200);
+
+  delete db;
+  db = nullptr;
+
+  // Case 2: Keeping BackupInfo alive rather than BackupEngine also suffices
+  backup_engine_->GetBackupInfo(&backup_info, /*with file details*/ true);
+  ASSERT_EQ(backup_info.size(), 2);
+  CloseBackupEngine();
+  opts.create_if_missing = true;  // check also OK (though pointless)
+  opts.env = backup_info[1].env_for_open.get();
+  name = backup_info[1].name_for_open;
+  // Note: keeping backup_info[1] alive
+  ASSERT_OK(DB::OpenForReadOnly(opts, name, &db));
+
+  AssertExists(db, 0, 200);
+  delete db;
+  db = nullptr;
+
+  // Now try opening read-write and make sure it fails, for safety.
+  ASSERT_TRUE(DB::Open(opts, name, &db).IsIOError());
 }
 
 TEST_F(BackupableDBTest, ProgressCallbackDuringBackup) {
