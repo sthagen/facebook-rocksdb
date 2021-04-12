@@ -129,7 +129,8 @@ class BackupEngineImpl {
   ~BackupEngineImpl();
 
   Status CreateNewBackupWithMetadata(const CreateBackupOptions& options, DB* db,
-                                     const std::string& app_metadata);
+                                     const std::string& app_metadata,
+                                     BackupID* new_backup_id_ptr);
 
   Status PurgeOldBackups(uint32_t num_backups_to_keep);
 
@@ -143,6 +144,9 @@ class BackupEngineImpl {
   // latest backup comes last.
   void GetBackupInfo(std::vector<BackupInfo>* backup_info,
                      bool include_file_details) const;
+
+  Status GetBackupInfo(BackupID backup_id, BackupInfo* backup_info,
+                       bool include_file_details = false) const;
 
   void GetCorruptedBackups(std::vector<BackupID>* corrupt_backup_ids) const;
 
@@ -460,6 +464,10 @@ class BackupEngineImpl {
     mutable std::shared_ptr<Env> env_for_open_;
   };  // BackupMeta
 
+  void SetBackupInfoFromBackupMeta(BackupID id, const BackupMeta& meta,
+                                   BackupInfo* backup_info,
+                                   bool include_file_details) const;
+
   inline std::string GetAbsolutePath(
       const std::string &relative_path = "") const {
     assert(relative_path.size() == 0 || relative_path[0] != '/');
@@ -749,7 +757,7 @@ class BackupEngineImpl {
       BackupID backup_id, bool shared, const std::string& src_dir,
       const std::string& fname,  // starts with "/"
       const EnvOptions& src_env_options, RateLimiter* rate_limiter,
-      uint64_t size_bytes, uint64_t size_limit = 0,
+      FileType file_type, uint64_t size_bytes, uint64_t size_limit = 0,
       bool shared_checksum = false,
       std::function<void()> progress_callback = []() {},
       const std::string& contents = std::string(),
@@ -802,9 +810,11 @@ class BackupEngineImplThreadSafe : public BackupEngine,
 
   using BackupEngine::CreateNewBackupWithMetadata;
   Status CreateNewBackupWithMetadata(const CreateBackupOptions& options, DB* db,
-                                     const std::string& app_metadata) override {
+                                     const std::string& app_metadata,
+                                     BackupID* new_backup_id) override {
     WriteLock lock(&mutex_);
-    return impl_.CreateNewBackupWithMetadata(options, db, app_metadata);
+    return impl_.CreateNewBackupWithMetadata(options, db, app_metadata,
+                                             new_backup_id);
   }
 
   Status PurgeOldBackups(uint32_t num_backups_to_keep) override {
@@ -825,6 +835,19 @@ class BackupEngineImplThreadSafe : public BackupEngine,
   Status GarbageCollect() override {
     WriteLock lock(&mutex_);
     return impl_.GarbageCollect();
+  }
+
+  Status GetLatestBackupInfo(BackupInfo* backup_info,
+                             bool include_file_details = false) const override {
+    ReadLock lock(&mutex_);
+    return impl_.GetBackupInfo(kLatestBackupIDMarker, backup_info,
+                               include_file_details);
+  }
+
+  Status GetBackupInfo(BackupID backup_id, BackupInfo* backup_info,
+                       bool include_file_details = false) const override {
+    ReadLock lock(&mutex_);
+    return impl_.GetBackupInfo(backup_id, backup_info, include_file_details);
   }
 
   void GetBackupInfo(std::vector<BackupInfo>* backup_info,
@@ -1181,8 +1204,8 @@ Status BackupEngineImpl::Initialize() {
 }
 
 Status BackupEngineImpl::CreateNewBackupWithMetadata(
-    const CreateBackupOptions& options, DB* db,
-    const std::string& app_metadata) {
+    const CreateBackupOptions& options, DB* db, const std::string& app_metadata,
+    BackupID* new_backup_id_ptr) {
   assert(initialized_);
   assert(!read_only_);
   if (app_metadata.size() > kMaxAppMetaSize) {
@@ -1287,7 +1310,7 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
           Log(options_.info_log, "add file for backup %s", fname.c_str());
           uint64_t size_bytes = 0;
           Status st;
-          if (type == kTableFile) {
+          if (type == kTableFile || type == kBlobFile) {
             st = db_env_->GetFileSize(src_dirname + fname, &size_bytes);
           }
           EnvOptions src_env_options;
@@ -1304,6 +1327,10 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
               src_env_options =
                   db_env_->OptimizeForManifestRead(src_raw_env_options);
               break;
+            case kBlobFile:
+              src_env_options = db_env_->OptimizeForBlobFileRead(
+                  src_raw_env_options, ImmutableDBOptions(db_options));
+              break;
             default:
               // Other backed up files (like options file) are not read by live
               // DB, so don't need to worry about avoiding mixing buffered and
@@ -1314,22 +1341,25 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
           if (st.ok()) {
             st = AddBackupFileWorkItem(
                 live_dst_paths, backup_items_to_finish, new_backup_id,
-                options_.share_table_files && type == kTableFile, src_dirname,
-                fname, src_env_options, rate_limiter, size_bytes,
-                size_limit_bytes,
-                options_.share_files_with_checksum && type == kTableFile,
+                options_.share_table_files &&
+                    (type == kTableFile || type == kBlobFile),
+                src_dirname, fname, src_env_options, rate_limiter, type,
+                size_bytes, size_limit_bytes,
+                options_.share_files_with_checksum &&
+                    (type == kTableFile || type == kBlobFile),
                 options.progress_callback, "" /* contents */,
                 checksum_func_name, checksum_val);
           }
           return st;
         } /* copy_file_cb */,
-        [&](const std::string& fname, const std::string& contents, FileType) {
+        [&](const std::string& fname, const std::string& contents,
+            FileType type) {
           Log(options_.info_log, "add file for backup %s", fname.c_str());
           return AddBackupFileWorkItem(
               live_dst_paths, backup_items_to_finish, new_backup_id,
               false /* shared */, "" /* src_dir */, fname,
-              EnvOptions() /* src_env_options */, rate_limiter, contents.size(),
-              0 /* size_limit */, false /* shared_checksum */,
+              EnvOptions() /* src_env_options */, rate_limiter, type,
+              contents.size(), 0 /* size_limit */, false /* shared_checksum */,
               options.progress_callback, contents);
         } /* create_file_cb */,
         &sequence_number, options.flush_before_backup ? 0 : port::kMaxUint64,
@@ -1410,6 +1440,9 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
   // in the LATEST_BACKUP file
   latest_backup_id_ = new_backup_id;
   latest_valid_backup_id_ = new_backup_id;
+  if (new_backup_id_ptr) {
+    *new_backup_id_ptr = new_backup_id;
+  }
   ROCKS_LOG_INFO(options_.info_log, "Backup DONE. All is good");
 
   // backup_speed is in byte/second
@@ -1539,30 +1572,61 @@ Status BackupEngineImpl::DeleteBackupNoGC(BackupID backup_id) {
   return Status::OK();
 }
 
+void BackupEngineImpl::SetBackupInfoFromBackupMeta(
+    BackupID id, const BackupMeta& meta, BackupInfo* backup_info,
+    bool include_file_details) const {
+  *backup_info = BackupInfo(id, meta.GetTimestamp(), meta.GetSize(),
+                            meta.GetNumberFiles(), meta.GetAppMetadata());
+  if (include_file_details) {
+    auto& file_details = backup_info->file_details;
+    file_details.reserve(meta.GetFiles().size());
+    for (auto& file_ptr : meta.GetFiles()) {
+      BackupFileInfo& finfo = *file_details.emplace(file_details.end());
+      finfo.relative_filename = file_ptr->filename;
+      finfo.size = file_ptr->size;
+    }
+    backup_info->name_for_open = GetAbsolutePath(GetPrivateFileRel(id));
+    backup_info->name_for_open.pop_back();  // remove trailing '/'
+    backup_info->env_for_open = meta.GetEnvForOpen();
+  }
+}
+
+Status BackupEngineImpl::GetBackupInfo(BackupID backup_id,
+                                       BackupInfo* backup_info,
+                                       bool include_file_details) const {
+  assert(initialized_);
+  if (backup_id == kLatestBackupIDMarker) {
+    // Note: Read latest_valid_backup_id_ inside of lock
+    backup_id = latest_valid_backup_id_;
+  }
+  auto corrupt_itr = corrupt_backups_.find(backup_id);
+  if (corrupt_itr != corrupt_backups_.end()) {
+    return Status::Corruption(corrupt_itr->second.first.ToString());
+  }
+  auto backup_itr = backups_.find(backup_id);
+  if (backup_itr == backups_.end()) {
+    return Status::NotFound("Backup not found");
+  }
+  auto& backup = backup_itr->second;
+  if (backup->Empty()) {
+    return Status::NotFound("Backup not found");
+  }
+
+  SetBackupInfoFromBackupMeta(backup_id, *backup, backup_info,
+                              include_file_details);
+  return Status::OK();
+}
+
 void BackupEngineImpl::GetBackupInfo(std::vector<BackupInfo>* backup_info,
                                      bool include_file_details) const {
   assert(initialized_);
-  backup_info->reserve(backups_.size());
+  backup_info->resize(backups_.size());
+  size_t i = 0;
   for (auto& backup : backups_) {
     const BackupMeta& meta = *backup.second;
     if (!meta.Empty()) {
-      backup_info->push_back(BackupInfo(backup.first, meta.GetTimestamp(),
-                                        meta.GetSize(), meta.GetNumberFiles(),
-                                        meta.GetAppMetadata()));
-      BackupInfo& binfo = backup_info->back();
-      if (include_file_details) {
-        auto& file_details = binfo.file_details;
-        file_details.reserve(meta.GetFiles().size());
-        for (auto& file_ptr : meta.GetFiles()) {
-          BackupFileInfo& finfo = *file_details.emplace(file_details.end());
-          finfo.relative_filename = file_ptr->filename;
-          finfo.size = file_ptr->size;
-        }
-        binfo.name_for_open =
-            GetAbsolutePath(GetPrivateFileRel(binfo.backup_id));
-        binfo.name_for_open.pop_back();  // remove trailing '/'
-        binfo.env_for_open = meta.GetEnvForOpen();
-      }
+      SetBackupInfoFromBackupMeta(backup.first, meta, &backup_info->at(i++),
+                                  include_file_details);
     }
   }
 }
@@ -1872,9 +1936,10 @@ Status BackupEngineImpl::AddBackupFileWorkItem(
     std::vector<BackupAfterCopyOrCreateWorkItem>& backup_items_to_finish,
     BackupID backup_id, bool shared, const std::string& src_dir,
     const std::string& fname, const EnvOptions& src_env_options,
-    RateLimiter* rate_limiter, uint64_t size_bytes, uint64_t size_limit,
-    bool shared_checksum, std::function<void()> progress_callback,
-    const std::string& contents, const std::string& src_checksum_func_name,
+    RateLimiter* rate_limiter, FileType file_type, uint64_t size_bytes,
+    uint64_t size_limit, bool shared_checksum,
+    std::function<void()> progress_callback, const std::string& contents,
+    const std::string& src_checksum_func_name,
     const std::string& src_checksum_str) {
   assert(!fname.empty() && fname[0] == '/');
   assert(contents.empty() != src_dir.empty());
@@ -1887,8 +1952,8 @@ Status BackupEngineImpl::AddBackupFileWorkItem(
   std::string checksum_hex;
 
   // Whenever a default checksum function name is passed in, we will compares
-  // the corresponding checksum values after copying. Note that only table files
-  // may have a known checksum function name passed in.
+  // the corresponding checksum values after copying. Note that only table and
+  // blob files may have a known checksum function name passed in.
   //
   // If no default checksum function name is passed in and db session id is not
   // available, we will calculate the checksum *before* copying in two cases
@@ -1906,7 +1971,8 @@ Status BackupEngineImpl::AddBackupFileWorkItem(
 
   // Step 1: Prepare the relative path to destination
   if (shared && shared_checksum) {
-    if (GetNamingNoFlags() != BackupableDBOptions::kLegacyCrc32cAndFileSize) {
+    if (GetNamingNoFlags() != BackupableDBOptions::kLegacyCrc32cAndFileSize &&
+        file_type != kBlobFile) {
       // Prepare db_session_id to add to the file name
       // Ignore the returned status
       // In the failed cases, db_id and db_session_id will be empty
@@ -1938,6 +2004,11 @@ Status BackupEngineImpl::AddBackupFileWorkItem(
     // shared_checksum/<file_number>_<db_session_id>.sst
     // Otherwise, dst_relative is of the form
     // shared_checksum/<file_number>_<checksum>_<size>.sst
+    //
+    // For blob files, db_session_id is not supported with the blob file format.
+    // It uses original/legacy naming scheme.
+    // dst_relative will be of the form:
+    // shared_checksum/<file_number>_<checksum>_<size>.blob
     dst_relative = GetSharedFileWithChecksum(dst_relative, checksum_hex,
                                              size_bytes, db_session_id);
     dst_relative_tmp = GetSharedFileWithChecksumRel(dst_relative, true);
