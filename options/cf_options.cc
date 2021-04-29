@@ -687,10 +687,9 @@ const std::string OptionsHelper::kCFOptionsName = "ColumnFamilyOptions";
 
 class ConfigurableMutableCFOptions : public Configurable {
  public:
-  ConfigurableMutableCFOptions(const MutableCFOptions& mcf) {
+  explicit ConfigurableMutableCFOptions(const MutableCFOptions& mcf) {
     mutable_ = mcf;
-    ConfigurableHelper::RegisterOptions(*this, &mutable_,
-                                        &cf_mutable_options_type_info);
+    RegisterOptions(&mutable_, &cf_mutable_options_type_info);
   }
 
  protected:
@@ -705,8 +704,7 @@ class ConfigurableCFOptions : public ConfigurableMutableCFOptions {
         immutable_(ImmutableDBOptions(), opts),
         cf_options_(opts),
         opt_map_(map) {
-    ConfigurableHelper::RegisterOptions(*this, &immutable_,
-                                        &cf_immutable_options_type_info);
+    RegisterOptions(&immutable_, &cf_immutable_options_type_info);
   }
 
  protected:
@@ -795,9 +793,7 @@ ImmutableCFOptions::ImmutableCFOptions(const Options& options)
 
 ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
                                        const ColumnFamilyOptions& cf_options)
-    : logger(db_options.info_log),
-      stats(db_options.statistics),
-      compaction_style(cf_options.compaction_style),
+    : compaction_style(cf_options.compaction_style),
       compaction_pri(cf_options.compaction_pri),
       user_comparator(cf_options.comparator),
       internal_comparator(InternalKeyComparator(cf_options.comparator)),
@@ -812,8 +808,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
           cf_options.max_write_buffer_size_to_maintain),
       inplace_update_support(cf_options.inplace_update_support),
       inplace_callback(cf_options.inplace_callback),
-      info_log(logger.get()),
-      statistics(stats.get()),
+      logger(db_options.logger),
+      stats(db_options.stats),
       rate_limiter(db_options.rate_limiter),
       info_log_level(db_options.info_log_level),
       env(db_options.env),
