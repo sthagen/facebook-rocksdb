@@ -188,12 +188,13 @@ struct CompressionOptions {
 
 // Temperature of a file. Used to pass to FileSystem for a different
 // placement and/or coding.
+// Reserve some numbers in the middle, in case we need to insert new tier
+// there.
 enum class Temperature : uint8_t {
-  kHot,
-  kWarm,
-  kCold,
-  kTotal,
-  kUnknown = kTotal,
+  kUnknown = 0,
+  kHot = 0x04,
+  kWarm = 0x08,
+  kCold = 0x0C,
 };
 
 enum UpdateStatus {    // Return status For inplace update callback
@@ -390,7 +391,8 @@ struct AdvancedColumnFamilyOptions {
 
   // size of one block in arena memory allocation.
   // If <= 0, a proper value is automatically calculated (usually 1/8 of
-  // writer_buffer_size, rounded up to a multiple of 4KB).
+  // writer_buffer_size, rounded up to a multiple of 4KB, or 1MB which ever is
+  // smaller).
   //
   // There are two additional restriction of the specified size:
   // (1) size should be in the range of [4096, 2 << 30] and

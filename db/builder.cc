@@ -69,7 +69,7 @@ Status BuildTable(
     int job_id, const Env::IOPriority io_priority,
     TableProperties* table_properties, Env::WriteLifeTimeHint write_hint,
     const std::string* full_history_ts_low,
-    BlobFileCompletionCallback* blob_callback) {
+    BlobFileCompletionCallback* blob_callback, uint64_t* num_input_entries) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -88,7 +88,10 @@ Status BuildTable(
   std::unique_ptr<CompactionRangeDelAggregator> range_del_agg(
       new CompactionRangeDelAggregator(&tboptions.internal_comparator,
                                        snapshots));
+  uint64_t num_unfragmented_tombstones = 0;
   for (auto& range_del_iter : range_del_iters) {
+    num_unfragmented_tombstones +=
+        range_del_iter->num_unfragmented_tombstones();
     range_del_agg->AddTombstones(std::move(range_del_iter));
   }
 
@@ -109,6 +112,26 @@ Status BuildTable(
 
   TableProperties tp;
   if (iter->Valid() || !range_del_agg->IsEmpty()) {
+    std::unique_ptr<CompactionFilter> compaction_filter;
+    if (ioptions.compaction_filter_factory != nullptr &&
+        ioptions.compaction_filter_factory->ShouldFilterTableFileCreation(
+            tboptions.reason)) {
+      CompactionFilter::Context context;
+      context.is_full_compaction = false;
+      context.is_manual_compaction = false;
+      context.column_family_id = tboptions.column_family_id;
+      context.reason = tboptions.reason;
+      compaction_filter =
+          ioptions.compaction_filter_factory->CreateCompactionFilter(context);
+      if (compaction_filter != nullptr &&
+          !compaction_filter->IgnoreSnapshots()) {
+        s.PermitUncheckedError();
+        return Status::NotSupported(
+            "CompactionFilter::IgnoreSnapshots() = false is not supported "
+            "anymore.");
+      }
+    }
+
     TableBuilder* builder;
     std::unique_ptr<WritableFileWriter> file_writer;
     {
@@ -143,11 +166,11 @@ Status BuildTable(
       builder = NewTableBuilder(tboptions, file_writer.get());
     }
 
-    MergeHelper merge(env, tboptions.internal_comparator.user_comparator(),
-                      ioptions.merge_operator.get(), nullptr, ioptions.logger,
-                      true /* internal key corruption is not ok */,
-                      snapshots.empty() ? 0 : snapshots.back(),
-                      snapshot_checker);
+    MergeHelper merge(
+        env, tboptions.internal_comparator.user_comparator(),
+        ioptions.merge_operator.get(), compaction_filter.get(), ioptions.logger,
+        true /* internal key corruption is not ok */,
+        snapshots.empty() ? 0 : snapshots.back(), snapshot_checker);
 
     std::unique_ptr<BlobFileBuilder> blob_file_builder(
         (mutable_cf_options.enable_blob_files && blob_file_additions)
@@ -165,8 +188,8 @@ Status BuildTable(
         snapshot_checker, env, ShouldReportDetailedTime(env, ioptions.stats),
         true /* internal key corruption is not ok */, range_del_agg.get(),
         blob_file_builder.get(), ioptions.allow_data_in_errors,
-        /*compaction=*/nullptr,
-        /*compaction_filter=*/nullptr, /*shutting_down=*/nullptr,
+        /*compaction=*/nullptr, compaction_filter.get(),
+        /*shutting_down=*/nullptr,
         /*preserve_deletes_seqnum=*/0, /*manual_compaction_paused=*/nullptr,
         db_options.info_log, full_history_ts_low);
 
@@ -211,6 +234,10 @@ Status BuildTable(
 
     TEST_SYNC_POINT("BuildTable:BeforeFinishBuildTable");
     const bool empty = builder->IsEmpty();
+    if (num_input_entries != nullptr) {
+      *num_input_entries =
+          c_iter.num_input_entry_scanned() + num_unfragmented_tombstones;
+    }
     if (!s.ok() || empty) {
       builder->Abandon();
     } else {
