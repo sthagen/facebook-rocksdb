@@ -1293,7 +1293,7 @@ Status DBImpl::GetLogSizeAndMaybeTruncate(uint64_t wal_number, bool truncate,
       truncate_status = last_log->Close(IOOptions(), nullptr);
     }
     // Not a critical error if fail to truncate.
-    if (!truncate_status.ok()) {
+    if (!truncate_status.ok() && !truncate_status.IsNotSupported()) {
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
                      "Failed to truncate log #%" PRIu64 ": %s", wal_number,
                      truncate_status.ToString().c_str());
@@ -1402,7 +1402,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           0 /* level */, false /* is_bottommost */,
           TableFileCreationReason::kRecovery, current_time,
           0 /* oldest_key_time */, 0 /* file_creation_time */, db_id_,
-          db_session_id_, 0 /* target_file_size */);
+          db_session_id_, 0 /* target_file_size */, meta.fd.GetNumber());
       s = BuildTable(
           dbname_, versions_.get(), immutable_db_options_, tboptions,
           file_options_for_compaction_, cfd->table_cache(), iter.get(),

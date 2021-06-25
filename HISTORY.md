@@ -1,8 +1,32 @@
 # Rocksdb Change Log
 ## Unreleased
 ### Behavior Changes
-* Added API comments clarifying safe usage of Disable/EnableManualCompaction and EventListener callbacks for compaction.
 * Obsolete keys in the bottommost level that were preserved for a snapshot will now be cleaned upon snapshot release in all cases. This form of compaction (snapshot release triggered compaction) previously had an artificial limitation that multiple tombstones needed to be present.
+
+### Bug Fixes
+* Blob file checksums are now printed in hexadecimal format when using the `manifest_dump` `ldb` command.
+* `GetLiveFilesMetaData()` now populates the `temperature`, `oldest_ancester_time`, and `file_creation_time` fields of its `LiveFileMetaData` results when the information is available. Previously these fields always contained zero indicating unknown.
+
+### New Features
+* ldb has a new feature, `list_live_files_metadata`, that shows the live SST files, as well as their LSM storage level and the column family they belong to.
+* The new BlobDB implementation now tracks the amount of garbage in each blob file in the MANIFEST.
+
+## 6.22.0 (2021-06-18)
+### Behavior Changes
+* Added two additional tickers, MEMTABLE_PAYLOAD_BYTES_AT_FLUSH and MEMTABLE_GARBAGE_BYTES_AT_FLUSH. These stats can be used to estimate the ratio of "garbage" (outdated) bytes in the memtable that are discarded at flush time.
+* Added API comments clarifying safe usage of Disable/EnableManualCompaction and EventListener callbacks for compaction.
+### Bug Fixes
+* fs_posix.cc GetFreeSpace() always report disk space available to root even when running as non-root.  Linux defaults often have disk mounts with 5 to 10 percent of total space reserved only for root.  Out of space could result for non-root users.
+* Subcompactions are now disabled when user-defined timestamps are used, since the subcompaction boundary picking logic is currently not timestamp-aware, which could lead to incorrect results when different subcompactions process keys that only differ by timestamp.
+* Fix an issue that `DeleteFilesInRange()` may cause ongoing compaction reports corruption exception, or ASSERT for debug build. There's no actual data loss or corruption that we find.
+* Fixed confusingly duplicated output in LOG for periodic stats ("DUMPING STATS"), including "Compaction Stats" and "File Read Latency Histogram By Level".
+* Fixed performance bugs in background gathering of block cache entry statistics, that could consume a lot of CPU when there are many column families with a shared block cache.
+
+### New Features
+* Marked the Ribbon filter and optimize_filters_for_memory features as production-ready, each enabling memory savings for Bloom-like filters. Use `NewRibbonFilterPolicy` in place of `NewBloomFilterPolicy` to use Ribbon filters instead of Bloom, or `ribbonfilter` in place of `bloomfilter` in configuration string.
+* Allow `DBWithTTL` to use `DeleteRange` api just like other DBs. `DeleteRangeCF()` which executes `WriteBatchInternal::DeleteRange()` has been added to the handler in `DBWithTTLImpl::Write()` to implement it.
+* Add BlockBasedTableOptions.prepopulate_block_cache.  If enabled, it prepopulate warm/hot data blocks which are already in memory into block cache at the time of flush. On a flush, the data block that is in memory (in memtables) get flushed to the device. If using Direct IO, additional IO is incurred to read this data back into memory again, which is avoided by enabling this option and it also helps with Distributed FileSystem. More details in include/rocksdb/table.h.
+* Added a `cancel` field to `CompactRangeOptions`, allowing individual in-process manual range compactions to be cancelled.
 
 ## 6.21.0 (2021-05-21)
 ### Bug Fixes
