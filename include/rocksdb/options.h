@@ -384,12 +384,12 @@ class CompactionService : public Customizable {
   // TODO: sub-compaction is not supported, as they will have the same job_id, a
   // sub-compaction id might be added
   virtual CompactionServiceJobStatus Start(
-      const std::string& compaction_service_input, int job_id) = 0;
+      const std::string& compaction_service_input, uint64_t job_id) = 0;
 
   // Wait compaction to be finish.
   // TODO: Add output path override
   virtual CompactionServiceJobStatus WaitForComplete(
-      int job_id, std::string* compaction_service_result) = 0;
+      uint64_t job_id, std::string* compaction_service_result) = 0;
 
   virtual ~CompactionService() {}
 };
@@ -1797,6 +1797,11 @@ struct CompactionServiceOptionsOverride {
   std::shared_ptr<const SliceTransform> prefix_extractor = nullptr;
   std::shared_ptr<TableFactory> table_factory;
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory = nullptr;
+
+  // statistics is used to collect DB operation metrics, the metrics won't be
+  // returned to CompactionService primary host, to collect that, the user needs
+  // to set it here.
+  std::shared_ptr<Statistics> statistics = nullptr;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
