@@ -318,7 +318,7 @@ bool CompareCandidateFile(const JobContext::CandidateFileInfo& first,
     return (first.file_path > second.file_path);
   }
 }
-};  // namespace
+}  // namespace
 
 // Delete obsolete files and log status and information of file deletion
 void DBImpl::DeleteObsoleteFileImpl(int job_id, const std::string& fname,
@@ -524,12 +524,6 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
         break;
       case kOptionsFile:
         keep = (number >= optsfile_num2);
-        TEST_SYNC_POINT_CALLBACK(
-            "DBImpl::PurgeObsoleteFiles:CheckOptionsFiles:1",
-            reinterpret_cast<void*>(&number));
-        TEST_SYNC_POINT_CALLBACK(
-            "DBImpl::PurgeObsoleteFiles:CheckOptionsFiles:2",
-            reinterpret_cast<void*>(&keep));
         break;
       case kCurrentFile:
       case kDBLockFile:
