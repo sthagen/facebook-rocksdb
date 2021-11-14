@@ -5537,8 +5537,6 @@ TEST_F(DBTest2, TestCompactFiles) {
 }
 #endif  // ROCKSDB_LITE
 
-// TODO: figure out why this test fails in appveyor
-#ifndef OS_WIN
 TEST_F(DBTest2, MultiDBParallelOpenTest) {
   const int kNumDbs = 2;
   Options options = CurrentOptions();
@@ -5569,7 +5567,6 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
   }
 
   // Verify non-empty DBs can be recovered in parallel
-  dbs.clear();
   open_threads.clear();
   for (int i = 0; i < kNumDbs; ++i) {
     open_threads.emplace_back(
@@ -5586,7 +5583,6 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
     ASSERT_OK(DestroyDB(dbnames[i], options));
   }
 }
-#endif  // OS_WIN
 
 namespace {
 class DummyOldStats : public Statistics {
@@ -6768,14 +6764,6 @@ TEST_F(DBTest2, RenameDirectory) {
   dbname_ = old_dbname;
 }
 }  // namespace ROCKSDB_NAMESPACE
-
-#ifdef ROCKSDB_UNITTESTS_WITH_CUSTOM_OBJECTS_FROM_STATIC_LIBS
-extern "C" {
-void RegisterCustomObjects(int argc, char** argv);
-}
-#else
-void RegisterCustomObjects(int /*argc*/, char** /*argv*/) {}
-#endif  // !ROCKSDB_UNITTESTS_WITH_CUSTOM_OBJECTS_FROM_STATIC_LIBS
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
