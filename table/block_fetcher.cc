@@ -32,9 +32,9 @@ inline void BlockFetcher::ProcessTrailerIfPresent() {
   if (footer_.GetBlockTrailerSize() > 0) {
     assert(footer_.GetBlockTrailerSize() == BlockBasedTable::kBlockTrailerSize);
     if (read_options_.verify_checksums) {
-      io_status_ = status_to_io_status(
-          VerifyBlockChecksum(footer_.checksum(), slice_.data(), block_size_,
-                              file_->file_name(), handle_.offset()));
+      io_status_ = status_to_io_status(VerifyBlockChecksum(
+          footer_.checksum_type(), slice_.data(), block_size_,
+          file_->file_name(), handle_.offset()));
     }
     compression_type_ =
         BlockBasedTable::GetBlockCompressionType(slice_.data(), block_size_);
@@ -69,9 +69,10 @@ inline bool BlockFetcher::TryGetFromPrefetchBuffer() {
   if (prefetch_buffer_ != nullptr) {
     IOOptions opts;
     IOStatus io_s = file_->PrepareIOOptions(read_options_, opts);
-    if (io_s.ok() && prefetch_buffer_->TryReadFromCache(
-                         opts, handle_.offset(), block_size_with_trailer_,
-                         &slice_, &io_s, for_compaction_)) {
+    if (io_s.ok() &&
+        prefetch_buffer_->TryReadFromCache(opts, file_, handle_.offset(),
+                                           block_size_with_trailer_, &slice_,
+                                           &io_s, for_compaction_)) {
       ProcessTrailerIfPresent();
       if (!io_status_.ok()) {
         return true;
@@ -314,7 +315,7 @@ IOStatus BlockFetcher::ReadBlockContents() {
     UncompressionContext context(compression_type_);
     UncompressionInfo info(context, uncompression_dict_, compression_type_);
     io_status_ = status_to_io_status(UncompressBlockContents(
-        info, slice_.data(), block_size_, contents_, footer_.version(),
+        info, slice_.data(), block_size_, contents_, footer_.format_version(),
         ioptions_, memory_allocator_));
 #ifndef NDEBUG
     num_heap_buf_memcpy_++;
