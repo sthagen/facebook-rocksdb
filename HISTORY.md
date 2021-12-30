@@ -1,7 +1,13 @@
 # Rocksdb Change Log
+## Unreleased
+### Public API change
+* Added values to `TraceFilterType`: `kTraceFilterIteratorSeek`, `kTraceFilterIteratorSeekForPrev`, and `kTraceFilterMultiGet`. They can be set in `TraceOptions` to filter out the operation types after which they are named.
+* Added `TraceOptions::preserve_write_order`. When enabled it  guarantees write records are traced in the same order they are logged to WAL and applied to the DB. By default it is disabled (false) to match the legacy behavior and prevent regression.
+
 ## 6.28.0 (2021-12-17)
 ### New Features
 * Introduced 'CommitWithTimestamp' as a new tag. Currently, there is no API for user to trigger a write with this tag to the WAL. This is part of the efforts to support write-commited transactions with user-defined timestamps.
+* Introduce SimulatedHybridFileSystem which can help simulating HDD latency in db_bench. Tiered Storage latency simulation can be enabled using -simulate_hybrid_fs_file (note that it doesn't work if db_bench is interrupted in the middle). -simulate_hdd can also be used to simulate all files on HDD.
 
 ### Bug Fixes
 * Fixed a bug in rocksdb automatic implicit prefetching which got broken because of new feature adaptive_readahead and internal prefetching got disabled when iterator moves from one file to next.
@@ -17,6 +23,8 @@
 ### Public API change
 * Extend WriteBatch::AssignTimestamp and AssignTimestamps API so that both functions can accept an optional `checker` argument that performs additional checking on timestamp sizes.
 * Introduce a new EventListener callback that will be called upon the end of automatic error recovery.
+* Add IncreaseFullHistoryTsLow API so users can advance each column family's full_history_ts_low seperately.
+* Add GetFullHistoryTsLow API so users can query current full_history_low value of specified column family.
 
 ### Performance Improvements
 * Replaced map property `TableProperties::properties_offsets`  with uint64_t property `external_sst_file_global_seqno_offset` to save table properties's memory.
