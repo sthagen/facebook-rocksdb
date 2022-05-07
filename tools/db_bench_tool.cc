@@ -1952,9 +1952,9 @@ class ReporterAgent {
       auto secs_elapsed =
           (clock->NowMicros() - time_started + kMicrosInSecond / 2) /
           kMicrosInSecond;
-      std::string report = ToString(secs_elapsed) + "," +
-                           ToString(total_ops_done_snapshot - last_report_) +
-                           "\n";
+      std::string report =
+          std::to_string(secs_elapsed) + "," +
+          std::to_string(total_ops_done_snapshot - last_report_) + "\n";
       auto s = report_file_->Append(report);
       if (s.ok()) {
         s = report_file_->Flush();
@@ -2208,7 +2208,7 @@ class Stats {
                     if (db->GetProperty(
                             db_with_cfh->cfh[i],
                             "rocksdb.aggregated-table-properties-at-level" +
-                                ToString(level),
+                                std::to_string(level),
                             &stats)) {
                       if (stats.find("# entries=0") == std::string::npos) {
                         fprintf(stderr, "Level[%d]: %s\n", level,
@@ -2232,7 +2232,7 @@ class Stats {
                 for (int level = 0; level < FLAGS_num_levels; ++level) {
                   if (db->GetProperty(
                           "rocksdb.aggregated-table-properties-at-level" +
-                              ToString(level),
+                              std::to_string(level),
                           &stats)) {
                     if (stats.find("# entries=0") == std::string::npos) {
                       fprintf(stderr, "Level[%d]: %s\n", level, stats.c_str());
@@ -2265,25 +2265,23 @@ class Stats {
     if (done_ < 1) done_ = 1;
 
     std::string extra;
+    double elapsed = (finish_ - start_) * 1e-6;
     if (bytes_ > 0) {
       // Rate is computed on actual elapsed time, not the sum of per-thread
       // elapsed times.
-      double elapsed = (finish_ - start_) * 1e-6;
       char rate[100];
       snprintf(rate, sizeof(rate), "%6.1f MB/s",
                (bytes_ / 1048576.0) / elapsed);
       extra = rate;
     }
     AppendWithSpace(&extra, message_);
-    double elapsed = (finish_ - start_) * 1e-6;
     double throughput = (double)done_/elapsed;
 
-    fprintf(stdout, "%-12s : %11.3f micros/op %ld ops/sec;%s%s\n",
-            name.ToString().c_str(),
-            seconds_ * 1e6 / done_,
-            (long)throughput,
-            (extra.empty() ? "" : " "),
-            extra.c_str());
+    fprintf(stdout,
+            "%-12s : %11.3f micros/op %ld ops/sec %.3f seconds %" PRIu64
+            " operations;%s%s\n",
+            name.ToString().c_str(), seconds_ * 1e6 / done_, (long)throughput,
+            elapsed, done_, (extra.empty() ? "" : " "), extra.c_str());
     if (FLAGS_histogram) {
       for (auto it = hist_.begin(); it != hist_.end(); ++it) {
         fprintf(stdout, "Microseconds per %s:\n%s\n",
@@ -3144,7 +3142,7 @@ class Benchmark {
       }
 #endif
     }
-    return base_name + ToString(id);
+    return base_name + std::to_string(id);
   }
 
   void VerifyDBFromDB(std::string& truth_db_name) {
@@ -3793,7 +3791,7 @@ class Benchmark {
   static inline void ChecksumBenchmark(FnType fn, ThreadState* thread,
                                        Args... args) {
     const int size = FLAGS_block_size; // use --block_size option for db_bench
-    std::string labels = "(" + ToString(FLAGS_block_size) + " per op)";
+    std::string labels = "(" + std::to_string(FLAGS_block_size) + " per op)";
     const char* label = labels.c_str();
 
     std::string data(size, 'x');
@@ -4431,7 +4429,7 @@ class Benchmark {
           Status s = FilterPolicy::CreateFromString(
               ConfigOptions(),
               "rocksdb.internal.DeprecatedBlockBasedBloomFilter:" +
-                  ROCKSDB_NAMESPACE::ToString(FLAGS_bloom_bits),
+                  std::to_string(FLAGS_bloom_bits),
               &table_options->filter_policy);
           if (!s.ok()) {
             fprintf(stderr,
@@ -8021,14 +8019,27 @@ class Benchmark {
     flush_opt.wait = true;
 
     if (db_.db != nullptr) {
-      Status s = db_.db->Flush(flush_opt, db_.cfh);
+      Status s;
+      if (FLAGS_num_column_families > 1) {
+        s = db_.db->Flush(flush_opt, db_.cfh);
+      } else {
+        s = db_.db->Flush(flush_opt, db_.db->DefaultColumnFamily());
+      }
+
       if (!s.ok()) {
         fprintf(stderr, "Flush failed: %s\n", s.ToString().c_str());
         exit(1);
       }
     } else {
       for (const auto& db_with_cfh : multi_dbs_) {
-        Status s = db_with_cfh.db->Flush(flush_opt, db_with_cfh.cfh);
+        Status s;
+        if (FLAGS_num_column_families > 1) {
+          s = db_with_cfh.db->Flush(flush_opt, db_with_cfh.cfh);
+        } else {
+          s = db_with_cfh.db->Flush(flush_opt,
+                                    db_with_cfh.db->DefaultColumnFamily());
+        }
+
         if (!s.ok()) {
           fprintf(stderr, "Flush failed: %s\n", s.ToString().c_str());
           exit(1);
@@ -8062,7 +8073,8 @@ class Benchmark {
     }
 
     std::unique_ptr<StatsHistoryIterator> shi;
-    Status s = db->GetStatsHistory(0, port::kMaxUint64, &shi);
+    Status s =
+        db->GetStatsHistory(0, std::numeric_limits<uint64_t>::max(), &shi);
     if (!s.ok()) {
       fprintf(stdout, "%s\n", s.ToString().c_str());
       return;
