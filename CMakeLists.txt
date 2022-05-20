@@ -337,9 +337,6 @@ endif()
 # Reset the required flags
 set(CMAKE_REQUIRED_FLAGS ${OLD_CMAKE_REQUIRED_FLAGS})
 
-# thread_local is part of C++11 and later (TODO: clean up this define)
-add_definitions(-DROCKSDB_SUPPORT_THREAD_LOCAL)
-
 option(WITH_IOSTATS_CONTEXT "Enable IO stats context" ON)
 if (NOT WITH_IOSTATS_CONTEXT)
   add_definitions(-DNIOSTATS_CONTEXT)
@@ -799,6 +796,7 @@ set(SOURCES
         trace_replay/trace_record_result.cc
         trace_replay/trace_record.cc
         trace_replay/trace_replay.cc
+        util/async_file_reader.cc
         util/cleanable.cc
         util/coding.cc
         util/compaction_job_stats_impl.cc
@@ -1219,6 +1217,7 @@ if(WITH_TESTS)
         db/comparator_db_test.cc
         db/corruption_test.cc
         db/cuckoo_table_db_test.cc
+        db/db_readonly_with_timestamp_test.cc
         db/db_with_timestamp_basic_test.cc
         db/db_block_cache_test.cc
         db/db_bloom_filter_test.cc
@@ -1387,6 +1386,7 @@ if(WITH_TESTS)
 
   set(TESTUTIL_SOURCE
       db/db_test_util.cc
+      db/db_with_timestamp_test_util.cc
       monitoring/thread_status_updater_debug.cc
       table/mock_table.cc
       utilities/agg_merge/test_agg_merge.cc

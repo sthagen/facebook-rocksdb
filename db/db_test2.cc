@@ -3987,12 +3987,14 @@ TEST_F(DBTest2, RateLimitedCompactionReads) {
 
       // should be slightly above 512KB due to non-data blocks read. Arbitrarily
       // chose 1MB as the upper bound on the total bytes read.
-      size_t rate_limited_bytes =
-          options.rate_limiter->GetTotalBytesThrough(Env::IO_TOTAL);
-      // There must be no charges at non-`IO_LOW` priorities.
+      size_t rate_limited_bytes = static_cast<size_t>(
+          options.rate_limiter->GetTotalBytesThrough(Env::IO_TOTAL));
+      // The charges can exist for `IO_LOW` and `IO_USER` priorities.
+      size_t rate_limited_bytes_by_pri =
+          options.rate_limiter->GetTotalBytesThrough(Env::IO_LOW) +
+          options.rate_limiter->GetTotalBytesThrough(Env::IO_USER);
       ASSERT_EQ(rate_limited_bytes,
-                static_cast<size_t>(
-                    options.rate_limiter->GetTotalBytesThrough(Env::IO_LOW)));
+                static_cast<size_t>(rate_limited_bytes_by_pri));
       // Include the explicit prefetch of the footer in direct I/O case.
       size_t direct_io_extra = use_direct_io ? 512 * 1024 : 0;
       ASSERT_GE(
@@ -4010,9 +4012,11 @@ TEST_F(DBTest2, RateLimitedCompactionReads) {
       }
       delete iter;
       // bytes read for user iterator shouldn't count against the rate limit.
+      rate_limited_bytes_by_pri =
+          options.rate_limiter->GetTotalBytesThrough(Env::IO_LOW) +
+          options.rate_limiter->GetTotalBytesThrough(Env::IO_USER);
       ASSERT_EQ(rate_limited_bytes,
-                static_cast<size_t>(
-                    options.rate_limiter->GetTotalBytesThrough(Env::IO_LOW)));
+                static_cast<size_t>(rate_limited_bytes_by_pri));
     }
   }
 }
@@ -6305,115 +6309,118 @@ TEST_F(DBTest2, BlockBasedTablePrefixGetIndexNotFound) {
 
 #ifndef ROCKSDB_LITE
 TEST_F(DBTest2, AutoPrefixMode1) {
-  // create a DB with block prefix index
-  BlockBasedTableOptions table_options;
-  Options options = CurrentOptions();
-  table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
-  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
-  options.prefix_extractor.reset(NewFixedPrefixTransform(1));
-  options.statistics = CreateDBStatistics();
+  do {
+    // create a DB with block prefix index
+    Options options = CurrentOptions();
+    BlockBasedTableOptions table_options =
+        *options.table_factory->GetOptions<BlockBasedTableOptions>();
+    table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+    options.statistics = CreateDBStatistics();
 
-  Reopen(options);
+    Reopen(options);
 
-  Random rnd(301);
-  std::string large_value = rnd.RandomString(500);
+    Random rnd(301);
+    std::string large_value = rnd.RandomString(500);
 
-  ASSERT_OK(Put("a1", large_value));
-  ASSERT_OK(Put("x1", large_value));
-  ASSERT_OK(Put("y1", large_value));
-  ASSERT_OK(Flush());
+    ASSERT_OK(Put("a1", large_value));
+    ASSERT_OK(Put("x1", large_value));
+    ASSERT_OK(Put("y1", large_value));
+    ASSERT_OK(Flush());
 
-  ReadOptions ro;
-  ro.total_order_seek = false;
-  ro.auto_prefix_mode = true;
-  {
-    std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
-    iterator->Seek("b1");
-    ASSERT_TRUE(iterator->Valid());
-    ASSERT_EQ("x1", iterator->key().ToString());
-    ASSERT_EQ(0, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
-    ASSERT_OK(iterator->status());
-  }
+    ReadOptions ro;
+    ro.total_order_seek = false;
+    ro.auto_prefix_mode = true;
+    {
+      std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
+      iterator->Seek("b1");
+      ASSERT_TRUE(iterator->Valid());
+      ASSERT_EQ("x1", iterator->key().ToString());
+      ASSERT_EQ(0, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+      ASSERT_OK(iterator->status());
+    }
 
-  std::string ub_str = "b9";
-  Slice ub(ub_str);
-  ro.iterate_upper_bound = &ub;
-
-  {
-    std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
-    iterator->Seek("b1");
-    ASSERT_FALSE(iterator->Valid());
-    ASSERT_EQ(1, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
-    ASSERT_OK(iterator->status());
-  }
-
-  ub_str = "z";
-  ub = Slice(ub_str);
-  {
-    std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
-    iterator->Seek("b1");
-    ASSERT_TRUE(iterator->Valid());
-    ASSERT_EQ("x1", iterator->key().ToString());
-    ASSERT_EQ(1, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
-    ASSERT_OK(iterator->status());
-  }
-
-  ub_str = "c";
-  ub = Slice(ub_str);
-  {
-    std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
-    iterator->Seek("b1");
-    ASSERT_FALSE(iterator->Valid());
-    ASSERT_EQ(2, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
-    ASSERT_OK(iterator->status());
-  }
-
-  // The same queries without recreating iterator
-  {
-    ub_str = "b9";
-    ub = Slice(ub_str);
+    std::string ub_str = "b9";
+    Slice ub(ub_str);
     ro.iterate_upper_bound = &ub;
 
-    std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
-    iterator->Seek("b1");
-    ASSERT_FALSE(iterator->Valid());
-    ASSERT_EQ(3, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
-    ASSERT_OK(iterator->status());
+    {
+      std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
+      iterator->Seek("b1");
+      ASSERT_FALSE(iterator->Valid());
+      ASSERT_EQ(1, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+      ASSERT_OK(iterator->status());
+    }
 
     ub_str = "z";
     ub = Slice(ub_str);
-
-    iterator->Seek("b1");
-    ASSERT_TRUE(iterator->Valid());
-    ASSERT_EQ("x1", iterator->key().ToString());
-    ASSERT_EQ(3, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+    {
+      std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
+      iterator->Seek("b1");
+      ASSERT_TRUE(iterator->Valid());
+      ASSERT_EQ("x1", iterator->key().ToString());
+      ASSERT_EQ(1, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+      ASSERT_OK(iterator->status());
+    }
 
     ub_str = "c";
     ub = Slice(ub_str);
+    {
+      std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
+      iterator->Seek("b1");
+      ASSERT_FALSE(iterator->Valid());
+      ASSERT_EQ(2, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+      ASSERT_OK(iterator->status());
+    }
 
-    iterator->Seek("b1");
-    ASSERT_FALSE(iterator->Valid());
-    ASSERT_EQ(4, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+    // The same queries without recreating iterator
+    {
+      ub_str = "b9";
+      ub = Slice(ub_str);
+      ro.iterate_upper_bound = &ub;
 
-    ub_str = "b9";
-    ub = Slice(ub_str);
-    ro.iterate_upper_bound = &ub;
-    iterator->SeekForPrev("b1");
-    ASSERT_TRUE(iterator->Valid());
-    ASSERT_EQ("a1", iterator->key().ToString());
-    ASSERT_EQ(4, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+      std::unique_ptr<Iterator> iterator(db_->NewIterator(ro));
+      iterator->Seek("b1");
+      ASSERT_FALSE(iterator->Valid());
+      ASSERT_EQ(3, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+      ASSERT_OK(iterator->status());
 
-    ub_str = "zz";
-    ub = Slice(ub_str);
-    ro.iterate_upper_bound = &ub;
-    iterator->SeekToLast();
-    ASSERT_TRUE(iterator->Valid());
-    ASSERT_EQ("y1", iterator->key().ToString());
+      ub_str = "z";
+      ub = Slice(ub_str);
 
-    iterator->SeekToFirst();
-    ASSERT_TRUE(iterator->Valid());
-    ASSERT_EQ("a1", iterator->key().ToString());
-  }
+      iterator->Seek("b1");
+      ASSERT_TRUE(iterator->Valid());
+      ASSERT_EQ("x1", iterator->key().ToString());
+      ASSERT_EQ(3, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+
+      ub_str = "c";
+      ub = Slice(ub_str);
+
+      iterator->Seek("b1");
+      ASSERT_FALSE(iterator->Valid());
+      ASSERT_EQ(4, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+
+      ub_str = "b9";
+      ub = Slice(ub_str);
+      ro.iterate_upper_bound = &ub;
+      iterator->SeekForPrev("b1");
+      ASSERT_TRUE(iterator->Valid());
+      ASSERT_EQ("a1", iterator->key().ToString());
+      ASSERT_EQ(4, TestGetTickerCount(options, BLOOM_FILTER_PREFIX_CHECKED));
+
+      ub_str = "zz";
+      ub = Slice(ub_str);
+      ro.iterate_upper_bound = &ub;
+      iterator->SeekToLast();
+      ASSERT_TRUE(iterator->Valid());
+      ASSERT_EQ("y1", iterator->key().ToString());
+
+      iterator->SeekToFirst();
+      ASSERT_TRUE(iterator->Valid());
+      ASSERT_EQ("a1", iterator->key().ToString());
+    }
+  } while (ChangeOptions(kSkipPlainTable));
 }
 
 class RenameCurrentTest : public DBTestBase,
@@ -7143,6 +7150,112 @@ TEST_F(DBTest2, RenameDirectory) {
   ASSERT_EQ("value0", Get("foo"));
   Destroy(options);
   dbname_ = old_dbname;
+}
+
+TEST_F(DBTest2, SstUniqueIdVerifyBackwardCompatible) {
+  const int kNumSst = 3;
+  const int kLevel0Trigger = 4;
+  auto options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kLevel0Trigger;
+  options.statistics = CreateDBStatistics();
+
+  // Existing manifest doesn't have unique id
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEdit::EncodeTo:UniqueId", [&](void* arg) {
+        auto unique_id = static_cast<UniqueId64x2*>(arg);
+        // remove id before writing it to manifest
+        (*unique_id)[0] = 0;
+        (*unique_id)[1] = 0;
+      });
+  std::atomic_int skipped = 0;
+  SyncPoint::GetInstance()->SetCallBack("Version::VerifySstUniqueIds::Skipped",
+                                        [&](void* /*arg*/) { skipped++; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // generate a few SSTs
+  for (int i = 0; i < kNumSst; i++) {
+    for (int j = 0; j < 100; j++) {
+      ASSERT_OK(Put(Key(i * 10 + j), "value"));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  // Reopen without verification
+  Reopen(options);
+
+  // Reopen with verification, but it's skipped because manifest doesn't have id
+  options.verify_sst_unique_id_in_manifest = true;
+  Reopen(options);
+  ASSERT_EQ(skipped, kNumSst);
+
+  // test compaction generated Sst
+  for (int i = kNumSst; i < kLevel0Trigger; i++) {
+    for (int j = 0; j < 100; j++) {
+      ASSERT_OK(Put(Key(i * 10 + j), "value"));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+#ifndef ROCKSDB_LITE
+  ASSERT_EQ("0,1", FilesPerLevel(0));
+#endif  // ROCKSDB_LITE
+
+  // Reopen with verification should fail
+  options.verify_sst_unique_id_in_manifest = true;
+  skipped = 0;
+  Reopen(options);
+  ASSERT_EQ(skipped, 1);
+}
+
+TEST_F(DBTest2, SstUniqueIdVerify) {
+  const int kNumSst = 3;
+  const int kLevel0Trigger = 4;
+  auto options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kLevel0Trigger;
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:Start", [&](void* props_vs) {
+        auto props = static_cast<TableProperties*>(props_vs);
+        // update table property session_id to a different one
+        props->db_session_id = DBImpl::GenerateDbSessionId(nullptr);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // generate a few SSTs
+  for (int i = 0; i < kNumSst; i++) {
+    for (int j = 0; j < 100; j++) {
+      ASSERT_OK(Put(Key(i * 10 + j), "value"));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  // Reopen with verification should report corruption
+  options.verify_sst_unique_id_in_manifest = true;
+  auto s = TryReopen(options);
+  ASSERT_TRUE(s.IsCorruption());
+
+  // Reopen without verification should be fine
+  options.verify_sst_unique_id_in_manifest = false;
+  Reopen(options);
+
+  // test compaction generated Sst
+  for (int i = kNumSst; i < kLevel0Trigger; i++) {
+    for (int j = 0; j < 100; j++) {
+      ASSERT_OK(Put(Key(i * 10 + j), "value"));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+#ifndef ROCKSDB_LITE
+  ASSERT_EQ("0,1", FilesPerLevel(0));
+#endif  // ROCKSDB_LITE
+
+  // Reopen with verification should fail
+  options.verify_sst_unique_id_in_manifest = true;
+  s = TryReopen(options);
+  ASSERT_TRUE(s.IsCorruption());
 }
 
 #ifndef ROCKSDB_LITE

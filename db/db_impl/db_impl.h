@@ -1974,6 +1974,11 @@ class DBImpl : public DB {
   IOStatus CreateWAL(uint64_t log_file_num, uint64_t recycle_log_number,
                      size_t preallocate_block_size, log::Writer** new_log);
 
+  // Verify SST file unique id between Manifest and table properties to make
+  // sure they're the same. Currently only used during DB open when
+  // `verify_sst_unique_id_in_manifest = true`.
+  Status VerifySstUniqueIdInManifest();
+
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
   // Validate self-consistency of DB options and its consistency with cf options
@@ -2393,6 +2398,15 @@ class DBImpl : public DB {
 
   // Pointer to WriteBufferManager stalling interface.
   std::unique_ptr<StallInterface> wbm_stall_;
+};
+
+class GetWithTimestampReadCallback : public ReadCallback {
+ public:
+  explicit GetWithTimestampReadCallback(SequenceNumber seq)
+      : ReadCallback(seq) {}
+  bool IsVisibleFullCheck(SequenceNumber seq) override {
+    return seq <= max_visible_seq_;
+  }
 };
 
 extern Options SanitizeOptions(const std::string& db, const Options& src,
