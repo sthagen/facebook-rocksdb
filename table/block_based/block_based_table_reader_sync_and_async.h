@@ -56,7 +56,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
                         &(*results)[idx_in_batch], BlockType::kData,
                         mget_iter->get_context, &lookup_data_block_context,
                         /* for_compaction */ false, /* use_cache */ true,
-                        /* wait_for_cache */ true);
+                        /* wait_for_cache */ true, /* async_read */ false);
     }
     CO_RETURN;
   }
@@ -140,12 +140,16 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
     IOOptions opts;
     IOStatus s = file->PrepareIOOptions(options, opts);
     if (s.ok()) {
-#if defined(WITHOUT_COROUTINES)
-      s = file->MultiRead(opts, &read_reqs[0], read_reqs.size(), &direct_io_buf,
-                          options.rate_limiter_priority);
-#else   // WITH_COROUTINES
-      co_await batch->context()->reader().MultiReadAsync(
-          file, opts, &read_reqs[0], read_reqs.size(), &direct_io_buf);
+#if defined(WITH_COROUTINES)
+      if (file->use_direct_io()) {
+#endif  // WITH_COROUTINES
+        s = file->MultiRead(opts, &read_reqs[0], read_reqs.size(),
+                            &direct_io_buf, options.rate_limiter_priority);
+#if defined(WITH_COROUTINES)
+      } else {
+        co_await batch->context()->reader().MultiReadAsync(
+            file, opts, &read_reqs[0], read_reqs.size(), &direct_io_buf);
+      }
 #endif  // WITH_COROUTINES
     }
     if (!s.ok()) {
@@ -268,7 +272,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
             nullptr, options, handle, uncompression_dict, /*wait=*/true,
             /*for_compaction=*/false, block_entry, BlockType::kData,
             mget_iter->get_context, &lookup_data_block_context,
-            &raw_block_contents);
+            &raw_block_contents, /*async_read=*/false);
 
         // block_entry value could be null if no block cache is present, i.e
         // BlockBasedTableOptions::no_block_cache is true and no compressed
@@ -441,7 +445,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
             nullptr, ro, handle, dict, &(results.back()), BlockType::kData,
             miter->get_context, &lookup_data_block_context,
             /* for_compaction */ false, /* use_cache */ true,
-            /* wait_for_cache */ false);
+            /* wait_for_cache */ false, /* async_read */ false);
         if (s.IsIncomplete()) {
           s = Status::OK();
         }
@@ -585,10 +589,12 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           }
 
           next_biter.Invalidate(Status::OK());
+          Status tmp_s;
           NewDataBlockIterator<DataBlockIter>(
               read_options, iiter->value().handle, &next_biter,
               BlockType::kData, get_context, &lookup_data_block_context,
-              Status(), nullptr);
+              /* prefetch_buffer= */ nullptr, /* for_compaction = */ false,
+              /*async_read = */ false, tmp_s);
           biter = &next_biter;
           reusing_prev_block = false;
           later_reused = false;

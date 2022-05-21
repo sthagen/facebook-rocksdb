@@ -82,6 +82,7 @@
 #undef WITHOUT_COROUTINES
 #define WITH_COROUTINES
 #include "db/version_set_sync_and_async.h"
+#undef WITH_COROUTINES
 // clang-format on
 
 namespace ROCKSDB_NAMESPACE {
@@ -1077,7 +1078,15 @@ void LevelIterator::Seek(const Slice& target) {
 
   if (file_iter_.iter() != nullptr) {
     file_iter_.Seek(target);
+    // Status::TryAgain indicates asynchronous request for retrieval of data
+    // blocks has been submitted. So it should return at this point and Seek
+    // should be called again to retrieve the requested block and execute the
+    // remaining code.
+    if (file_iter_.status() == Status::TryAgain()) {
+      return;
+    }
   }
+
   if (SkipEmptyFileForward() && prefix_extractor_ != nullptr &&
       !read_options_.total_order_seek && !read_options_.auto_prefix_mode &&
       file_iter_.iter() != nullptr && file_iter_.Valid()) {
