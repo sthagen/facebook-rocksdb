@@ -5,9 +5,17 @@
 * Add transaction `get_pinned` and `multi_get` to C API.
 * Add two-phase commit support to C API.
 * Add `rocksdb_transaction_get_writebatch_wi` and `rocksdb_transaction_rebuild_from_writebatch` to C API.
+* Add SingleDelete for DB in C API
+* Add User Defined Timestamp in C API. 
+  * `rocksdb_comparator_with_ts_create` to create timestamp aware comparator
+  * Put, Get, Delete, SingleDelete, MultiGet APIs has corresponding timestamp aware APIs with suffix `with_ts`
+  * And Add C API's for Transaction, SstFileWriter, Compaction as mentioned [here](https://github.com/facebook/rocksdb/wiki/User-defined-Timestamp-(Experimental))
 
 ### New Features
 * Add FileSystem::ReadAsync API in io_tracing
+
+### Behavior changes
+* DB::Open(), DB::OpenAsSecondary() will fail if a Logger cannot be created (#9984)
 
 ## 7.3.0 (05/20/2022)
 ### Bug Fixes
