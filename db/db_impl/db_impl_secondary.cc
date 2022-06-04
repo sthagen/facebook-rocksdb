@@ -33,7 +33,8 @@ DBImplSecondary::~DBImplSecondary() {}
 Status DBImplSecondary::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     bool /*readonly*/, bool /*error_if_wal_file_exists*/,
-    bool /*error_if_data_exists_in_wals*/, uint64_t*) {
+    bool /*error_if_data_exists_in_wals*/, uint64_t*,
+    RecoveryContext* /*recovery_ctx*/) {
   mutex_.AssertHeld();
 
   JobContext job_context(0);
@@ -358,6 +359,12 @@ Status DBImplSecondary::GetImpl(const ReadOptions& read_options,
     if (!s.ok()) {
       return s;
     }
+  }
+
+  // Clear the timestamp for returning results so that we can distinguish
+  // between tombstone or key that has never been written later.
+  if (timestamp) {
+    timestamp->clear();
   }
 
   auto cfh = static_cast<ColumnFamilyHandleImpl*>(column_family);
