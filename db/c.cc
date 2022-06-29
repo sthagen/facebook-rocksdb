@@ -4027,6 +4027,18 @@ uint64_t rocksdb_perfcontext_metric(rocksdb_perfcontext_t* context,
       return rep->env_new_logger_nanos;
     case rocksdb_number_async_seek:
       return rep->number_async_seek;
+    case rocksdb_blob_cache_hit_count:
+      return rep->blob_cache_hit_count;
+    case rocksdb_blob_read_count:
+      return rep->blob_read_count;
+    case rocksdb_blob_read_byte:
+      return rep->blob_read_byte;
+    case rocksdb_blob_read_time:
+      return rep->blob_read_time;
+    case rocksdb_blob_checksum_time:
+      return rep->blob_checksum_time;
+    case rocksdb_blob_decompress_time:
+      return rep->blob_decompress_time;
     default:
       break;
   }
@@ -4622,6 +4634,11 @@ void rocksdb_lru_cache_options_destroy(rocksdb_lru_cache_options_t* opt) {
 void rocksdb_lru_cache_options_set_capacity(rocksdb_lru_cache_options_t* opt,
                                             size_t capacity) {
   opt->rep.capacity = capacity;
+}
+
+void rocksdb_lru_cache_options_set_num_shard_bits(
+    rocksdb_lru_cache_options_t* opt, int num_shard_bits) {
+  opt->rep.num_shard_bits = num_shard_bits;
 }
 
 void rocksdb_lru_cache_options_set_memory_allocator(
