@@ -1309,11 +1309,15 @@ DEFINE_string(fs_uri, "",
 DEFINE_string(simulate_hybrid_fs_file, "",
               "File for Store Metadata for Simulate hybrid FS. Empty means "
               "disable the feature. Now, if it is set, "
-              "bottommost_temperature is set to kWarm.");
+              "last_level_temperature is set to kWarm.");
 DEFINE_int32(simulate_hybrid_hdd_multipliers, 1,
              "In simulate_hybrid_fs_file or simulate_hdd mode, how many HDDs "
              "are simulated.");
 DEFINE_bool(simulate_hdd, false, "Simulate read/write latency on HDD.");
+
+DEFINE_int64(
+    preclude_last_level_data_seconds, 0,
+    "Preclude the latest data from the last level. (Used for tiered storage)");
 
 static std::shared_ptr<ROCKSDB_NAMESPACE::Env> env_guard;
 
@@ -4449,6 +4453,8 @@ class Benchmark {
     if (FLAGS_simulate_hybrid_fs_file != "") {
       options.bottommost_temperature = Temperature::kWarm;
     }
+    options.preclude_last_level_data_seconds =
+        FLAGS_preclude_last_level_data_seconds;
     options.sample_for_compression = FLAGS_sample_for_compression;
     options.WAL_ttl_seconds = FLAGS_wal_ttl_seconds;
     options.WAL_size_limit_MB = FLAGS_wal_size_limit_MB;
