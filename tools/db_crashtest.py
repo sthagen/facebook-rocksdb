@@ -35,6 +35,7 @@ default_params = {
     # Consider larger number when backups considered more stable
     "backup_one_in": 100000,
     "batch_protection_bytes_per_key": lambda: random.choice([0, 8]),
+    "memtable_protection_bytes_per_key": lambda: random.choice([0, 1, 2, 4, 8]),
     "block_size": 16384,
     "bloom_bits": lambda: random.choice([random.randint(0,19),
                                          random.lognormvariate(2.3, 1.3)]),
@@ -178,8 +179,7 @@ default_params = {
     "async_io": lambda: random.choice([0, 1]),
     "wal_compression": lambda: random.choice(["none", "zstd"]),
     "verify_sst_unique_id_in_manifest": 1,  # always do unique_id verification
-    "secondary_cache_uri": lambda: random.choice(
-        ["", "compressed_secondary_cache://capacity=8388608"]),
+    "secondary_cache_uri": "",
     "allow_data_in_errors": True,
 }
 

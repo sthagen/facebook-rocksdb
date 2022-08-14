@@ -1,4 +1,5 @@
-//  Copyright (c) Meta Platforms, Inc. and its affiliates. All Rights Reserved.
+//  Copyright (c) Meta Platforms, Inc. and affiliates.
+//
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
@@ -79,18 +80,7 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::MultiGet)
       }
     }
     if (s.ok() && !options.ignore_range_deletions) {
-      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-          t->NewRangeTombstoneIterator(options));
-      if (range_del_iter != nullptr) {
-        for (auto iter = table_range.begin(); iter != table_range.end();
-             ++iter) {
-          SequenceNumber* max_covering_tombstone_seq =
-              iter->get_context->max_covering_tombstone_seq();
-          *max_covering_tombstone_seq = std::max(
-              *max_covering_tombstone_seq,
-              range_del_iter->MaxCoveringTombstoneSeqnum(iter->ukey_with_ts));
-        }
-      }
+      UpdateRangeTombstoneSeqnums(options, t, table_range);
     }
     if (s.ok()) {
       CO_AWAIT(t->MultiGet)
