@@ -410,15 +410,27 @@ Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(const Slice& blob,
     // Objects to be put into the cache have to be heap-allocated and
     // self-contained, i.e. own their contents. The Cache has to be able to
     // take unique ownership of them.
-    // TODO: support custom allocators
-    CacheAllocationPtr allocation(new char[blob.size()]);
+    CacheAllocationPtr allocation =
+        AllocateBlock(blob.size(), blob_cache->memory_allocator());
     memcpy(allocation.get(), blob.data(), blob.size());
     std::unique_ptr<BlobContents> buf =
         BlobContents::Create(std::move(allocation), blob.size());
 
-    s = blob_cache->Insert(key, buf.get(), buf->ApproximateMemoryUsage(),
-                           &BlobContents::DeleteCallback,
-                           nullptr /* cache_handle */, priority);
+    Cache::CacheItemHelper* const cache_item_helper =
+        BlobContents::GetCacheItemHelper();
+    assert(cache_item_helper);
+
+    if (immutable_options_->lowest_used_cache_tier ==
+        CacheTier::kNonVolatileBlockTier) {
+      s = blob_cache->Insert(key, buf.get(), cache_item_helper,
+                             buf->ApproximateMemoryUsage(),
+                             nullptr /* cache_handle */, priority);
+    } else {
+      s = blob_cache->Insert(key, buf.get(), buf->ApproximateMemoryUsage(),
+                             cache_item_helper->del_cb,
+                             nullptr /* cache_handle */, priority);
+    }
+
     if (s.ok()) {
       RecordTick(statistics, BLOB_DB_CACHE_ADD);
       RecordTick(statistics, BLOB_DB_CACHE_BYTES_WRITE, buf->size());

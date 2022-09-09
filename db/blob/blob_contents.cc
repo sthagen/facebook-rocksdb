@@ -7,6 +7,7 @@
 
 #include <cassert>
 
+#include "cache/cache_entry_roles.h"
 #include "cache/cache_helpers.h"
 #include "port/malloc.h"
 
@@ -62,20 +63,19 @@ Status BlobContents::SaveToCallback(void* from_obj, size_t from_offset,
   return Status::OK();
 }
 
-void BlobContents::DeleteCallback(const Slice& key, void* value) {
-  DeleteCacheEntry<BlobContents>(key, value);
-}
-
 Cache::CacheItemHelper* BlobContents::GetCacheItemHelper() {
-  static Cache::CacheItemHelper cache_helper(&SizeCallback, &SaveToCallback,
-                                             &DeleteCallback);
+  static Cache::CacheItemHelper cache_helper(
+      &SizeCallback, &SaveToCallback,
+      GetCacheEntryDeleterForRole<BlobContents, CacheEntryRole::kBlobValue>());
 
   return &cache_helper;
 }
 
-Status BlobContents::CreateCallback(const void* buf, size_t size,
+Status BlobContents::CreateCallback(CacheAllocationPtr&& allocation,
+                                    const void* buf, size_t size,
                                     void** out_obj, size_t* charge) {
-  CacheAllocationPtr allocation(new char[size]);
+  assert(allocation);
+
   memcpy(allocation.get(), buf, size);
 
   std::unique_ptr<BlobContents> obj = Create(std::move(allocation), size);

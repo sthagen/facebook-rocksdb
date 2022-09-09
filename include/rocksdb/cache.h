@@ -159,13 +159,13 @@ struct CompressedSecondaryCacheOptions : LRUCacheOptions {
   CompressedSecondaryCacheOptions() {}
   CompressedSecondaryCacheOptions(
       size_t _capacity, int _num_shard_bits, bool _strict_capacity_limit,
-      double _high_pri_pool_ratio,
+      double _high_pri_pool_ratio, double _low_pri_pool_ratio = 0.0,
       std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
       bool _use_adaptive_mutex = kDefaultToAdaptiveMutex,
       CacheMetadataChargePolicy _metadata_charge_policy =
           kDefaultCacheMetadataChargePolicy,
       CompressionType _compression_type = CompressionType::kLZ4Compression,
-      uint32_t _compress_format_version = 2, double _low_pri_pool_ratio = 0.0)
+      uint32_t _compress_format_version = 2)
       : LRUCacheOptions(_capacity, _num_shard_bits, _strict_capacity_limit,
                         _high_pri_pool_ratio, std::move(_memory_allocator),
                         _use_adaptive_mutex, _metadata_charge_policy,
@@ -179,12 +179,13 @@ struct CompressedSecondaryCacheOptions : LRUCacheOptions {
 extern std::shared_ptr<SecondaryCache> NewCompressedSecondaryCache(
     size_t capacity, int num_shard_bits = -1,
     bool strict_capacity_limit = false, double high_pri_pool_ratio = 0.5,
+    double low_pri_pool_ratio = 0.0,
     std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
     bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
     CacheMetadataChargePolicy metadata_charge_policy =
         kDefaultCacheMetadataChargePolicy,
     CompressionType compression_type = CompressionType::kLZ4Compression,
-    uint32_t compress_format_version = 2, double low_pri_pool_ratio = 0.0);
+    uint32_t compress_format_version = 2);
 
 extern std::shared_ptr<SecondaryCache> NewCompressedSecondaryCache(
     const CompressedSecondaryCacheOptions& opts);
@@ -600,7 +601,10 @@ enum class CacheEntryRole {
   kBlockBasedTableReader,
   // FileMetadata's charge to account for its memory usage
   kFileMetadata,
-  // Blob cache's charge to account for its memory usage
+  // Blob value (when using the same cache as block cache and blob cache)
+  kBlobValue,
+  // Blob cache's charge to account for its memory usage (when using a
+  // separate block cache and blob cache)
   kBlobCache,
   // Default bucket, for miscellaneous cache entries. Do not use for
   // entries that could potentially add up to large usage.
