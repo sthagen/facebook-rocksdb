@@ -116,7 +116,7 @@ default_params = {
     "use_direct_reads": lambda: random.randint(0, 1),
     "use_direct_io_for_flush_and_compaction": lambda: random.randint(0, 1),
     "mock_direct_io": False,
-    "cache_type": lambda: random.choice(["lru_cache", "clock_cache"]),
+    "cache_type": lambda: random.choice(["lru_cache", "hyper_clock_cache"]),
         # fast_lru_cache is incompatible with stress tests, because it doesn't support strict_capacity_limit == false.
     "use_full_merge_v1": lambda: random.randint(0, 1),
     "use_merge": lambda: random.randint(0, 1),
@@ -178,8 +178,13 @@ default_params = {
     "wal_compression": lambda: random.choice(["none", "zstd"]),
     "verify_sst_unique_id_in_manifest": 1,  # always do unique_id verification
     "secondary_cache_uri":  lambda: random.choice(
-        ["", "compressed_secondary_cache://capacity=8388608"]),
+        ["", "compressed_secondary_cache://capacity=8388608",
+         "compressed_secondary_cache://capacity=8388608;enable_custom_split_merge=true"]),
     "allow_data_in_errors": True,
+    "readahead_size": lambda: random.choice([0, 16384, 524288]),
+    "initial_auto_readahead_size": lambda: random.choice([0, 16384, 524288]),
+    "max_auto_readahead_size": lambda: random.choice([0, 16384, 524288]),
+    "num_file_reads_for_auto_readahead": lambda: random.choice([0, 1, 2]),
 }
 
 _TEST_DIR_ENV_VAR = 'TEST_TMPDIR'
@@ -364,20 +369,17 @@ ts_params = {
     "enable_blob_files": 0,
     "use_blob_db": 0,
     "ingest_external_file_one_in": 0,
-    # TODO akanksha: Currently subcompactions is failing with user_defined_timestamp if
-    # subcompactions > 1, or
-    # compact_pri == 4 even if subcompactions is 1, there can still be multiple subcompactions.
-    # Remove this check once its fixed.
-    "subcompactions": 1,
-    "compaction_pri": random.randint(0, 3),
 }
 
 tiered_params = {
     "enable_tiered_storage": 1,
-    "preclude_last_level_data_seconds": lambda: random.choice([3600]),
+    # Set tiered compaction hot data time as: 1 minute, 1 hour, 10 hour
+    "preclude_last_level_data_seconds": lambda: random.choice([60, 3600, 36000]),
     # only test universal compaction for now, level has known issue of
     # endless compaction
     "compaction_style": 1,
+    # tiered storage doesn't support blob db yet
+    "use_blob_db": 0,
 }
 
 multiops_txn_default_params = {
