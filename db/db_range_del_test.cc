@@ -2303,7 +2303,6 @@ TEST_F(DBRangeDelTest, TombstoneOnlyLevel) {
   InternalIterator* level_iter = sv->current->TEST_GetLevelIterator(
       read_options, &merge_iter_builder, 1 /* level */, true);
   // This is needed to make LevelIterator range tombstone aware
-  merge_iter_builder.AddIterator(level_iter);
   auto miter = merge_iter_builder.Finish();
   auto k = Key(3);
   IterKey target;
@@ -2686,6 +2685,23 @@ TEST_F(DBRangeDelTest, PrefixSentinelKey) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(iter->key(), "aaae");
   delete iter;
+}
+
+TEST_F(DBRangeDelTest, RefreshMemtableIter) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "a", "z"));
+  ReadOptions ro;
+  ro.read_tier = kMemtableTier;
+  std::unique_ptr<Iterator> iter{db_->NewIterator(ro)};
+  ASSERT_OK(Flush());
+  // First refresh reinits iter, which had a bug where
+  // iter.memtable_range_tombstone_iter_ was not set to nullptr, and caused
+  // subsequent refresh to double free.
+  ASSERT_OK(iter->Refresh());
+  ASSERT_OK(iter->Refresh());
 }
 
 #endif  // ROCKSDB_LITE
