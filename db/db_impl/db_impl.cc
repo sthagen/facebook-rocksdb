@@ -865,8 +865,11 @@ Status DBImpl::RegisterRecordSeqnoTimeWorker() {
 
   uint64_t seqno_time_cadence = 0;
   if (min_time_duration != std::numeric_limits<uint64_t>::max()) {
+    // round up to 1 when the time_duration is smaller than
+    // kMaxSeqnoTimePairsPerCF
     seqno_time_cadence =
-        min_time_duration / SeqnoToTimeMapping::kMaxSeqnoTimePairsPerCF;
+        (min_time_duration + SeqnoToTimeMapping::kMaxSeqnoTimePairsPerCF - 1) /
+        SeqnoToTimeMapping::kMaxSeqnoTimePairsPerCF;
   }
 
   Status s;
@@ -5779,8 +5782,24 @@ Status DBImpl::NewDefaultReplayer(
 Status DBImpl::StartBlockCacheTrace(
     const TraceOptions& trace_options,
     std::unique_ptr<TraceWriter>&& trace_writer) {
-  return block_cache_tracer_.StartTrace(immutable_db_options_.clock,
-                                        trace_options, std::move(trace_writer));
+  BlockCacheTraceOptions block_trace_opts;
+  block_trace_opts.sampling_frequency = trace_options.sampling_frequency;
+
+  BlockCacheTraceWriterOptions trace_writer_opt;
+  trace_writer_opt.max_trace_file_size = trace_options.max_trace_file_size;
+
+  std::unique_ptr<BlockCacheTraceWriter> block_cache_trace_writer =
+      NewBlockCacheTraceWriter(env_->GetSystemClock().get(), trace_writer_opt,
+                               std::move(trace_writer));
+
+  return block_cache_tracer_.StartTrace(block_trace_opts,
+                                        std::move(block_cache_trace_writer));
+}
+
+Status DBImpl::StartBlockCacheTrace(
+    const BlockCacheTraceOptions& trace_options,
+    std::unique_ptr<BlockCacheTraceWriter>&& trace_writer) {
+  return block_cache_tracer_.StartTrace(trace_options, std::move(trace_writer));
 }
 
 Status DBImpl::EndBlockCacheTrace() {
