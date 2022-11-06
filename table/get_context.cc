@@ -351,9 +351,17 @@ bool GetContext::SaveValue(const ParsedInternalKey& parsed_key,
               Slice blob_value(pin_val);
               push_operand(blob_value, nullptr);
             } else if (type == kTypeWideColumnEntity) {
-              // TODO: support wide-column entities
-              state_ = kUnexpectedWideColumnEntity;
-              return false;
+              Slice value_copy = value;
+              Slice value_of_default;
+
+              if (!WideColumnSerialization::GetValueOfDefaultColumn(
+                       value_copy, value_of_default)
+                       .ok()) {
+                state_ = kCorrupt;
+                return false;
+              }
+
+              push_operand(value_of_default, value_pinner);
             } else {
               assert(type == kTypeValue);
               push_operand(value, value_pinner);
@@ -377,9 +385,26 @@ bool GetContext::SaveValue(const ParsedInternalKey& parsed_key,
               push_operand(blob_value, nullptr);
             }
           } else if (type == kTypeWideColumnEntity) {
-            // TODO: support wide-column entities
-            state_ = kUnexpectedWideColumnEntity;
-            return false;
+            state_ = kFound;
+
+            if (do_merge_) {
+              MergeWithEntity(value);
+            } else {
+              // It means this function is called as part of DB GetMergeOperands
+              // API and the current value should be part of
+              // merge_context_->operand_list
+              Slice value_copy = value;
+              Slice value_of_default;
+
+              if (!WideColumnSerialization::GetValueOfDefaultColumn(
+                       value_copy, value_of_default)
+                       .ok()) {
+                state_ = kCorrupt;
+                return false;
+              }
+
+              push_operand(value_of_default, value_pinner);
+            }
           } else {
             assert(type == kTypeValue);
 
@@ -457,6 +482,24 @@ void GetContext::Merge(const Slice* value) {
   }
 }
 
+void GetContext::MergeWithEntity(Slice entity) {
+  assert(do_merge_);
+  assert(!pinnable_val_ || !columns_);
+
+  const Status s = MergeHelper::TimedFullMergeWithEntity(
+      merge_operator_, user_key_, entity, merge_context_->GetOperands(),
+      pinnable_val_ ? pinnable_val_->GetSelf() : nullptr, columns_, logger_,
+      statistics_, clock_);
+  if (!s.ok()) {
+    state_ = kCorrupt;
+    return;
+  }
+
+  if (LIKELY(pinnable_val_ != nullptr)) {
+    pinnable_val_->PinSelf();
+  }
+}
+
 bool GetContext::GetBlobValue(const Slice& blob_index,
                               PinnableSlice* blob_value) {
   constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
@@ -478,6 +521,7 @@ bool GetContext::GetBlobValue(const Slice& blob_index,
 }
 
 void GetContext::push_operand(const Slice& value, Cleanable* value_pinner) {
+  // TODO(yanqin) preserve timestamps information in merge_context
   if (pinned_iters_mgr() && pinned_iters_mgr()->PinningEnabled() &&
       value_pinner != nullptr) {
     value_pinner->DelegateCleanupsTo(pinned_iters_mgr());

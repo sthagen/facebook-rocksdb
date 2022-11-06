@@ -523,11 +523,13 @@ bool DBIter::MergeValuesNewToOld() {
       return false;
     }
 
-    if (!user_comparator_.Equal(ikey.user_key, saved_key_.GetUserKey())) {
+    if (!user_comparator_.EqualWithoutTimestamp(ikey.user_key,
+                                                saved_key_.GetUserKey())) {
       // hit the next user key, stop right here
       break;
     }
-    if (kTypeDeletion == ikey.type || kTypeSingleDeletion == ikey.type) {
+    if (kTypeDeletion == ikey.type || kTypeSingleDeletion == ikey.type ||
+        kTypeDeletionWithTimestamp == ikey.type) {
       // hit a delete with the same user key, stop right here
       // iter_ is positioned after delete
       iter_.Next();
@@ -956,7 +958,8 @@ bool DBIter::FindValueForCurrentKey() {
     case kTypeMerge:
       current_entry_is_merged_ = true;
       if (last_not_merge_type == kTypeDeletion ||
-          last_not_merge_type == kTypeSingleDeletion) {
+          last_not_merge_type == kTypeSingleDeletion ||
+          last_not_merge_type == kTypeDeletionWithTimestamp) {
         s = Merge(nullptr, saved_key_.GetUserKey());
         if (!s.ok()) {
           return false;
@@ -1159,10 +1162,12 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
     if (!ParseKey(&ikey)) {
       return false;
     }
-    if (!user_comparator_.Equal(ikey.user_key, saved_key_.GetUserKey())) {
+    if (!user_comparator_.EqualWithoutTimestamp(ikey.user_key,
+                                                saved_key_.GetUserKey())) {
       break;
     }
-    if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion) {
+    if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion ||
+        ikey.type == kTypeDeletionWithTimestamp) {
       break;
     }
     if (!iter_.PrepareValue()) {
