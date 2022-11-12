@@ -396,9 +396,20 @@ TEST_F(DBWideBasicTest, MergeEntity) {
                          second_merge_operand));
   };
 
-  auto verify = [&]() {
-    const std::string first_expected_default(
-        first_columns[0].value().ToString() + delim + first_merge_operand);
+  const std::string first_expected_default(first_columns[0].value().ToString() +
+                                           delim + first_merge_operand);
+  const std::string second_expected_default(delim + second_merge_operand);
+
+  auto verify_basic = [&]() {
+    WideColumns first_expected_columns{
+        {kDefaultWideColumnName, first_expected_default},
+        first_columns[1],
+        first_columns[2]};
+
+    WideColumns second_expected_columns{
+        {kDefaultWideColumnName, second_expected_default},
+        second_columns[0],
+        second_columns[1]};
 
     {
       PinnableSlice result;
@@ -411,34 +422,8 @@ TEST_F(DBWideBasicTest, MergeEntity) {
       PinnableWideColumns result;
       ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
                                first_key, &result));
-
-      WideColumns expected_columns{
-          {kDefaultWideColumnName, first_expected_default},
-          first_columns[1],
-          first_columns[2]};
-
-      ASSERT_EQ(result.columns(), expected_columns);
+      ASSERT_EQ(result.columns(), first_expected_columns);
     }
-
-    {
-      constexpr size_t num_merge_operands = 2;
-
-      std::array<PinnableSlice, num_merge_operands> merge_operands;
-
-      GetMergeOperandsOptions get_merge_opts;
-      get_merge_opts.expected_max_number_of_operands = num_merge_operands;
-
-      int number_of_operands = 0;
-
-      ASSERT_OK(db_->GetMergeOperands(ReadOptions(), db_->DefaultColumnFamily(),
-                                      first_key, &merge_operands[0],
-                                      &get_merge_opts, &number_of_operands));
-      ASSERT_EQ(number_of_operands, num_merge_operands);
-      ASSERT_EQ(merge_operands[0], first_columns[0].value());
-      ASSERT_EQ(merge_operands[1], first_merge_operand);
-    }
-
-    const std::string second_expected_default(delim + second_merge_operand);
 
     {
       PinnableSlice result;
@@ -451,31 +436,7 @@ TEST_F(DBWideBasicTest, MergeEntity) {
       PinnableWideColumns result;
       ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
                                second_key, &result));
-
-      WideColumns expected_columns{
-          {kDefaultWideColumnName, second_expected_default},
-          second_columns[0],
-          second_columns[1]};
-
-      ASSERT_EQ(result.columns(), expected_columns);
-    }
-
-    {
-      constexpr size_t num_merge_operands = 2;
-
-      std::array<PinnableSlice, num_merge_operands> merge_operands;
-
-      GetMergeOperandsOptions get_merge_opts;
-      get_merge_opts.expected_max_number_of_operands = num_merge_operands;
-
-      int number_of_operands = 0;
-
-      ASSERT_OK(db_->GetMergeOperands(ReadOptions(), db_->DefaultColumnFamily(),
-                                      second_key, &merge_operands[0],
-                                      &get_merge_opts, &number_of_operands));
-      ASSERT_EQ(number_of_operands, num_merge_operands);
-      ASSERT_TRUE(merge_operands[0].empty());
-      ASSERT_EQ(merge_operands[1], second_merge_operand);
+      ASSERT_EQ(result.columns(), second_expected_columns);
     }
 
     {
@@ -495,18 +456,108 @@ TEST_F(DBWideBasicTest, MergeEntity) {
       ASSERT_OK(statuses[1]);
     }
 
-    // Note: Merge is currently not supported for wide-column entities in
-    // iterator
     {
       std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
 
       iter->SeekToFirst();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->key(), first_key);
+      ASSERT_EQ(iter->value(), first_expected_default);
+      ASSERT_EQ(iter->columns(), first_expected_columns);
+
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->key(), second_key);
+      ASSERT_EQ(iter->value(), second_expected_default);
+      ASSERT_EQ(iter->columns(), second_expected_columns);
+
+      iter->Next();
       ASSERT_FALSE(iter->Valid());
-      ASSERT_TRUE(iter->status().IsNotSupported());
+      ASSERT_OK(iter->status());
 
       iter->SeekToLast();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->key(), second_key);
+      ASSERT_EQ(iter->value(), second_expected_default);
+      ASSERT_EQ(iter->columns(), second_expected_columns);
+
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->key(), first_key);
+      ASSERT_EQ(iter->value(), first_expected_default);
+      ASSERT_EQ(iter->columns(), first_expected_columns);
+
+      iter->Prev();
       ASSERT_FALSE(iter->Valid());
-      ASSERT_TRUE(iter->status().IsNotSupported());
+      ASSERT_OK(iter->status());
+    }
+  };
+
+  auto verify_merge_ops_pre_compaction = [&]() {
+    constexpr size_t num_merge_operands = 2;
+
+    GetMergeOperandsOptions get_merge_opts;
+    get_merge_opts.expected_max_number_of_operands = num_merge_operands;
+
+    {
+      std::array<PinnableSlice, num_merge_operands> merge_operands;
+      int number_of_operands = 0;
+
+      ASSERT_OK(db_->GetMergeOperands(ReadOptions(), db_->DefaultColumnFamily(),
+                                      first_key, &merge_operands[0],
+                                      &get_merge_opts, &number_of_operands));
+
+      ASSERT_EQ(number_of_operands, num_merge_operands);
+      ASSERT_EQ(merge_operands[0], first_columns[0].value());
+      ASSERT_EQ(merge_operands[1], first_merge_operand);
+    }
+
+    {
+      std::array<PinnableSlice, num_merge_operands> merge_operands;
+      int number_of_operands = 0;
+
+      ASSERT_OK(db_->GetMergeOperands(ReadOptions(), db_->DefaultColumnFamily(),
+                                      second_key, &merge_operands[0],
+                                      &get_merge_opts, &number_of_operands));
+
+      ASSERT_EQ(number_of_operands, num_merge_operands);
+      ASSERT_TRUE(merge_operands[0].empty());
+      ASSERT_EQ(merge_operands[1], second_merge_operand);
+    }
+  };
+
+  auto verify_merge_ops_post_compaction = [&]() {
+    constexpr size_t num_merge_operands = 1;
+
+    GetMergeOperandsOptions get_merge_opts;
+    get_merge_opts.expected_max_number_of_operands = num_merge_operands;
+
+    {
+      std::array<PinnableSlice, num_merge_operands> merge_operands;
+      int number_of_operands = 0;
+
+      ASSERT_OK(db_->GetMergeOperands(ReadOptions(), db_->DefaultColumnFamily(),
+                                      first_key, &merge_operands[0],
+                                      &get_merge_opts, &number_of_operands));
+
+      ASSERT_EQ(number_of_operands, num_merge_operands);
+      ASSERT_EQ(merge_operands[0], first_expected_default);
+    }
+
+    {
+      std::array<PinnableSlice, num_merge_operands> merge_operands;
+      int number_of_operands = 0;
+
+      ASSERT_OK(db_->GetMergeOperands(ReadOptions(), db_->DefaultColumnFamily(),
+                                      second_key, &merge_operands[0],
+                                      &get_merge_opts, &number_of_operands));
+
+      ASSERT_EQ(number_of_operands, num_merge_operands);
+      ASSERT_EQ(merge_operands[0], second_expected_default);
     }
   };
 
@@ -517,11 +568,13 @@ TEST_F(DBWideBasicTest, MergeEntity) {
     write_base();
     ManagedSnapshot snapshot(db_);
     write_merge();
-    verify();
+    verify_basic();
+    verify_merge_ops_pre_compaction();
 
     // Base KVs and Merge operands both in storage
     ASSERT_OK(Flush());
-    verify();
+    verify_basic();
+    verify_merge_ops_pre_compaction();
   }
 
   // Base KVs in storage, Merge operands in memtable
@@ -529,7 +582,15 @@ TEST_F(DBWideBasicTest, MergeEntity) {
   write_base();
   ASSERT_OK(Flush());
   write_merge();
-  verify();
+  verify_basic();
+  verify_merge_ops_pre_compaction();
+
+  // Flush and compact
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), /* begin */ nullptr,
+                              /* end */ nullptr));
+  verify_basic();
+  verify_merge_ops_post_compaction();
 }
 
 TEST_F(DBWideBasicTest, PutEntityTimestampError) {
