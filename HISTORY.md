@@ -2,9 +2,17 @@
 ## Unreleased
 ### Behavior changes
 * Make best-efforts recovery verify SST unique ID before Version construction (#10962)
+* Introduce `epoch_number` and sort L0 files by `epoch_number` instead of `largest_seqno`. `epoch_number` represents the order of a file being flushed or ingested/imported. Compaction output file will be assigned with the minimum `epoch_number` among input files'. For L0, larger `epoch_number` indicates newer L0 file.
+* Compaction output file cutting logic now considers range tombstone start keys. For example, SST partitioner now may receive ParitionRequest for range tombstone start keys.
 
 ### Bug Fixes
 * Fixed a regression in iterator where range tombstones after `iterate_upper_bound` is processed.
+* Fixed a memory leak in MultiGet with async_io read option, caused by IO errors during table file open
+* Fixed a bug that multi-level FIFO compaction deletes one file in non-L0 even when `CompactionOptionsFIFO::max_table_files_size` is no exceeded since #10348 or 7.8.0.
+* Fixed a bug caused by `DB::SyncWAL()` affecting `track_and_verify_wals_in_manifest`. Without the fix, application may see "open error: Corruption: Missing WAL with log number" while trying to open the db. The corruption is a false alarm but prevents DB open (#10892).
+* Fixed a BackupEngine bug in which RestoreDBFromLatestBackup would fail if the latest backup was deleted and there is another valid backup available.
+* Fix L0 file misorder corruption caused by ingesting files of overlapping seqnos with memtable entries' through introducing `epoch_number`. Before the fix, `force_consistency_checks=true` may catch the corruption before it's exposed to readers, in which case writes returning `Status::Corruption` would be expected. Also replace the previous incomplete fix (#5958) to the same corruption with this new and more complete fix.
+* Fixed a bug in LockWAL() leading to re-locking mutex (#11020).
 
 ## 7.9.0 (11/21/2022)
 ### Performance Improvements
@@ -17,8 +25,6 @@
 * Fixed a memory safety bug when using a SecondaryCache with `block_cache_compressed`. `block_cache_compressed` no longer attempts to use SecondaryCache features.
 * Fixed a regression in scan for async_io. During seek, valid buffers were getting cleared causing a regression.
 * Tiered Storage: fixed excessive keys written to penultimate level in non-debug builds.
-* Fixed a bug that multi-level FIFO compaction deletes one file in non-L0 even when `CompactionOptionsFIFO::max_table_files_size` is no exceeded since #10348 or 7.8.0.
-* Fixed a bug caused by `DB::SyncWAL()` affecting `track_and_verify_wals_in_manifest`. Without the fix, application may see "open error: Corruption: Missing WAL with log number" while trying to open the db. The corruption is a false alarm but prevents DB open (#10892).
 
 ### New Features
 * Add basic support for user-defined timestamp to Merge (#10819).
