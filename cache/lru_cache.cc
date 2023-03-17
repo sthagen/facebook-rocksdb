@@ -344,8 +344,7 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
 void LRUCacheShard::TryInsertIntoSecondaryCache(
     autovector<LRUHandle*> evicted_handles) {
   for (auto entry : evicted_handles) {
-    if (secondary_cache_ && entry->IsSecondaryCacheCompatible() &&
-        !entry->IsInSecondaryCache()) {
+    if (secondary_cache_ && entry->IsSecondaryCacheCompatible()) {
       secondary_cache_->Insert(entry->key(), entry->value, entry->helper)
           .PermitUncheckedError();
     }
@@ -555,12 +554,18 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
   // again, we erase it from CompressedSecondaryCache and add it into the
   // primary cache.
   if (!e && secondary_cache_ && helper && helper->create_cb) {
-    bool is_in_sec_cache{false};
+    bool kept_in_sec_cache{false};
     std::unique_ptr<SecondaryCacheResultHandle> secondary_handle =
         secondary_cache_->Lookup(key, helper, create_context, wait,
-                                 found_dummy_entry, is_in_sec_cache);
+                                 found_dummy_entry, kept_in_sec_cache);
     if (secondary_handle != nullptr) {
       e = static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
+
+      // For entries already in secondary cache, prevent re-insertion by
+      // using a helper that is not secondary cache compatible
+      if (kept_in_sec_cache) {
+        helper = helper->without_secondary_compat;
+      }
 
       e->m_flags = 0;
       e->im_flags = 0;
@@ -575,7 +580,6 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
       e->sec_handle = secondary_handle.release();
       e->total_charge = 0;
       e->Ref();
-      e->SetIsInSecondaryCache(is_in_sec_cache);
       e->SetIsStandalone(secondary_cache_->SupportForceErase() &&
                          !found_dummy_entry);
 
