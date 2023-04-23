@@ -275,6 +275,7 @@ Status ImportColumnFamilyJob::GetIngestedFileInfo(
   // in file_meta.
   if (file_meta.smallest.empty()) {
     assert(file_meta.largest.empty());
+    // TODO: plumb Env::IOActivity
     ReadOptions ro;
     std::unique_ptr<InternalIterator> iter(table_reader->NewIterator(
         ro, sv->mutable_cf_options.prefix_extractor.get(), /*arena=*/nullptr,
@@ -302,15 +303,24 @@ Status ImportColumnFamilyJob::GetIngestedFileInfo(
           return Status::Corruption("Corrupted key in external file. ",
                                     pik_status.getState());
         }
-        RangeTombstone tombstone(key, range_del_iter->value());
-        InternalKey start_key = tombstone.SerializeKey();
+        RangeTombstone first_tombstone(key, range_del_iter->value());
+        InternalKey start_key = first_tombstone.SerializeKey();
         const InternalKeyComparator* icmp = &cfd_->internal_comparator();
         if (!bound_set ||
             icmp->Compare(start_key, file_to_import->smallest_internal_key) <
                 0) {
           file_to_import->smallest_internal_key = start_key;
         }
-        InternalKey end_key = tombstone.SerializeEndKey();
+
+        range_del_iter->SeekToLast();
+        pik_status = ParseInternalKey(range_del_iter->key(), &key,
+                                      db_options_.allow_data_in_errors);
+        if (!pik_status.ok()) {
+          return Status::Corruption("Corrupted key in external file. ",
+                                    pik_status.getState());
+        }
+        RangeTombstone last_tombstone(key, range_del_iter->value());
+        InternalKey end_key = last_tombstone.SerializeEndKey();
         if (!bound_set ||
             icmp->Compare(end_key, file_to_import->largest_internal_key) > 0) {
           file_to_import->largest_internal_key = end_key;
@@ -341,4 +351,3 @@ Status ImportColumnFamilyJob::GetIngestedFileInfo(
   return status;
 }
 }  // namespace ROCKSDB_NAMESPACE
-
