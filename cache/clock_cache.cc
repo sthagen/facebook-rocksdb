@@ -9,6 +9,7 @@
 
 #include "cache/clock_cache.h"
 
+#include <cassert>
 #include <functional>
 #include <numeric>
 
@@ -118,74 +119,6 @@ inline bool ClockUpdate(ClockHandle& h) {
   }
 }
 
-}  // namespace
-
-void ClockHandleBasicData::FreeData(MemoryAllocator* allocator) const {
-  if (helper->del_cb) {
-    helper->del_cb(value, allocator);
-  }
-}
-
-HyperClockTable::HyperClockTable(
-    size_t capacity, bool /*strict_capacity_limit*/,
-    CacheMetadataChargePolicy metadata_charge_policy,
-    MemoryAllocator* allocator,
-    const Cache::EvictionCallback* eviction_callback, const uint32_t* hash_seed,
-    const Opts& opts)
-    : length_bits_(CalcHashBits(capacity, opts.estimated_value_size,
-                                metadata_charge_policy)),
-      length_bits_mask_((size_t{1} << length_bits_) - 1),
-      occupancy_limit_(static_cast<size_t>((uint64_t{1} << length_bits_) *
-                                           kStrictLoadFactor)),
-      array_(new HandleImpl[size_t{1} << length_bits_]),
-      allocator_(allocator),
-      eviction_callback_(*eviction_callback),
-      hash_seed_(*hash_seed) {
-  if (metadata_charge_policy ==
-      CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
-    usage_ += size_t{GetTableSize()} * sizeof(HandleImpl);
-  }
-
-  static_assert(sizeof(HandleImpl) == 64U,
-                "Expecting size / alignment with common cache line size");
-}
-
-HyperClockTable::~HyperClockTable() {
-  // Assumes there are no references or active operations on any slot/element
-  // in the table.
-  for (size_t i = 0; i < GetTableSize(); i++) {
-    HandleImpl& h = array_[i];
-    switch (h.meta >> ClockHandle::kStateShift) {
-      case ClockHandle::kStateEmpty:
-        // noop
-        break;
-      case ClockHandle::kStateInvisible:  // rare but possible
-      case ClockHandle::kStateVisible:
-        assert(GetRefcount(h.meta) == 0);
-        h.FreeData(allocator_);
-#ifndef NDEBUG
-        Rollback(h.hashed_key, &h);
-        ReclaimEntryUsage(h.GetTotalCharge());
-#endif
-        break;
-      // otherwise
-      default:
-        assert(false);
-        break;
-    }
-  }
-
-#ifndef NDEBUG
-  for (size_t i = 0; i < GetTableSize(); i++) {
-    assert(array_[i].displacements.load() == 0);
-  }
-#endif
-
-  assert(usage_.load() == 0 ||
-         usage_.load() == size_t{GetTableSize()} * sizeof(HandleImpl));
-  assert(occupancy_ == 0);
-}
-
 // If an entry doesn't receive clock updates but is repeatedly referenced &
 // released, the acquire and release counters could overflow without some
 // intervention. This is that intervention, which should be inexpensive
@@ -259,8 +192,169 @@ inline void CorrectNearOverflow(uint64_t old_meta,
   }
 }
 
-inline Status HyperClockTable::ChargeUsageMaybeEvictStrict(
-    size_t total_charge, size_t capacity, bool need_evict_for_occupancy) {
+inline bool BeginSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
+                            uint64_t initial_countdown, bool* already_matches) {
+  assert(*already_matches == false);
+  // Optimistically transition the slot from "empty" to
+  // "under construction" (no effect on other states)
+  uint64_t old_meta = h.meta.fetch_or(
+      uint64_t{ClockHandle::kStateOccupiedBit} << ClockHandle::kStateShift,
+      std::memory_order_acq_rel);
+  uint64_t old_state = old_meta >> ClockHandle::kStateShift;
+
+  if (old_state == ClockHandle::kStateEmpty) {
+    // We've started inserting into an available slot, and taken
+    // ownership.
+    return true;
+  } else if (old_state != ClockHandle::kStateVisible) {
+    // Slot not usable / touchable now
+    return false;
+  }
+  // Existing, visible entry, which might be a match.
+  // But first, we need to acquire a ref to read it. In fact, number of
+  // refs for initial countdown, so that we boost the clock state if
+  // this is a match.
+  old_meta =
+      h.meta.fetch_add(ClockHandle::kAcquireIncrement * initial_countdown,
+                       std::memory_order_acq_rel);
+  // Like Lookup
+  if ((old_meta >> ClockHandle::kStateShift) == ClockHandle::kStateVisible) {
+    // Acquired a read reference
+    if (h.hashed_key == proto.hashed_key) {
+      // Match. Release in a way that boosts the clock state
+      old_meta =
+          h.meta.fetch_add(ClockHandle::kReleaseIncrement * initial_countdown,
+                           std::memory_order_acq_rel);
+      // Correct for possible (but rare) overflow
+      CorrectNearOverflow(old_meta, h.meta);
+      // Insert detached instead (only if return handle needed)
+      *already_matches = true;
+      return false;
+    } else {
+      // Mismatch. Pretend we never took the reference
+      old_meta =
+          h.meta.fetch_sub(ClockHandle::kAcquireIncrement * initial_countdown,
+                           std::memory_order_acq_rel);
+    }
+  } else if (UNLIKELY((old_meta >> ClockHandle::kStateShift) ==
+                      ClockHandle::kStateInvisible)) {
+    // Pretend we never took the reference
+    // WART/FIXME?: there's a tiny chance we release last ref to invisible
+    // entry here. If that happens, we let eviction take care of it.
+    old_meta =
+        h.meta.fetch_sub(ClockHandle::kAcquireIncrement * initial_countdown,
+                         std::memory_order_acq_rel);
+  } else {
+    // For other states, incrementing the acquire counter has no effect
+    // so we don't need to undo it.
+    // Slot not usable / touchable now.
+  }
+  (void)old_meta;
+  return false;
+}
+
+inline void FinishSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
+                             uint64_t initial_countdown, bool keep_ref) {
+  // Save data fields
+  ClockHandleBasicData* h_alias = &h;
+  *h_alias = proto;
+
+  // Transition from "under construction" state to "visible" state
+  uint64_t new_meta = uint64_t{ClockHandle::kStateVisible}
+                      << ClockHandle::kStateShift;
+
+  // Maybe with an outstanding reference
+  new_meta |= initial_countdown << ClockHandle::kAcquireCounterShift;
+  new_meta |= (initial_countdown - keep_ref)
+              << ClockHandle::kReleaseCounterShift;
+
+#ifndef NDEBUG
+  // Save the state transition, with assertion
+  uint64_t old_meta = h.meta.exchange(new_meta, std::memory_order_release);
+  assert(old_meta >> ClockHandle::kStateShift ==
+         ClockHandle::kStateConstruction);
+#else
+  // Save the state transition
+  h.meta.store(new_meta, std::memory_order_release);
+#endif
+}
+
+bool TryInsert(const ClockHandleBasicData& proto, ClockHandle& h,
+               uint64_t initial_countdown, bool keep_ref,
+               bool* already_matches) {
+  bool b = BeginSlotInsert(proto, h, initial_countdown, already_matches);
+  if (b) {
+    FinishSlotInsert(proto, h, initial_countdown, keep_ref);
+  }
+  return b;
+}
+
+}  // namespace
+
+void ClockHandleBasicData::FreeData(MemoryAllocator* allocator) const {
+  if (helper->del_cb) {
+    helper->del_cb(value, allocator);
+  }
+}
+
+template <class HandleImpl>
+HandleImpl* BaseClockTable::StandaloneInsert(
+    const ClockHandleBasicData& proto) {
+  // Heap allocated separate from table
+  HandleImpl* h = new HandleImpl();
+  ClockHandleBasicData* h_alias = h;
+  *h_alias = proto;
+  h->SetStandalone();
+  // Single reference (standalone entries only created if returning a refed
+  // Handle back to user)
+  uint64_t meta = uint64_t{ClockHandle::kStateInvisible}
+                  << ClockHandle::kStateShift;
+  meta |= uint64_t{1} << ClockHandle::kAcquireCounterShift;
+  h->meta.store(meta, std::memory_order_release);
+  // Keep track of how much of usage is standalone
+  standalone_usage_.fetch_add(proto.GetTotalCharge(),
+                              std::memory_order_relaxed);
+  return h;
+}
+
+template <class Table>
+typename Table::HandleImpl* BaseClockTable::CreateStandalone(
+    ClockHandleBasicData& proto, size_t capacity, bool strict_capacity_limit,
+    bool allow_uncharged) {
+  Table& derived = static_cast<Table&>(*this);
+  typename Table::InsertState state;
+  derived.StartInsert(state);
+
+  const size_t total_charge = proto.GetTotalCharge();
+  if (strict_capacity_limit) {
+    Status s = ChargeUsageMaybeEvictStrict<Table>(
+        total_charge, capacity,
+        /*need_evict_for_occupancy=*/false, state);
+    if (!s.ok()) {
+      if (allow_uncharged) {
+        proto.total_charge = 0;
+      } else {
+        return nullptr;
+      }
+    }
+  } else {
+    // Case strict_capacity_limit == false
+    bool success = ChargeUsageMaybeEvictNonStrict<Table>(
+        total_charge, capacity,
+        /*need_evict_for_occupancy=*/false, state);
+    if (!success) {
+      // Force the issue
+      usage_.fetch_add(total_charge, std::memory_order_relaxed);
+    }
+  }
+
+  return StandaloneInsert<typename Table::HandleImpl>(proto);
+}
+
+template <class Table>
+Status BaseClockTable::ChargeUsageMaybeEvictStrict(
+    size_t total_charge, size_t capacity, bool need_evict_for_occupancy,
+    typename Table::InsertState& state) {
   if (total_charge > capacity) {
     return Status::MemoryLimit(
         "Cache entry too large for a single cache shard: " +
@@ -287,7 +381,8 @@ inline Status HyperClockTable::ChargeUsageMaybeEvictStrict(
   if (request_evict_charge > 0) {
     size_t evicted_charge = 0;
     size_t evicted_count = 0;
-    Evict(request_evict_charge, &evicted_charge, &evicted_count);
+    static_cast<Table*>(this)->Evict(request_evict_charge, &evicted_charge,
+                                     &evicted_count, state);
     occupancy_.fetch_sub(evicted_count, std::memory_order_release);
     if (LIKELY(evicted_charge > need_evict_charge)) {
       assert(evicted_count > 0);
@@ -316,8 +411,10 @@ inline Status HyperClockTable::ChargeUsageMaybeEvictStrict(
   return Status::OK();
 }
 
-inline bool HyperClockTable::ChargeUsageMaybeEvictNonStrict(
-    size_t total_charge, size_t capacity, bool need_evict_for_occupancy) {
+template <class Table>
+inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
+    size_t total_charge, size_t capacity, bool need_evict_for_occupancy,
+    typename Table::InsertState& state) {
   // For simplicity, we consider that either the cache can accept the insert
   // with no evictions, or we must evict enough to make (at least) enough
   // space. It could lead to unnecessary failures or excessive evictions in
@@ -354,7 +451,8 @@ inline bool HyperClockTable::ChargeUsageMaybeEvictNonStrict(
   size_t evicted_charge = 0;
   size_t evicted_count = 0;
   if (need_evict_charge > 0) {
-    Evict(need_evict_charge, &evicted_charge, &evicted_count);
+    static_cast<Table*>(this)->Evict(need_evict_charge, &evicted_charge,
+                                     &evicted_count, state);
     // Deal with potential occupancy deficit
     if (UNLIKELY(need_evict_for_occupancy) && evicted_count == 0) {
       assert(evicted_charge == 0);
@@ -373,54 +471,43 @@ inline bool HyperClockTable::ChargeUsageMaybeEvictNonStrict(
   return true;
 }
 
-inline HyperClockTable::HandleImpl* HyperClockTable::StandaloneInsert(
-    const ClockHandleBasicData& proto) {
-  // Heap allocated separate from table
-  HandleImpl* h = new HandleImpl();
-  ClockHandleBasicData* h_alias = h;
-  *h_alias = proto;
-  h->SetStandalone();
-  // Single reference (standalone entries only created if returning a refed
-  // Handle back to user)
-  uint64_t meta = uint64_t{ClockHandle::kStateInvisible}
-                  << ClockHandle::kStateShift;
-  meta |= uint64_t{1} << ClockHandle::kAcquireCounterShift;
-  h->meta.store(meta, std::memory_order_release);
-  // Keep track of how much of usage is standalone
-  standalone_usage_.fetch_add(proto.GetTotalCharge(),
-                              std::memory_order_relaxed);
-  return h;
-}
+template <class Table>
+Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
+                              typename Table::HandleImpl** handle,
+                              Cache::Priority priority, size_t capacity,
+                              bool strict_capacity_limit) {
+  using HandleImpl = typename Table::HandleImpl;
+  Table& derived = static_cast<Table&>(*this);
 
-Status HyperClockTable::Insert(const ClockHandleBasicData& proto,
-                               HandleImpl** handle, Cache::Priority priority,
-                               size_t capacity, bool strict_capacity_limit) {
+  typename Table::InsertState state;
+  derived.StartInsert(state);
+
   // Do we have the available occupancy? Optimistically assume we do
   // and deal with it if we don't.
   size_t old_occupancy = occupancy_.fetch_add(1, std::memory_order_acquire);
-  auto revert_occupancy_fn = [&]() {
-    occupancy_.fetch_sub(1, std::memory_order_relaxed);
-  };
   // Whether we over-committed and need an eviction to make up for it
-  bool need_evict_for_occupancy = old_occupancy >= occupancy_limit_;
+  bool need_evict_for_occupancy =
+      !derived.GrowIfNeeded(old_occupancy + 1, state);
 
   // Usage/capacity handling is somewhat different depending on
   // strict_capacity_limit, but mostly pessimistic.
   bool use_standalone_insert = false;
   const size_t total_charge = proto.GetTotalCharge();
   if (strict_capacity_limit) {
-    Status s = ChargeUsageMaybeEvictStrict(total_charge, capacity,
-                                           need_evict_for_occupancy);
+    Status s = ChargeUsageMaybeEvictStrict<Table>(
+        total_charge, capacity, need_evict_for_occupancy, state);
     if (!s.ok()) {
-      revert_occupancy_fn();
+      // Revert occupancy
+      occupancy_.fetch_sub(1, std::memory_order_relaxed);
       return s;
     }
   } else {
     // Case strict_capacity_limit == false
-    bool success = ChargeUsageMaybeEvictNonStrict(total_charge, capacity,
-                                                  need_evict_for_occupancy);
+    bool success = ChargeUsageMaybeEvictNonStrict<Table>(
+        total_charge, capacity, need_evict_for_occupancy, state);
     if (!success) {
-      revert_occupancy_fn();
+      // Revert occupancy
+      occupancy_.fetch_sub(1, std::memory_order_relaxed);
       if (handle == nullptr) {
         // Don't insert the entry but still return ok, as if the entry
         // inserted into cache and evicted immediately.
@@ -433,11 +520,6 @@ Status HyperClockTable::Insert(const ClockHandleBasicData& proto,
       }
     }
   }
-  auto revert_usage_fn = [&]() {
-    usage_.fetch_sub(total_charge, std::memory_order_relaxed);
-    // No underflow
-    assert(usage_.load(std::memory_order_relaxed) < SIZE_MAX / 2);
-  };
 
   if (!use_standalone_insert) {
     // Attempt a table insert, but abort if we find an existing entry for the
@@ -451,129 +533,37 @@ Status HyperClockTable::Insert(const ClockHandleBasicData& proto,
     uint64_t initial_countdown = GetInitialCountdown(priority);
     assert(initial_countdown > 0);
 
-    size_t probe = 0;
-    HandleImpl* e = FindSlot(
-        proto.hashed_key,
-        [&](HandleImpl* h) {
-          // Optimistically transition the slot from "empty" to
-          // "under construction" (no effect on other states)
-          uint64_t old_meta =
-              h->meta.fetch_or(uint64_t{ClockHandle::kStateOccupiedBit}
-                                   << ClockHandle::kStateShift,
-                               std::memory_order_acq_rel);
-          uint64_t old_state = old_meta >> ClockHandle::kStateShift;
+    HandleImpl* e =
+        derived.DoInsert(proto, initial_countdown, handle != nullptr, state);
 
-          if (old_state == ClockHandle::kStateEmpty) {
-            // We've started inserting into an available slot, and taken
-            // ownership Save data fields
-            ClockHandleBasicData* h_alias = h;
-            *h_alias = proto;
-
-            // Transition from "under construction" state to "visible" state
-            uint64_t new_meta = uint64_t{ClockHandle::kStateVisible}
-                                << ClockHandle::kStateShift;
-
-            // Maybe with an outstanding reference
-            new_meta |= initial_countdown << ClockHandle::kAcquireCounterShift;
-            new_meta |= (initial_countdown - (handle != nullptr))
-                        << ClockHandle::kReleaseCounterShift;
-
-#ifndef NDEBUG
-            // Save the state transition, with assertion
-            old_meta = h->meta.exchange(new_meta, std::memory_order_release);
-            assert(old_meta >> ClockHandle::kStateShift ==
-                   ClockHandle::kStateConstruction);
-#else
-            // Save the state transition
-            h->meta.store(new_meta, std::memory_order_release);
-#endif
-            return true;
-          } else if (old_state != ClockHandle::kStateVisible) {
-            // Slot not usable / touchable now
-            return false;
-          }
-          // Existing, visible entry, which might be a match.
-          // But first, we need to acquire a ref to read it. In fact, number of
-          // refs for initial countdown, so that we boost the clock state if
-          // this is a match.
-          old_meta = h->meta.fetch_add(
-              ClockHandle::kAcquireIncrement * initial_countdown,
-              std::memory_order_acq_rel);
-          // Like Lookup
-          if ((old_meta >> ClockHandle::kStateShift) ==
-              ClockHandle::kStateVisible) {
-            // Acquired a read reference
-            if (h->hashed_key == proto.hashed_key) {
-              // Match. Release in a way that boosts the clock state
-              old_meta = h->meta.fetch_add(
-                  ClockHandle::kReleaseIncrement * initial_countdown,
-                  std::memory_order_acq_rel);
-              // Correct for possible (but rare) overflow
-              CorrectNearOverflow(old_meta, h->meta);
-              // Insert standalone instead (only if return handle needed)
-              use_standalone_insert = true;
-              return true;
-            } else {
-              // Mismatch. Pretend we never took the reference
-              old_meta = h->meta.fetch_sub(
-                  ClockHandle::kAcquireIncrement * initial_countdown,
-                  std::memory_order_acq_rel);
-            }
-          } else if (UNLIKELY((old_meta >> ClockHandle::kStateShift) ==
-                              ClockHandle::kStateInvisible)) {
-            // Pretend we never took the reference
-            // WART: there's a tiny chance we release last ref to invisible
-            // entry here. If that happens, we let eviction take care of it.
-            old_meta = h->meta.fetch_sub(
-                ClockHandle::kAcquireIncrement * initial_countdown,
-                std::memory_order_acq_rel);
-          } else {
-            // For other states, incrementing the acquire counter has no effect
-            // so we don't need to undo it.
-            // Slot not usable / touchable now.
-          }
-          (void)old_meta;
-          return false;
-        },
-        [&](HandleImpl* /*h*/) { return false; },
-        [&](HandleImpl* h) {
-          h->displacements.fetch_add(1, std::memory_order_relaxed);
-        },
-        probe);
-    if (e == nullptr) {
-      // Occupancy check and never abort FindSlot above should generally
-      // prevent this, except it's theoretically possible for other threads
-      // to evict and replace entries in the right order to hit every slot
-      // when it is populated. Assuming random hashing, the chance of that
-      // should be no higher than pow(kStrictLoadFactor, n) for n slots.
-      // That should be infeasible for roughly n >= 256, so if this assertion
-      // fails, that suggests something is going wrong.
-      assert(GetTableSize() < 256);
-      use_standalone_insert = true;
-    }
-    if (!use_standalone_insert) {
+    if (e) {
       // Successfully inserted
       if (handle) {
         *handle = e;
       }
       return Status::OK();
     }
-    // Roll back table insertion
-    Rollback(proto.hashed_key, e);
-    revert_occupancy_fn();
+    // Not inserted
+    // Revert occupancy
+    occupancy_.fetch_sub(1, std::memory_order_relaxed);
     // Maybe fall back on standalone insert
     if (handle == nullptr) {
-      revert_usage_fn();
+      // Revert usage
+      usage_.fetch_sub(total_charge, std::memory_order_relaxed);
+      // No underflow
+      assert(usage_.load(std::memory_order_relaxed) < SIZE_MAX / 2);
       // As if unrefed entry immdiately evicted
       proto.FreeData(allocator_);
       return Status::OK();
     }
+
+    use_standalone_insert = true;
   }
 
   // Run standalone insert
   assert(use_standalone_insert);
 
-  *handle = StandaloneInsert(proto);
+  *handle = StandaloneInsert<HandleImpl>(proto);
 
   // The OkOverwritten status is used to count "redundant" insertions into
   // block cache. This implementation doesn't strictly check for redundant
@@ -583,37 +573,156 @@ Status HyperClockTable::Insert(const ClockHandleBasicData& proto,
   return Status::OkOverwritten();
 }
 
-HyperClockTable::HandleImpl* HyperClockTable::CreateStandalone(
-    ClockHandleBasicData& proto, size_t capacity, bool strict_capacity_limit,
-    bool allow_uncharged) {
-  const size_t total_charge = proto.GetTotalCharge();
-  if (strict_capacity_limit) {
-    Status s = ChargeUsageMaybeEvictStrict(total_charge, capacity,
-                                           /*need_evict_for_occupancy=*/false);
-    if (!s.ok()) {
-      if (allow_uncharged) {
-        proto.total_charge = 0;
-      } else {
-        return nullptr;
-      }
-    }
-  } else {
-    // Case strict_capacity_limit == false
-    bool success =
-        ChargeUsageMaybeEvictNonStrict(total_charge, capacity,
-                                       /*need_evict_for_occupancy=*/false);
-    if (!success) {
-      // Force the issue
-      usage_.fetch_add(total_charge, std::memory_order_relaxed);
+void BaseClockTable::Ref(ClockHandle& h) {
+  // Increment acquire counter
+  uint64_t old_meta = h.meta.fetch_add(ClockHandle::kAcquireIncrement,
+                                       std::memory_order_acquire);
+
+  assert((old_meta >> ClockHandle::kStateShift) &
+         ClockHandle::kStateShareableBit);
+  // Must have already had a reference
+  assert(GetRefcount(old_meta) > 0);
+  (void)old_meta;
+}
+
+#ifndef NDEBUG
+void BaseClockTable::TEST_RefN(ClockHandle& h, size_t n) {
+  // Increment acquire counter
+  uint64_t old_meta = h.meta.fetch_add(n * ClockHandle::kAcquireIncrement,
+                                       std::memory_order_acquire);
+
+  assert((old_meta >> ClockHandle::kStateShift) &
+         ClockHandle::kStateShareableBit);
+  (void)old_meta;
+}
+
+void BaseClockTable::TEST_ReleaseNMinus1(ClockHandle* h, size_t n) {
+  assert(n > 0);
+
+  // Like n-1 Releases, but assumes one more will happen in the caller to take
+  // care of anything like erasing an unreferenced, invisible entry.
+  uint64_t old_meta = h->meta.fetch_add(
+      (n - 1) * ClockHandle::kReleaseIncrement, std::memory_order_acquire);
+  assert((old_meta >> ClockHandle::kStateShift) &
+         ClockHandle::kStateShareableBit);
+  (void)old_meta;
+}
+#endif
+
+HyperClockTable::HyperClockTable(
+    size_t capacity, bool /*strict_capacity_limit*/,
+    CacheMetadataChargePolicy metadata_charge_policy,
+    MemoryAllocator* allocator,
+    const Cache::EvictionCallback* eviction_callback, const uint32_t* hash_seed,
+    const Opts& opts)
+    : BaseClockTable(metadata_charge_policy, allocator, eviction_callback,
+                     hash_seed),
+      length_bits_(CalcHashBits(capacity, opts.estimated_value_size,
+                                metadata_charge_policy)),
+      length_bits_mask_((size_t{1} << length_bits_) - 1),
+      occupancy_limit_(static_cast<size_t>((uint64_t{1} << length_bits_) *
+                                           kStrictLoadFactor)),
+      array_(new HandleImpl[size_t{1} << length_bits_]) {
+  if (metadata_charge_policy ==
+      CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
+    usage_ += size_t{GetTableSize()} * sizeof(HandleImpl);
+  }
+
+  static_assert(sizeof(HandleImpl) == 64U,
+                "Expecting size / alignment with common cache line size");
+}
+
+HyperClockTable::~HyperClockTable() {
+  // Assumes there are no references or active operations on any slot/element
+  // in the table.
+  for (size_t i = 0; i < GetTableSize(); i++) {
+    HandleImpl& h = array_[i];
+    switch (h.meta >> ClockHandle::kStateShift) {
+      case ClockHandle::kStateEmpty:
+        // noop
+        break;
+      case ClockHandle::kStateInvisible:  // rare but possible
+      case ClockHandle::kStateVisible:
+        assert(GetRefcount(h.meta) == 0);
+        h.FreeData(allocator_);
+#ifndef NDEBUG
+        Rollback(h.hashed_key, &h);
+        ReclaimEntryUsage(h.GetTotalCharge());
+#endif
+        break;
+      // otherwise
+      default:
+        assert(false);
+        break;
     }
   }
 
-  return StandaloneInsert(proto);
+#ifndef NDEBUG
+  for (size_t i = 0; i < GetTableSize(); i++) {
+    assert(array_[i].displacements.load() == 0);
+  }
+#endif
+
+  assert(usage_.load() == 0 ||
+         usage_.load() == size_t{GetTableSize()} * sizeof(HandleImpl));
+  assert(occupancy_ == 0);
+}
+
+void HyperClockTable::StartInsert(InsertState&) {}
+
+bool HyperClockTable::GrowIfNeeded(size_t new_occupancy, InsertState&) {
+  return new_occupancy <= occupancy_limit_;
+}
+
+HyperClockTable::HandleImpl* HyperClockTable::DoInsert(
+    const ClockHandleBasicData& proto, uint64_t initial_countdown,
+    bool keep_ref, InsertState&) {
+  bool already_matches = false;
+  HandleImpl* e = FindSlot(
+      proto.hashed_key,
+      [&](HandleImpl* h) {
+        return TryInsert(proto, *h, initial_countdown, keep_ref,
+                         &already_matches);
+      },
+      [&](HandleImpl* h) {
+        if (already_matches) {
+          // Stop searching & roll back displacements
+          Rollback(proto.hashed_key, h);
+          return true;
+        } else {
+          // Keep going
+          return false;
+        }
+      },
+      [&](HandleImpl* h, bool is_last) {
+        if (is_last) {
+          // Search is ending. Roll back displacements
+          Rollback(proto.hashed_key, h);
+        } else {
+          h->displacements.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+  if (already_matches) {
+    // Insertion skipped
+    return nullptr;
+  }
+  if (e != nullptr) {
+    // Successfully inserted
+    return e;
+  }
+  // Else, no available slot found. Occupancy check should generally prevent
+  // this, except it's theoretically possible for other threads to evict and
+  // replace entries in the right order to hit every slot when it is populated.
+  // Assuming random hashing, the chance of that should be no higher than
+  // pow(kStrictLoadFactor, n) for n slots. That should be infeasible for
+  // roughly n >= 256, so if this assertion fails, that suggests something is
+  // going wrong.
+  assert(GetTableSize() < 256);
+  return nullptr;
 }
 
 HyperClockTable::HandleImpl* HyperClockTable::Lookup(
     const UniqueId64x2& hashed_key) {
-  size_t probe = 0;
   HandleImpl* e = FindSlot(
       hashed_key,
       [&](HandleImpl* h) {
@@ -673,7 +782,7 @@ HyperClockTable::HandleImpl* HyperClockTable::Lookup(
       [&](HandleImpl* h) {
         return h->displacements.load(std::memory_order_relaxed) == 0;
       },
-      [&](HandleImpl* /*h*/) {}, probe);
+      [&](HandleImpl* /*h*/, bool /*is_last*/) {});
 
   return e;
 }
@@ -753,43 +862,19 @@ bool HyperClockTable::Release(HandleImpl* h, bool useful,
   }
 }
 
-void HyperClockTable::Ref(HandleImpl& h) {
-  // Increment acquire counter
-  uint64_t old_meta = h.meta.fetch_add(ClockHandle::kAcquireIncrement,
-                                       std::memory_order_acquire);
-
-  assert((old_meta >> ClockHandle::kStateShift) &
-         ClockHandle::kStateShareableBit);
-  // Must have already had a reference
-  assert(GetRefcount(old_meta) > 0);
-  (void)old_meta;
-}
-
-void HyperClockTable::TEST_RefN(HandleImpl& h, size_t n) {
-  // Increment acquire counter
-  uint64_t old_meta = h.meta.fetch_add(n * ClockHandle::kAcquireIncrement,
-                                       std::memory_order_acquire);
-
-  assert((old_meta >> ClockHandle::kStateShift) &
-         ClockHandle::kStateShareableBit);
-  (void)old_meta;
-}
-
+#ifndef NDEBUG
 void HyperClockTable::TEST_ReleaseN(HandleImpl* h, size_t n) {
   if (n > 0) {
-    // Split into n - 1 and 1 steps.
-    uint64_t old_meta = h->meta.fetch_add(
-        (n - 1) * ClockHandle::kReleaseIncrement, std::memory_order_acquire);
-    assert((old_meta >> ClockHandle::kStateShift) &
-           ClockHandle::kStateShareableBit);
-    (void)old_meta;
+    // Do n-1 simple releases first
+    TEST_ReleaseNMinus1(h, n);
 
+    // Then the last release might be more involved
     Release(h, /*useful*/ true, /*erase_if_last_ref*/ false);
   }
 }
+#endif
 
 void HyperClockTable::Erase(const UniqueId64x2& hashed_key) {
-  size_t probe = 0;
   (void)FindSlot(
       hashed_key,
       [&](HandleImpl* h) {
@@ -856,7 +941,7 @@ void HyperClockTable::Erase(const UniqueId64x2& hashed_key) {
       [&](HandleImpl* h) {
         return h->displacements.load(std::memory_order_relaxed) == 0;
       },
-      [&](HandleImpl* /*h*/) {}, probe);
+      [&](HandleImpl* /*h*/, bool /*is_last*/) {});
 }
 
 void HyperClockTable::ConstApplyToEntriesRange(
@@ -921,10 +1006,10 @@ void HyperClockTable::EraseUnRefEntries() {
   }
 }
 
+template <typename MatchFn, typename AbortFn, typename UpdateFn>
 inline HyperClockTable::HandleImpl* HyperClockTable::FindSlot(
-    const UniqueId64x2& hashed_key, std::function<bool(HandleImpl*)> match_fn,
-    std::function<bool(HandleImpl*)> abort_fn,
-    std::function<void(HandleImpl*)> update_fn, size_t& probe) {
+    const UniqueId64x2& hashed_key, MatchFn match_fn, AbortFn abort_fn,
+    UpdateFn update_fn) {
   // NOTE: upper 32 bits of hashed_key[0] is used for sharding
   //
   // We use double-hashing probing. Every probe in the sequence is a
@@ -938,20 +1023,21 @@ inline HyperClockTable::HandleImpl* HyperClockTable::FindSlot(
   // TODO: we could also reconsider linear probing, though locality benefits
   // are limited because each slot is a full cache line
   size_t increment = static_cast<size_t>(hashed_key[0]) | 1U;
-  size_t current = ModTableSize(base + probe * increment);
-  while (probe <= length_bits_mask_) {
+  size_t first = ModTableSize(base);
+  size_t current = first;
+  bool is_last;
+  do {
     HandleImpl* h = &array_[current];
     if (match_fn(h)) {
-      probe++;
       return h;
     }
     if (abort_fn(h)) {
       return nullptr;
     }
-    probe++;
-    update_fn(h);
     current = ModTableSize(current + increment);
-  }
+    is_last = current == first;
+    update_fn(h, is_last);
+  } while (!is_last);
   // We looped back.
   return nullptr;
 }
@@ -978,7 +1064,8 @@ inline void HyperClockTable::ReclaimEntryUsage(size_t total_charge) {
 }
 
 inline void HyperClockTable::Evict(size_t requested_charge,
-                                   size_t* freed_charge, size_t* freed_count) {
+                                   size_t* freed_charge, size_t* freed_count,
+                                   InsertState&) {
   // precondition
   assert(requested_charge > 0);
 
@@ -1146,18 +1233,15 @@ Status ClockCacheShard<Table>::Insert(const Slice& key,
   proto.value = value;
   proto.helper = helper;
   proto.total_charge = charge;
-  return table_.Insert(proto, handle, priority,
-                       capacity_.load(std::memory_order_relaxed),
-                       strict_capacity_limit_.load(std::memory_order_relaxed));
+  return table_.template Insert<Table>(
+      proto, handle, priority, capacity_.load(std::memory_order_relaxed),
+      strict_capacity_limit_.load(std::memory_order_relaxed));
 }
 
 template <class Table>
-typename ClockCacheShard<Table>::HandleImpl*
-ClockCacheShard<Table>::CreateStandalone(const Slice& key,
-                                         const UniqueId64x2& hashed_key,
-                                         Cache::ObjectPtr obj,
-                                         const Cache::CacheItemHelper* helper,
-                                         size_t charge, bool allow_uncharged) {
+typename Table::HandleImpl* ClockCacheShard<Table>::CreateStandalone(
+    const Slice& key, const UniqueId64x2& hashed_key, Cache::ObjectPtr obj,
+    const Cache::CacheItemHelper* helper, size_t charge, bool allow_uncharged) {
   if (UNLIKELY(key.size() != kCacheKeySize)) {
     return nullptr;
   }
@@ -1166,7 +1250,7 @@ ClockCacheShard<Table>::CreateStandalone(const Slice& key,
   proto.value = obj;
   proto.helper = helper;
   proto.total_charge = charge;
-  return table_.CreateStandalone(
+  return table_.template CreateStandalone<Table>(
       proto, capacity_.load(std::memory_order_relaxed),
       strict_capacity_limit_.load(std::memory_order_relaxed), allow_uncharged);
 }
@@ -1198,6 +1282,7 @@ bool ClockCacheShard<Table>::Release(HandleImpl* handle, bool useful,
   return table_.Release(handle, useful, erase_if_last_ref);
 }
 
+#ifndef NDEBUG
 template <class Table>
 void ClockCacheShard<Table>::TEST_RefN(HandleImpl* h, size_t n) {
   table_.TEST_RefN(*h, n);
@@ -1207,6 +1292,7 @@ template <class Table>
 void ClockCacheShard<Table>::TEST_ReleaseN(HandleImpl* h, size_t n) {
   table_.TEST_ReleaseN(h, n);
 }
+#endif
 
 template <class Table>
 bool ClockCacheShard<Table>::Release(HandleImpl* handle,
