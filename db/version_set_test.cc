@@ -1221,7 +1221,7 @@ class VersionSetTestBase {
       tmp_db_options.env = env_;
       std::unique_ptr<DBImpl> impl(new DBImpl(tmp_db_options, dbname_));
       std::string db_id;
-      impl->GetDbIdentityFromIdentityFile(&db_id);
+      ASSERT_OK(impl->GetDbIdentityFromIdentityFile(&db_id));
       new_db.SetDBId(db_id);
     }
     new_db.SetLogNumber(0);
@@ -1277,7 +1277,7 @@ class VersionSetTestBase {
   void NewDB() {
     SequenceNumber last_seqno;
     std::unique_ptr<log::Writer> log_writer;
-    SetIdentityFile(env_, dbname_);
+    ASSERT_OK(SetIdentityFile(env_, dbname_));
     PrepareManifest(&column_families_, &last_seqno, &log_writer);
     log_writer.reset();
     // Make "CURRENT" file point to the new manifest file.
@@ -1349,6 +1349,8 @@ class VersionSetTestBase {
     new_cf.SetColumnFamily(new_id);
     new_cf.SetLogNumber(0);
     new_cf.SetComparatorName(cf_options.comparator->Name());
+    new_cf.SetPersistUserDefinedTimestamps(
+        cf_options.persist_user_defined_timestamps);
     Status s;
     mutex_.Lock();
     s = versions_->LogAndApply(/*column_family_data=*/nullptr,
@@ -2860,11 +2862,12 @@ class VersionSetTestEmptyDb
     assert(nullptr != log_writer);
     VersionEdit new_db;
     if (db_options_.write_dbid_to_manifest) {
+      ASSERT_OK(SetIdentityFile(env_, dbname_));
       DBOptions tmp_db_options;
       tmp_db_options.env = env_;
       std::unique_ptr<DBImpl> impl(new DBImpl(tmp_db_options, dbname_));
       std::string db_id;
-      impl->GetDbIdentityFromIdentityFile(&db_id);
+      ASSERT_OK(impl->GetDbIdentityFromIdentityFile(&db_id));
       new_db.SetDBId(db_id);
     }
     const std::string manifest_path = DescriptorFileName(dbname_, 1);
@@ -3194,7 +3197,7 @@ class VersionSetTestMissingFiles : public VersionSetTestBase,
       tmp_db_options.env = env_;
       std::unique_ptr<DBImpl> impl(new DBImpl(tmp_db_options, dbname_));
       std::string db_id;
-      impl->GetDbIdentityFromIdentityFile(&db_id);
+      ASSERT_OK(impl->GetDbIdentityFromIdentityFile(&db_id));
       new_db.SetDBId(db_id);
     }
     {

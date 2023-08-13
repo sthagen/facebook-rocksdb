@@ -771,6 +771,7 @@ Status BlockBasedTable::Open(
   if (!s.ok()) {
     return s;
   }
+  rep->verify_checksum_set_on_open = ro.verify_checksums;
   s = new_table->PrefetchIndexAndFilterBlocks(
       ro, prefetch_buffer.get(), metaindex_iter.get(), new_table.get(),
       prefetch_all, table_options, level, file_size,
@@ -859,10 +860,11 @@ Status BlockBasedTable::PrefetchTail(
                            &prefetch_off_len_pair);
 #endif  // NDEBUG
 
+  IOOptions opts;
+  Status s = file->PrepareIOOptions(ro, opts);
   // Try file system prefetch
-  if (!file->use_direct_io() && !force_direct_prefetch) {
-    if (!file->Prefetch(prefetch_off, prefetch_len, ro.rate_limiter_priority)
-             .IsNotSupported()) {
+  if (s.ok() && !file->use_direct_io() && !force_direct_prefetch) {
+    if (!file->Prefetch(opts, prefetch_off, prefetch_len).IsNotSupported()) {
       prefetch_buffer->reset(new FilePrefetchBuffer(
           0 /* readahead_size */, 0 /* max_readahead_size */,
           false /* enable */, true /* track_min_offset */));
@@ -878,12 +880,8 @@ Status BlockBasedTable::PrefetchTail(
       nullptr /* fs */, nullptr /* clock */, stats,
       FilePrefetchBufferUsage::kTableOpenPrefetchTail));
 
-  IOOptions opts;
-  Status s = file->PrepareIOOptions(ro, opts);
   if (s.ok()) {
-    s = (*prefetch_buffer)
-            ->Prefetch(opts, file, prefetch_off, prefetch_len,
-                       ro.rate_limiter_priority);
+    s = (*prefetch_buffer)->Prefetch(opts, file, prefetch_off, prefetch_len);
   }
   return s;
 }
@@ -1214,23 +1212,7 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
   return s;
 }
 
-void BlockBasedTable::SetupForCompaction() {
-  switch (rep_->ioptions.access_hint_on_compaction_start) {
-    case Options::NONE:
-      break;
-    case Options::NORMAL:
-      rep_->file->file()->Hint(FSRandomAccessFile::kNormal);
-      break;
-    case Options::SEQUENTIAL:
-      rep_->file->file()->Hint(FSRandomAccessFile::kSequential);
-      break;
-    case Options::WILLNEED:
-      rep_->file->file()->Hint(FSRandomAccessFile::kWillNeed);
-      break;
-    default:
-      assert(false);
-  }
-}
+void BlockBasedTable::SetupForCompaction() {}
 
 std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
     const {
@@ -2454,6 +2436,10 @@ BlockType BlockBasedTable::GetBlockTypeForMetaBlockByName(
     return BlockType::kHashIndexMetadata;
   }
 
+  if (meta_block_name == kIndexBlockName) {
+    return BlockType::kIndex;
+  }
+
   if (meta_block_name.starts_with(kObsoleteFilterBlockPrefix)) {
     // Obsolete but possible in old files
     return BlockType::kInvalid;
@@ -2474,6 +2460,9 @@ Status BlockBasedTable::VerifyChecksumInMetaBlocks(
     BlockHandle handle;
     Slice input = index_iter->value();
     s = handle.DecodeFrom(&input);
+    if (!s.ok()) {
+      break;
+    }
     BlockContents contents;
     const Slice meta_block_name = index_iter->key();
     if (meta_block_name == kPropertiesBlockName) {
@@ -2484,7 +2473,13 @@ Status BlockBasedTable::VerifyChecksumInMetaBlocks(
                                     nullptr /* prefetch_buffer */, rep_->footer,
                                     rep_->ioptions, &table_properties,
                                     nullptr /* memory_allocator */);
+    } else if (rep_->verify_checksum_set_on_open &&
+               meta_block_name == kIndexBlockName) {
+      // WART: For now, to maintain similar I/O behavior as before
+      // format_version=6, we skip verifying index block checksum--but only
+      // if it was checked on open.
     } else {
+      // FIXME? Need to verify checksums of index and filter partitions?
       s = BlockFetcher(
               rep_->file.get(), nullptr /* prefetch buffer */, rep_->footer,
               read_options, handle, &contents, rep_->ioptions,
@@ -2542,6 +2537,15 @@ Status BlockBasedTable::CreateIndexReader(
     InternalIterator* meta_iter, bool use_cache, bool prefetch, bool pin,
     BlockCacheLookupContext* lookup_context,
     std::unique_ptr<IndexReader>* index_reader) {
+  if (FormatVersionUsesIndexHandleInFooter(rep_->footer.format_version())) {
+    rep_->index_handle = rep_->footer.index_handle();
+  } else {
+    Status s = FindMetaBlock(meta_iter, kIndexBlockName, &rep_->index_handle);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
   switch (rep_->index_type) {
     case BlockBasedTableOptions::kTwoLevelIndexSearch: {
       return PartitionIndexReader::Create(this, ro, prefetch_buffer, use_cache,
@@ -2709,7 +2713,7 @@ bool BlockBasedTable::TEST_FilterBlockInCache() const {
 bool BlockBasedTable::TEST_IndexBlockInCache() const {
   assert(rep_ != nullptr);
 
-  return TEST_BlockInCache(rep_->footer.index_handle());
+  return TEST_BlockInCache(rep_->index_handle);
 }
 
 Status BlockBasedTable::GetKVPairsFromDataBlocks(
