@@ -1361,8 +1361,9 @@ class DB {
   // the files. In this case, client could set options.change_level to true, to
   // move the files back to the minimum level capable of holding the data set
   // or a given level (specified by non-negative options.target_level).
-  // In case of user_defined timestamp, if enabled, `start` and `end` should
-  // point to key without timestamp part.
+  //
+  // In case of user-defined timestamp, if enabled, `begin` and `end` should
+  // not contain timestamp.
   virtual Status CompactRange(const CompactRangeOptions& options,
                               ColumnFamilyHandle* column_family,
                               const Slice* begin, const Slice* end) = 0;
@@ -1476,7 +1477,8 @@ class DB {
   // NOTE: This may also never return if there's sufficient ongoing writes that
   // keeps flush and compaction going without stopping. The user would have to
   // cease all the writes to DB to make this eventually return in a stable
-  // state.
+  // state. The user may also use timeout option in WaitForCompactOptions to
+  // make this stop waiting and return when timeout expires.
   virtual Status WaitForCompact(
       const WaitForCompactOptions& /* wait_for_compact_options */) = 0;
 

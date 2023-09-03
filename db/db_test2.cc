@@ -6876,6 +6876,7 @@ TEST_F(DBTest2, LastLevelTemperatureUniversal) {
 TEST_F(DBTest2, LastLevelStatistics) {
   Options options = CurrentOptions();
   options.bottommost_temperature = Temperature::kWarm;
+  options.default_temperature = Temperature::kHot;
   options.level0_file_num_compaction_trigger = 2;
   options.level_compaction_dynamic_level_bytes = true;
   options.statistics = CreateDBStatistics();
@@ -6889,6 +6890,10 @@ TEST_F(DBTest2, LastLevelStatistics) {
 
   ASSERT_GT(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_BYTES), 0);
   ASSERT_GT(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_COUNT), 0);
+  ASSERT_EQ(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_BYTES),
+            options.statistics->getTickerCount(HOT_FILE_READ_BYTES));
+  ASSERT_EQ(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_COUNT),
+            options.statistics->getTickerCount(HOT_FILE_READ_COUNT));
   ASSERT_EQ(options.statistics->getTickerCount(LAST_LEVEL_READ_BYTES), 0);
   ASSERT_EQ(options.statistics->getTickerCount(LAST_LEVEL_READ_COUNT), 0);
 
@@ -6899,6 +6904,10 @@ TEST_F(DBTest2, LastLevelStatistics) {
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ASSERT_EQ("bar", Get("bar"));
 
+  ASSERT_EQ(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_BYTES),
+            options.statistics->getTickerCount(HOT_FILE_READ_BYTES));
+  ASSERT_EQ(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_COUNT),
+            options.statistics->getTickerCount(HOT_FILE_READ_COUNT));
   ASSERT_EQ(options.statistics->getTickerCount(LAST_LEVEL_READ_BYTES),
             options.statistics->getTickerCount(WARM_FILE_READ_BYTES));
   ASSERT_EQ(options.statistics->getTickerCount(LAST_LEVEL_READ_COUNT),
@@ -6919,6 +6928,30 @@ TEST_F(DBTest2, LastLevelStatistics) {
             pre_bytes);
   ASSERT_GT(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_COUNT),
             pre_count);
+  ASSERT_EQ(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_BYTES),
+            options.statistics->getTickerCount(HOT_FILE_READ_BYTES));
+  ASSERT_EQ(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_COUNT),
+            options.statistics->getTickerCount(HOT_FILE_READ_COUNT));
+  ASSERT_EQ(options.statistics->getTickerCount(LAST_LEVEL_READ_BYTES),
+            options.statistics->getTickerCount(WARM_FILE_READ_BYTES));
+  ASSERT_EQ(options.statistics->getTickerCount(LAST_LEVEL_READ_COUNT),
+            options.statistics->getTickerCount(WARM_FILE_READ_COUNT));
+
+  // Not a realistic setting to make last level kWarm and default temp kCold.
+  // This is just for testing default temp can be reset on reopen while the
+  // last level temp is consistent across DB reopen because those file's temp
+  // are persisted in manifest.
+  options.default_temperature = Temperature::kCold;
+  ASSERT_OK(options.statistics->Reset());
+  Reopen(options);
+  ASSERT_EQ("bar", Get("bar"));
+
+  ASSERT_EQ(0, options.statistics->getTickerCount(HOT_FILE_READ_BYTES));
+
+  ASSERT_EQ(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_BYTES),
+            options.statistics->getTickerCount(COLD_FILE_READ_BYTES));
+  ASSERT_EQ(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_COUNT),
+            options.statistics->getTickerCount(COLD_FILE_READ_COUNT));
   ASSERT_EQ(options.statistics->getTickerCount(LAST_LEVEL_READ_BYTES),
             options.statistics->getTickerCount(WARM_FILE_READ_BYTES));
   ASSERT_EQ(options.statistics->getTickerCount(LAST_LEVEL_READ_COUNT),
@@ -7669,6 +7702,41 @@ TEST_F(DBTest2, GetLatestSeqAndTsForKey) {
   // Verify that no read to SST files.
   ASSERT_EQ(0, options.statistics->getTickerCount(GET_HIT_L0));
 }
+
+#if defined(ZSTD_ADVANCED)
+TEST_F(DBTest2, ZSTDChecksum) {
+  // Verify that corruption during decompression is caught.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.compression = kZSTD;
+  options.compression_opts.max_compressed_bytes_per_kb = 1024;
+  options.compression_opts.checksum = true;
+  DestroyAndReopen(options);
+  Random rnd(33);
+  ASSERT_OK(Put(Key(0), rnd.RandomString(4 << 10)));
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::WriteBlock:TamperWithCompressedData",
+      [&](void* arg) {
+        std::string* output = static_cast<std::string*>(arg);
+        // https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#zstandard-frames
+        // Checksum is the last 4 bytes, corrupting that part in unit test is
+        // more controllable.
+        output->data()[output->size() - 1]++;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(Flush());
+  PinnableSlice val;
+  Status s = Get(Key(0), &val);
+  ASSERT_TRUE(s.IsCorruption());
+
+  // Corruption caught during flush.
+  options.paranoid_file_checks = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put(Key(0), rnd.RandomString(4 << 10)));
+  s = Flush();
+  ASSERT_TRUE(s.IsCorruption());
+}
+#endif
 
 }  // namespace ROCKSDB_NAMESPACE
 
