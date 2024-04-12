@@ -126,6 +126,8 @@ class CacheDumperImpl : public CacheDumper {
   // Deadline for dumper in microseconds.
   std::chrono::microseconds deadline_;
   uint64_t dumped_size_bytes_;
+  // dump all keys of cache if user doesn't call SetDumpFilter
+  bool dump_all_keys_ = true;
 };
 
 // The default implementation of CacheDumpedLoader
@@ -192,8 +194,12 @@ class ToFileCacheDumpWriter : public CacheDumpWriter {
 
   // Reset the writer
   IOStatus Close() override {
+    IOStatus io_s;
+    if (file_writer_ != nullptr && !file_writer_->seen_error()) {
+      io_s = file_writer_->Sync(IOOptions(), false /* use_fsync */);
+    }
     file_writer_.reset();
-    return IOStatus::OK();
+    return io_s;
   }
 
  private:
