@@ -80,7 +80,8 @@ default_params = {
     "flush_one_in": lambda: random.choice([1000, 1000000]),
     "manual_wal_flush_one_in": lambda: random.choice([0, 1000]),
     "file_checksum_impl": lambda: random.choice(["none", "crc32c", "xxh64", "big"]),
-    "get_live_files_one_in": lambda: random.choice([10000, 1000000]),
+    "get_live_files_apis_one_in": lambda: random.choice([10000, 1000000]),
+    "get_all_column_family_metadata_one_in": lambda: random.choice([10000, 1000000]),
     # Note: the following two are intentionally disabled as the corresponding
     # APIs are not guaranteed to succeed.
     "get_sorted_wal_files_one_in": 0,
@@ -107,6 +108,8 @@ default_params = {
     "partition_filters": lambda: random.randint(0, 1),
     "partition_pinning": lambda: random.randint(0, 3),
     "pause_background_one_in": lambda: random.choice([10000, 1000000]),
+    "disable_file_deletions_one_in": lambda: random.choice([10000, 1000000]),
+    "disable_manual_compaction_one_in": lambda: random.choice([10000, 1000000]),
     "prefix_size": lambda: random.choice([-1, 1, 5, 7, 8]),
     "prefixpercent": 5,
     "progress_reports": 0,
@@ -200,6 +203,7 @@ default_params = {
     "open_read_fault_one_in": lambda: random.choice([0, 0, 32]),
     "sync_fault_injection": lambda: random.randint(0, 1),
     "get_property_one_in":  lambda: random.choice([100000, 1000000]),
+    "get_properties_of_all_tables_one_in":  lambda: random.choice([100000, 1000000]),
     "paranoid_file_checks": lambda: random.choice([0, 1, 1, 1]),
     "max_write_buffer_size_to_maintain": lambda: random.choice(
         [0, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024]
@@ -631,8 +635,6 @@ def finalize_and_sanitize(src_params):
         dest_params["compression_max_dict_buffer_bytes"] = 0
     if dest_params.get("compression_type") != "zstd":
         dest_params["compression_zstd_max_train_bytes"] = 0
-    if dest_params.get("allow_concurrent_memtable_write", 1) == 1:
-        dest_params["memtablerep"] = "skip_list"
     if dest_params["mmap_read"] == 1:
         dest_params["use_direct_io_for_flush_and_compaction"] = 0
         dest_params["use_direct_reads"] = 0
@@ -713,18 +715,6 @@ def finalize_and_sanitize(src_params):
         dest_params["enable_pipelined_write"] = 0
     if dest_params.get("sst_file_manager_bytes_per_sec", 0) == 0:
         dest_params["sst_file_manager_bytes_per_truncate"] = 0
-    if (dest_params.get("enable_compaction_filter", 0) == 1
-        or dest_params.get("inplace_update_support", 0) == 1):
-        # Compaction filter, inplace update support are incompatible with snapshots. Need to avoid taking
-        # snapshots, as well as avoid operations that use snapshots for
-        # verification.
-        dest_params["acquire_snapshot_one_in"] = 0
-        dest_params["compact_range_one_in"] = 0
-        # Give the iterator ops away to reads.
-        dest_params["readpercent"] += dest_params.get("iterpercent", 10)
-        dest_params["iterpercent"] = 0
-        dest_params["check_multiget_consistency"] = 0
-        dest_params["check_multiget_entity_consistency"] = 0
     if dest_params.get("prefix_size") == -1:
         dest_params["readpercent"] += dest_params.get("prefixpercent", 20)
         dest_params["prefixpercent"] = 0
@@ -795,12 +785,27 @@ def finalize_and_sanitize(src_params):
         # with each other. There is no external APIs to ensure that.
         dest_params["use_multiget"] = 0
         dest_params["use_multi_get_entity"] = 0
-        dest_params["readpercent"] += dest_params.get("iterpercent", 10);
+        dest_params["readpercent"] += dest_params.get("iterpercent", 10)
         dest_params["iterpercent"] = 0
         # Only best efforts recovery test support disabling wal and
         # disable atomic flush.
         if dest_params["test_best_efforts_recovery"] == 0:
           dest_params["disable_wal"] = 0
+    if dest_params.get("allow_concurrent_memtable_write", 1) == 1:
+        dest_params["memtablerep"] = "skip_list"
+        dest_params["inplace_update_support"] = 0
+    if (dest_params.get("enable_compaction_filter", 0) == 1
+        or dest_params.get("inplace_update_support", 0) == 1):
+        # Compaction filter, inplace update support are incompatible with snapshots. Need to avoid taking
+        # snapshots, as well as avoid operations that use snapshots for
+        # verification.
+        dest_params["acquire_snapshot_one_in"] = 0
+        dest_params["compact_range_one_in"] = 0
+        # Give the iterator ops away to reads.
+        dest_params["readpercent"] += dest_params.get("iterpercent", 10)
+        dest_params["iterpercent"] = 0
+        dest_params["check_multiget_consistency"] = 0
+        dest_params["check_multiget_entity_consistency"] = 0
     if dest_params.get("disable_wal") == 1:
         # disableWAL and recycle_log_file_num options are not mutually
         # compatible at the moment
