@@ -74,9 +74,16 @@ default_params = {
     "destroy_db_initially": 0,
     "enable_pipelined_write": lambda: random.randint(0, 1),
     "enable_compaction_filter": lambda: random.choice([0, 0, 0, 1]),
-    # TODO(hx235): re-enable `inplace_update_support` after fixing the
-    # inconsistency issue it surfaced
-    "inplace_update_support": 0,
+    # `inplace_update_support` is incompatible with DB that has delete
+    # range data in memtables.
+    # Such data can result from any of the previous db stress runs
+    # using delete range.
+    # Since there is no easy way to keep track of whether delete range
+    # is used in any of the previous runs,
+    # to simpify our testing, we set `inplace_update_support` across
+    # runs and to disable delete range accordingly
+    # (see below `finalize_and_sanitize`).
+    "inplace_update_support": random.choice([0] * 9 + [1]),
     "expected_values_dir": lambda: setup_expected_values_dir(),
     "fail_if_options_file_error": lambda: random.randint(0, 1),
     "flush_one_in": lambda: random.choice([1000, 1000000]),
@@ -480,6 +487,8 @@ txn_params = {
     "create_timestamped_snapshot_one_in": random.choice([0, 20]),
     # PutEntity in transactions is not yet implemented
     "use_put_entity_one_in": 0,
+    # Should not be used with TransactionDB which uses snapshot.
+    "inplace_update_support": 0,
 }
 
 # For optimistic transaction db
@@ -600,6 +609,8 @@ multiops_txn_default_params = {
     "use_multi_get_entity": 0,
     # `MultiOpsTxnsStressTest::TestIterateAgainstExpected()` is not implemented.
     "verify_iterator_with_expected_state_one_in": 0,
+    # This test uses snapshot heavily which is incompatible with this option.
+    "inplace_update_support": 0,
 }
 
 multiops_wc_txn_params = {
@@ -673,6 +684,11 @@ def finalize_and_sanitize(src_params):
     ):
         dest_params["delpercent"] += dest_params["delrangepercent"]
         dest_params["delrangepercent"] = 0
+    if dest_params["inplace_update_support"] == 1:
+       dest_params["delpercent"] += dest_params["delrangepercent"]
+       dest_params["delrangepercent"] = 0
+       dest_params["readpercent"] += dest_params["prefixpercent"]
+       dest_params["prefixpercent"] = 0
     if (
         dest_params.get("disable_wal") == 1
         or dest_params.get("sync_fault_injection") == 1
