@@ -500,6 +500,8 @@ optimistic_txn_params = {
     "occ_lock_bucket_count": lambda: random.choice([10, 100, 500]),
     # PutEntity in transactions is not yet implemented
     "use_put_entity_one_in": 0,
+    # Should not be used with OptimisticTransactionDB which uses snapshot.
+    "inplace_update_support": 0,
 }
 
 best_efforts_recovery_params = {
@@ -835,6 +837,7 @@ def finalize_and_sanitize(src_params):
     # Enabling block_align with compression is not supported
     if dest_params.get("block_align") == 1:
         dest_params["compression_type"] = "none"
+        dest_params["bottommost_compression_type"] = "none"
     # If periodic_compaction_seconds is not set, daily_offpeak_time_utc doesn't do anything
     if dest_params.get("periodic_compaction_seconds") == 0:
         dest_params["daily_offpeak_time_utc"] = ""
