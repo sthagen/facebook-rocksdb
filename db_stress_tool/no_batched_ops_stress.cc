@@ -462,6 +462,44 @@ class NonBatchedOpsStressTest : public StressTest {
 
   bool IsStateTracked() const override { return true; }
 
+  void TestKeyMayExist(ThreadState* thread, const ReadOptions& read_opts,
+                       const std::vector<int>& rand_column_families,
+                       const std::vector<int64_t>& rand_keys) override {
+    auto cfh = column_families_[rand_column_families[0]];
+    std::string key_str = Key(rand_keys[0]);
+    Slice key = key_str;
+    std::string ignore;
+    ReadOptions read_opts_copy = read_opts;
+
+    std::string read_ts_str;
+    Slice read_ts_slice;
+    if (FLAGS_user_timestamp_size > 0) {
+      read_ts_str = GetNowNanos();
+      read_ts_slice = read_ts_str;
+      read_opts_copy.timestamp = &read_ts_slice;
+    }
+    bool read_older_ts = MaybeUseOlderTimestampForPointLookup(
+        thread, read_ts_str, read_ts_slice, read_opts_copy);
+
+    const ExpectedValue pre_read_expected_value =
+        thread->shared->Get(rand_column_families[0], rand_keys[0]);
+    bool key_may_exist = db_->KeyMayExist(read_opts_copy, cfh, key, &ignore);
+    const ExpectedValue post_read_expected_value =
+        thread->shared->Get(rand_column_families[0], rand_keys[0]);
+
+    if (!key_may_exist && !FLAGS_skip_verifydb && !read_older_ts) {
+      if (ExpectedValueHelper::MustHaveExisted(pre_read_expected_value,
+                                               post_read_expected_value)) {
+        thread->shared->SetVerificationFailure();
+        fprintf(stderr,
+                "error : inconsistent values for key %s: expected state has "
+                "the key, TestKeyMayExist() returns false indicating the key "
+                "must not exist.\n",
+                key.ToString(true).c_str());
+      }
+    }
+  }
+
   Status TestGet(ThreadState* thread, const ReadOptions& read_opts,
                  const std::vector<int>& rand_column_families,
                  const std::vector<int64_t>& rand_keys) override {
@@ -916,7 +954,8 @@ class NonBatchedOpsStressTest : public StressTest {
 
     const std::string key = Key(rand_keys[0]);
 
-    PinnableWideColumns from_db;
+    PinnableWideColumns columns_from_db;
+    PinnableAttributeGroups attribute_groups_from_db;
 
     ReadOptions read_opts_copy = read_opts;
     std::string read_ts_str;
@@ -929,7 +968,16 @@ class NonBatchedOpsStressTest : public StressTest {
     bool read_older_ts = MaybeUseOlderTimestampForPointLookup(
         thread, read_ts_str, read_ts_slice, read_opts_copy);
 
-    const Status s = db_->GetEntity(read_opts_copy, cfh, key, &from_db);
+    Status s;
+    if (FLAGS_use_attribute_group) {
+      attribute_groups_from_db.emplace_back(cfh);
+      s = db_->GetEntity(read_opts_copy, key, &attribute_groups_from_db);
+      if (s.ok()) {
+        s = attribute_groups_from_db.back().status();
+      }
+    } else {
+      s = db_->GetEntity(read_opts_copy, cfh, key, &columns_from_db);
+    }
 
     int error_count = 0;
 
@@ -953,7 +1001,13 @@ class NonBatchedOpsStressTest : public StressTest {
       thread->stats.AddGets(1, 1);
 
       if (!FLAGS_skip_verifydb && !read_older_ts) {
-        const WideColumns& columns = from_db.columns();
+        if (FLAGS_use_attribute_group) {
+          assert(!attribute_groups_from_db.empty());
+        }
+        const WideColumns& columns =
+            FLAGS_use_attribute_group
+                ? attribute_groups_from_db.back().columns()
+                : columns_from_db.columns();
         ExpectedValue expected =
             shared->Get(rand_column_families[0], rand_keys[0]);
         if (!VerifyWideColumns(columns)) {
@@ -1302,8 +1356,13 @@ class NonBatchedOpsStressTest : public StressTest {
 
     if (FLAGS_use_put_entity_one_in > 0 &&
         (value_base % FLAGS_use_put_entity_one_in) == 0) {
-      s = db_->PutEntity(write_opts, cfh, k,
-                         GenerateWideColumns(value_base, v));
+      if (FLAGS_use_attribute_group) {
+        s = db_->PutEntity(write_opts, k,
+                           GenerateAttributeGroups({cfh}, value_base, v));
+      } else {
+        s = db_->PutEntity(write_opts, cfh, k,
+                           GenerateWideColumns(value_base, v));
+      }
     } else if (FLAGS_use_timed_put_one_in > 0 &&
                ((value_base + kLargePrimeForCommonFactorSkew) %
                 FLAGS_use_timed_put_one_in) == 0) {
