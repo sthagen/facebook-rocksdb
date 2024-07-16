@@ -1280,11 +1280,9 @@ void LevelIterator::Seek(const Slice& target) {
                                           ts_sz);
       if (prefix_extractor_->InDomain(target_user_key_without_ts) &&
           (!prefix_extractor_->InDomain(next_file_first_user_key_without_ts) ||
-           user_comparator_.CompareWithoutTimestamp(
-               prefix_extractor_->Transform(target_user_key_without_ts), false,
-               prefix_extractor_->Transform(
-                   next_file_first_user_key_without_ts),
-               false) != 0)) {
+           prefix_extractor_->Transform(target_user_key_without_ts)
+                   .compare(prefix_extractor_->Transform(
+                       next_file_first_user_key_without_ts)) != 0)) {
         // SkipEmptyFileForward() will not advance to next file when this flag
         // is set for reason detailed below.
         //
@@ -5564,7 +5562,9 @@ Status VersionSet::ProcessManifestWrites(
         s = WriteCurrentStateToManifest(write_options, curr_state,
                                         wal_additions, descriptor_log_.get(),
                                         io_s);
-      } else {
+        assert(s == io_s);
+      }
+      if (!io_s.ok()) {
         manifest_io_status = io_s;
         s = io_s;
       }
