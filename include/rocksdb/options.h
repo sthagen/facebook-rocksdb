@@ -1923,6 +1923,18 @@ struct ReadOptions {
   // Default: true
   bool auto_readahead_size = true;
 
+  // When set, the iterator may defer loading the value when moving to a
+  // different entry (i.e. during SeekToFirst/SeekToLast/Seek/SeekForPrev/
+  // Next/Prev operations). This can be used to save on I/O when the values
+  // associated with certain keys may not be used by the application. See also
+  // IteratorBase::PrepareValue().
+  //
+  // Note: this option currently only applies to large values stored in blob
+  // files using BlobDB, and has no effect otherwise.
+  //
+  // Default: false
+  bool allow_unprepared_value = false;
+
   // *** END options only relevant to iterators or scans ***
 
   // *** BEGIN options for RocksDB internal use only ***
@@ -2259,6 +2271,14 @@ struct IngestExternalFileOptions {
   // RepairDB() may not recover these files correctly, potentially leading to
   // data loss.
   bool allow_db_generated_files = false;
+
+  // Controls whether data and metadata blocks (e.g. index, filter) read during
+  // file ingestion will be added to block cache.
+  // Users may wish to set this to false when bulk loading into a CF that is not
+  // available for reads yet.
+  // When ingesting to multiple families, this option should be the same across
+  // ingestion options.
+  bool fill_cache = true;
 };
 
 enum TraceFilterType : uint64_t {
