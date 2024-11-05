@@ -852,10 +852,11 @@ Status DBImpl::RegisterRecordSeqnoTimeWorker(const ReadOptions& read_options,
     InstrumentedMutexLock l(&mutex_);
 
     for (auto cfd : *versions_->GetColumnFamilySet()) {
+      auto& mopts = *cfd->GetLatestMutableCFOptions();
       // preserve time is the max of 2 options.
       uint64_t preserve_seconds =
-          std::max(cfd->ioptions()->preserve_internal_time_seconds,
-                   cfd->ioptions()->preclude_last_level_data_seconds);
+          std::max(mopts.preserve_internal_time_seconds,
+                   mopts.preclude_last_level_data_seconds);
       if (!cfd->IsDropped() && preserve_seconds > 0) {
         min_preserve_seconds = std::min(preserve_seconds, min_preserve_seconds);
         max_preserve_seconds = std::max(preserve_seconds, max_preserve_seconds);
@@ -3719,6 +3720,9 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
   edit.SetColumnFamily(cfd->GetID());
 
   Status s;
+  // Save re-aquiring lock for RegisterRecordSeqnoTimeWorker when not
+  // applicable
+  bool used_preserve_preclude = false;
   {
     InstrumentedMutexLock l(&mutex_);
     if (cfd->IsDropped()) {
@@ -3734,9 +3738,11 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
       write_thread_.ExitUnbatched(&w);
     }
     if (s.ok()) {
-      auto* mutable_cf_options = cfd->GetLatestMutableCFOptions();
-      max_total_in_memory_state_ -= mutable_cf_options->write_buffer_size *
-                                    mutable_cf_options->max_write_buffer_number;
+      auto& moptions = *cfd->GetLatestMutableCFOptions();
+      max_total_in_memory_state_ -=
+          moptions.write_buffer_size * moptions.max_write_buffer_number;
+      used_preserve_preclude = moptions.preserve_internal_time_seconds > 0 ||
+                               moptions.preclude_last_level_data_seconds > 0;
     }
 
     if (!cf_support_snapshot) {
@@ -3754,8 +3760,7 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
     bg_cv_.SignalAll();
   }
 
-  if (cfd->ioptions()->preserve_internal_time_seconds > 0 ||
-      cfd->ioptions()->preclude_last_level_data_seconds > 0) {
+  if (used_preserve_preclude) {
     s = RegisterRecordSeqnoTimeWorker(read_options, write_options,
                                       /* is_new_db */ false);
   }
@@ -3993,14 +3998,26 @@ std::unique_ptr<IterType> DBImpl::NewMultiCfIterator(
           "Different comparators are being used across CFs"));
     }
   }
+
   std::vector<Iterator*> child_iterators;
   Status s = NewIterators(_read_options, column_families, &child_iterators);
   if (!s.ok()) {
     return error_iterator_func(s);
   }
-  return std::make_unique<ImplType>(
-      column_families[0]->GetComparator(), _read_options.allow_unprepared_value,
-      column_families, std::move(child_iterators));
+
+  assert(column_families.size() == child_iterators.size());
+
+  std::vector<std::pair<ColumnFamilyHandle*, std::unique_ptr<Iterator>>>
+      cfh_iter_pairs;
+  cfh_iter_pairs.reserve(column_families.size());
+  for (size_t i = 0; i < column_families.size(); ++i) {
+    cfh_iter_pairs.emplace_back(column_families[i],
+                                std::unique_ptr<Iterator>(child_iterators[i]));
+  }
+
+  return std::make_unique<ImplType>(_read_options,
+                                    column_families[0]->GetComparator(),
+                                    std::move(cfh_iter_pairs));
 }
 
 Status DBImpl::NewIterators(
@@ -4730,9 +4747,9 @@ void DBImpl::GetApproximateMemTableStats(ColumnFamilyHandle* column_family,
   // Convert user_key into a corresponding internal key.
   InternalKey k1(start.value(), kMaxSequenceNumber, kValueTypeForSeek);
   InternalKey k2(limit.value(), kMaxSequenceNumber, kValueTypeForSeek);
-  MemTable::MemTableStats memStats =
+  ReadOnlyMemTable::MemTableStats memStats =
       sv->mem->ApproximateStats(k1.Encode(), k2.Encode());
-  MemTable::MemTableStats immStats =
+  ReadOnlyMemTable::MemTableStats immStats =
       sv->imm->ApproximateStats(k1.Encode(), k2.Encode());
   *count = memStats.count + immStats.count;
   *size = memStats.size + immStats.size;
