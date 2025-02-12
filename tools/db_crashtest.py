@@ -345,6 +345,7 @@ default_params = {
     "allow_unprepared_value": lambda: random.choice([0, 1]),
     "track_and_verify_wals": lambda: random.choice([0, 1]),
     "enable_remote_compaction": lambda: random.choice([0, 1]),
+    "auto_refresh_iterator_with_snapshot": lambda: random.choice([0, 1]),
 }
 _TEST_DIR_ENV_VAR = "TEST_TMPDIR"
 # If TEST_TMPDIR_EXPECTED is not specified, default value will be TEST_TMPDIR
@@ -841,7 +842,13 @@ def finalize_and_sanitize(src_params):
     if dest_params.get("atomic_flush", 0) == 1:
         # disable pipelined write when atomic flush is used.
         dest_params["enable_pipelined_write"] = 0
-    if dest_params.get("sst_file_manager_bytes_per_sec", 0) == 0:
+    # Truncating SST files in primary DB is incompatible 
+    # with secondary DB since the latter can't read the shared 
+    # and truncated SST file correctly 
+    if (
+        dest_params.get("sst_file_manager_bytes_per_sec", 0) == 0
+        or dest_params.get("test_secondary") == 1
+    ):
         dest_params["sst_file_manager_bytes_per_truncate"] = 0
     if dest_params.get("prefix_size") == -1:
         dest_params["readpercent"] += dest_params.get("prefixpercent", 20)
