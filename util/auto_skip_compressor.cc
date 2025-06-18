@@ -32,9 +32,10 @@ bool CompressionRejectionProbabilityPredictor::Record(
   } else {
     compressed_count_++;
   }
-  if (attempted_compression_count() >= window_size_) {
-    pred_rejection_prob_percentage_ = static_cast<int>(
-        rejected_count_ * 100 / (compressed_count_ + rejected_count_));
+  auto attempted = attempted_compression_count();
+  if (attempted >= window_size_) {
+    pred_rejection_prob_percentage_ =
+        static_cast<int>(rejected_count_ * 100 / attempted);
     compressed_count_ = 0;
     rejected_count_ = 0;
     assert(attempted_compression_count() == 0);
@@ -42,16 +43,11 @@ bool CompressionRejectionProbabilityPredictor::Record(
   return true;
 }
 AutoSkipCompressorWrapper::AutoSkipCompressorWrapper(
-    std::unique_ptr<Compressor> compressor, const CompressionOptions& opts,
-    const CompressionType type)
+    std::unique_ptr<Compressor> compressor, const CompressionOptions& opts)
     : CompressorWrapper::CompressorWrapper(std::move(compressor)),
-      opts_(opts),
-      type_(type),
+      kOpts(opts),
       predictor_(
-          std::make_shared<CompressionRejectionProbabilityPredictor>(10)) {
-  (void)type_;
-  (void)opts_;
-}
+          std::make_shared<CompressionRejectionProbabilityPredictor>(10)) {}
 
 const char* AutoSkipCompressorWrapper::Name() const {
   return "AutoSkipCompressorWrapper";
@@ -60,20 +56,30 @@ const char* AutoSkipCompressorWrapper::Name() const {
 Status AutoSkipCompressorWrapper::CompressBlock(
     Slice uncompressed_data, std::string* compressed_output,
     CompressionType* out_compression_type, ManagedWorkingArea* wa) {
+  // Check if the managed working area is provided or owned by this object.
+  // If not, bypass auto-skip logic since the working area lacks a predictor to
+  // record or make necessary decisions to compress or bypass compression of the
+  // block
+  if (wa == nullptr || wa->owner() != this) {
+    return wrapped_->CompressBlock(uncompressed_data, compressed_output,
+                                   out_compression_type, wa);
+  }
   bool exploration =
       Random::GetTLSInstance()->PercentTrue(kExplorationPercentage);
   TEST_SYNC_POINT_CALLBACK(
       "AutoSkipCompressorWrapper::CompressBlock::exploitOrExplore",
       &exploration);
+  auto autoskip_wa = static_cast<AutoSkipWorkingArea*>(wa->get());
   if (exploration) {
     return CompressBlockAndRecord(uncompressed_data, compressed_output,
-                                  out_compression_type, wa);
+                                  out_compression_type, autoskip_wa);
   } else {
-    auto prediction = predictor_->Predict();
+    auto predictor_ptr = autoskip_wa->predictor;
+    auto prediction = predictor_ptr->Predict();
     if (prediction <= kProbabilityCutOff) {
       // decide to compress
       return CompressBlockAndRecord(uncompressed_data, compressed_output,
-                                    out_compression_type, wa);
+                                    out_compression_type, autoskip_wa);
     } else {
       // decide to bypass compression
       *out_compression_type = kNoCompression;
@@ -83,13 +89,22 @@ Status AutoSkipCompressorWrapper::CompressBlock(
   return Status::OK();
 }
 
+Compressor::ManagedWorkingArea AutoSkipCompressorWrapper::ObtainWorkingArea() {
+  auto wrap_wa = wrapped_->ObtainWorkingArea();
+  return ManagedWorkingArea(new AutoSkipWorkingArea(std::move(wrap_wa)), this);
+}
+void AutoSkipCompressorWrapper::ReleaseWorkingArea(WorkingArea* wa) {
+  delete static_cast<AutoSkipWorkingArea*>(wa);
+}
+
 Status AutoSkipCompressorWrapper::CompressBlockAndRecord(
     Slice uncompressed_data, std::string* compressed_output,
-    CompressionType* out_compression_type, ManagedWorkingArea* wa) {
+    CompressionType* out_compression_type, AutoSkipWorkingArea* wa) {
   Status status = wrapped_->CompressBlock(uncompressed_data, compressed_output,
-                                          out_compression_type, wa);
+                                          out_compression_type, &(wa->wrapped));
   // determine if it was rejected or compressed
-  predictor_->Record(uncompressed_data, compressed_output, opts_);
+  auto predictor_ptr = wa->predictor;
+  predictor_ptr->Record(uncompressed_data, compressed_output, kOpts);
   return status;
 }
 
@@ -105,7 +120,7 @@ std::unique_ptr<Compressor> AutoSkipCompressorManager::GetCompressorForSST(
   assert(GetSupportedCompressions().size() > 1);
   assert(preferred != kNoCompression);
   return std::make_unique<AutoSkipCompressorWrapper>(
-      wrapped_->GetCompressorForSST(context, opts, preferred), opts, preferred);
+      wrapped_->GetCompressorForSST(context, opts, preferred), opts);
 }
 
 std::shared_ptr<CompressionManagerWrapper> CreateAutoSkipCompressionManager(
