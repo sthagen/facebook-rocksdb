@@ -275,8 +275,8 @@ TEST_F(OptionsSettableTest, TablePropertiesAllFieldsSettable) {
       "property_collectors_names=;prefix_extractor_name=;db_host_id="
       "64625F686F73745F6964;db_session_id=64625F73657373696F6E5F6964;creation_"
       "time=0;num_data_blocks=123;index_value_is_delta_encoded=0;top_level_"
-      "index_"
-      "size=0;data_size=100;merge_operator_name=;index_partitions=0;file_"
+      "index_size=0;data_size=100;uncompressed_data_size=1234;"
+      "merge_operator_name=;index_partitions=0;file_"
       "creation_time=0;raw_value_size=0;index_size=200;user_collected_"
       "properties={757365725F6B6579=757365725F76616C7565;};tail_start_offset=0;"
       "seqno_to_time_mapping=;raw_key_size=0;slow_compression_estimated_data_"
@@ -682,6 +682,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "bottommost_file_compaction_delay=7200;"
       "uncache_aggressiveness=1234;"
       "paranoid_memory_checks=1;"
+      "memtable_veirfy_per_key_checksum_on_seek=1;"
       "memtable_op_scan_flush_trigger=123;"
       "memtable_avg_op_scan_flush_trigger=12;"
       "cf_allow_ingest_behind=1;",

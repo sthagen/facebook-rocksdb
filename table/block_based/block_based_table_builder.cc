@@ -304,8 +304,7 @@ struct BlockBasedTableBuilder::ParallelCompressionRep {
   // state fields that are best updated atomically to avoid locking and/or to
   // simplify the interesting interleavings that have to be considered and
   // accommodated.
-  struct StateID {};
-  struct State : public BitFields<uint64_t, StateID> {};
+  struct State : public BitFields<uint64_t, State> {};
   ALIGN_AS(CACHE_LINE_SIZE) AcqRelBitFieldsAtomic<State> atomic_state;
 
   // The first field is a bit for each ring buffer slot (max 32) for whether
@@ -1729,6 +1728,7 @@ void BlockBasedTableBuilder::WriteBlock(const Slice& uncompressed_block_data,
   r->single_threaded_compressed_output.Reset();
   if (is_data_block) {
     r->props.data_size = r->get_offset();
+    r->props.uncompressed_data_size += uncompressed_block_data.size();
     ++r->props.num_data_blocks;
   }
 }
@@ -1776,6 +1776,7 @@ void BlockBasedTableBuilder::BGWorker(WorkingAreaPair& working_area) {
           &uncompressed);
       if (LIKELY(ios.ok())) {
         rep_->props.data_size = rep_->get_offset();
+        rep_->props.uncompressed_data_size += block_rep->uncompressed.size();
         ++rep_->props.num_data_blocks;
 
         rep_->index_builder->FinishIndexEntry(

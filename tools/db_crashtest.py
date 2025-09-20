@@ -11,22 +11,48 @@ import sys
 import tempfile
 import time
 
+per_iteration_random_seed_override = 0
+
+def get_random_seed(override):
+    if override == 0:
+        return random.randint(1, 2**64)
+    else:
+        return override
 
 def setup_random_seed_before_main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--random_seed",
+        "--initial_random_seed_override",
         default=0,
         type=int,
-        help="Random seed used for reproduce the same test parameter set",
+        help="Random seed used for initialize the test parameters at the beginning of stress test run",
     )
-    args, _ = parser.parse_known_args()
-    random_seed = (
-        random.randint(1, 2**64) if args.random_seed == 0 else args.random_seed
+    # sometimes the failure appeared after a few iteration, to reproduce the error, we have to wait for the test to run
+    # multiple iterations to reach the iteration that fails the test. By overriding the seed used within each iteration,
+    # we could skip all the previous iterations.
+    parser.add_argument(
+        "--per_iteration_random_seed_override",
+        default=0,
+        type=int,
+        help="Random seed used for initialize the test parameters in each iteration of the stress test run",
     )
-    print(f"Start with random seed {random_seed}")
-    random.seed(random_seed)
 
+    args, remain_args = parser.parse_known_args()
+    init_random_seed = get_random_seed(args.initial_random_seed_override)
+    global per_iteration_random_seed_override
+    per_iteration_random_seed_override = args.per_iteration_random_seed_override
+
+    print(f"Start with random seed {init_random_seed}")
+    random.seed(init_random_seed)
+
+    # reset the sys.argv with the remaining args, so that the rest of the argument parser would not see these 2 args
+    sys.argv = remain_args
+
+def apply_random_seed_per_iteration():
+    global per_iteration_random_seed_override
+    per_iteration_random_seed = get_random_seed(per_iteration_random_seed_override)
+    print(f"Use random seed for iteration {per_iteration_random_seed}")
+    random.seed(per_iteration_random_seed)
 
 # Random seed has to be setup before the rest of the script, so that the random
 # value selected in the global variable uses the random seed specified
@@ -364,9 +390,10 @@ default_params = {
     "use_timed_put_one_in": lambda: random.choice([0] * 7 + [1, 5, 10]),
     "universal_max_read_amp": lambda: random.choice([-1] * 3 + [0, 4, 10]),
     "paranoid_memory_checks": lambda: random.choice([0] * 7 + [1]),
+    "memtable_veirfy_per_key_checksum_on_seek": lambda: random.choice([0] * 7 + [1]),
     "allow_unprepared_value": lambda: random.choice([0, 1]),
     # TODO(hx235): enable `track_and_verify_wals` after stabalizing the stress test
-    "track_and_verify_wals": lambda: random.choice([0]),    
+    "track_and_verify_wals": lambda: random.choice([0]),
     "remote_compaction_worker_threads": lambda: random.choice([0, 8]),
     # TODO(jaykorean): Change to lambda: random.choice([0, 1]) after addressing all remote compaction failures
     "remote_compaction_failure_fall_back_to_local": 1,
@@ -775,7 +802,11 @@ def finalize_and_sanitize(src_params):
 
     if dest_params.get("memtablerep") == "vector":
         dest_params["inplace_update_support"] = 0
+
+    # only skip list memtable representation supports paranoid memory checks
+    if dest_params.get("memtablerep") != "skip_list":
         dest_params["paranoid_memory_checks"] = 0
+        dest_params["memtable_veirfy_per_key_checksum_on_seek"] = 0
 
     if dest_params["test_batches_snapshots"] == 1:
         dest_params["enable_compaction_filter"] = 0
@@ -1225,7 +1256,6 @@ def gen_cmd(params, unknown_params):
             not in {
                 "test_type",
                 "simple",
-                "random_seed",
                 "duration",
                 "interval",
                 "random_kill_odd",
@@ -1309,6 +1339,7 @@ def blackbox_crash_main(args, unknown_args):
     )
 
     while time.time() < exit_time:
+        apply_random_seed_per_iteration()
         cmd = gen_cmd(
             dict(list(cmd_params.items()) + list({"db": dbname}.items())), unknown_args
         )
@@ -1371,6 +1402,7 @@ def whitebox_crash_main(args, unknown_args):
     succeeded = True
     hit_timeout = False
     while time.time() < exit_time:
+        apply_random_seed_per_iteration()
         if check_mode == 0:
             additional_opts = {
                 # use large ops per thread since we will kill it anyway
