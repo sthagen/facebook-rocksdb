@@ -163,26 +163,35 @@ Status ExternalSstFileIngestionJob::Prepare(
         // It is unsafe to assume application had sync the file and file
         // directory before ingest the file. For integrity of RocksDB we need
         // to sync the file.
-        TEST_SYNC_POINT("ExternalSstFileIngestionJob::BeforeSyncIngestedFile");
-        auto s = fs_->SyncFile(path_inside_db, env_options_, IOOptions(),
-                               db_options_.use_fsync, nullptr);
-        TEST_SYNC_POINT("ExternalSstFileIngestionJob::AfterSyncIngestedFile");
-        TEST_SYNC_POINT_CALLBACK(
-            "ExternalSstFileIngestionJob::CheckSyncReturnCode", &s);
-        if (!s.ok()) {
-          if (s.IsNotSupported()) {
-            // Some file systems (especially remote/distributed) don't support
-            // SyncFile API. Ignore the NotSupported error in that case.
-            ROCKS_LOG_WARN(db_options_.info_log,
-                           "After link the file, SyncFile API is not supported "
-                           "for file %s: %s",
-                           path_inside_db.c_str(), status.ToString().c_str());
-          } else {
-            // for other errors, propagate the error
-            status = s;
-            ROCKS_LOG_WARN(db_options_.info_log,
-                           "Failed to sync ingested file %s: %s",
-                           path_inside_db.c_str(), status.ToString().c_str());
+
+        // TODO(xingbo), We should in general be moving away from production
+        // uses of ReuseWritableFile (except explicitly for WAL recycling),
+        // ReopenWritableFile, and NewRandomRWFile. We should create a
+        // FileSystem::SyncFile/FsyncFile API that by default does the
+        // re-open+sync+close combo but can (a) be reused easily, and (b) be
+        // overridden to do that more cleanly, e.g. in EncryptedEnv.
+        // https://github.com/facebook/rocksdb/issues/13741
+        std::unique_ptr<FSWritableFile> file_to_sync;
+        Status s = fs_->ReopenWritableFile(path_inside_db, env_options_,
+                                           &file_to_sync, nullptr);
+        TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::Prepare:Reopen",
+                                 &s);
+        // Some file systems (especially remote/distributed) don't support
+        // reopening a file for writing and don't require reopening and
+        // syncing the file. Ignore the NotSupported error in that case.
+        if (!s.IsNotSupported()) {
+          status = s;
+          if (status.ok()) {
+            TEST_SYNC_POINT(
+                "ExternalSstFileIngestionJob::BeforeSyncIngestedFile");
+            status = SyncIngestedFile(file_to_sync.get());
+            TEST_SYNC_POINT(
+                "ExternalSstFileIngestionJob::AfterSyncIngestedFile");
+            if (!status.ok()) {
+              ROCKS_LOG_WARN(db_options_.info_log,
+                             "Failed to sync ingested file %s: %s",
+                             path_inside_db.c_str(), status.ToString().c_str());
+            }
           }
         }
       } else if (status.IsNotSupported() &&
@@ -740,8 +749,7 @@ void ExternalSstFileIngestionJob::CreateEquivalentFileIngestingCompactions() {
                             cfd_->ioptions().compaction_style),
         LLONG_MAX /* max compaction bytes, not applicable */,
         0 /* output path ID, not applicable */, mutable_cf_options.compression,
-        mutable_cf_options.compression_opts,
-        mutable_cf_options.default_write_temperature,
+        mutable_cf_options.compression_opts, Temperature::kUnknown,
         0 /* max_subcompaction, not applicable */,
         {} /* grandparents, not applicable */,
         std::nullopt /* earliest_snapshot */, nullptr /* snapshot_checker */,
