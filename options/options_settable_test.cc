@@ -408,6 +408,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "skip_stats_update_on_db_open=false;"
                              "skip_checking_sst_file_sizes_on_db_open=false;"
                              "max_manifest_file_size=4295009941;"
+                             "max_manifest_space_amp_pct=321;"
                              "db_log_dir=path/to/db_log_dir;"
                              "writable_file_max_buffer_size=1048576;"
                              "paranoid_checks=true;"
@@ -688,7 +689,8 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "memtable_veirfy_per_key_checksum_on_seek=1;"
       "memtable_op_scan_flush_trigger=123;"
       "memtable_avg_op_scan_flush_trigger=12;"
-      "cf_allow_ingest_behind=1;",
+      "cf_allow_ingest_behind=1;"
+      "verify_output_flags=2049;",
       new_options));
 
   ASSERT_NE(new_options->blob_cache.get(), nullptr);
