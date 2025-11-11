@@ -573,6 +573,11 @@ class DBImpl : public DB {
   void GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
                                ColumnFamilyMetaData* metadata) override;
 
+  // Get column family metadata with filtering based on key range and level
+  void GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
+                               const GetColumnFamilyMetaDataOptions& options,
+                               ColumnFamilyMetaData* metadata) override;
+
   void GetAllColumnFamilyMetaData(
       std::vector<ColumnFamilyMetaData>* metadata) override;
 
@@ -2395,6 +2400,14 @@ class DBImpl : public DB {
                           const int output_level, int output_path_id,
                           JobContext* job_context, LogBuffer* log_buffer,
                           CompactionJobInfo* compaction_job_info);
+
+  // Helper function to perform trivial move by updating manifest metadata
+  // without rewriting data files. This is called when IsTrivialMove() is true.
+  // REQUIRES: mutex held
+  // Returns: Status of the trivial move operation
+  Status PerformTrivialMove(Compaction& c, LogBuffer* log_buffer,
+                            bool& compaction_released, size_t& moved_files,
+                            size_t& moved_bytes);
 
   // REQUIRES: mutex unlocked
   void TrackOrUntrackFiles(const std::vector<std::string>& existing_data_files,
