@@ -295,6 +295,7 @@ default_params = {
     "avoid_flush_during_recovery": lambda: random.choice(
         [1 if t == 0 else 0 for t in range(0, 8)]
     ),
+    "enforce_write_buffer_manager_during_recovery": random.randint(0, 1),
     "max_write_batch_group_size_bytes": lambda: random.choice(
         [16, 64, 1024 * 1024, 16 * 1024 * 1024]
     ),
@@ -914,6 +915,11 @@ def finalize_and_sanitize(src_params):
         dest_params["test_ingest_standalone_range_deletion_one_in"] = 0
         # Parallel compression is incompatible with UDI
         dest_params["compression_parallel_threads"] = 1
+        # Trie UDI has a known issue with prefix scanning where certain prefix
+        # patterns cause "SeekToFirst not supported" errors. Disable prefix
+        # scanning and redistribute its percentage to reads.
+        dest_params["readpercent"] += dest_params.get("prefixpercent", 0)
+        dest_params["prefixpercent"] = 0
 
     # Multi-key operations are not currently compatible with transactions or
     # timestamp.
