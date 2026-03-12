@@ -930,7 +930,7 @@ Status StressTest::CommitTxn(Transaction& txn, ThreadState* thread) {
   return s;
 }
 
-bool StressTest::IsExpectedTxnLockTimeout(const Status& s) {
+bool StressTest::IsExpectedTxnError(const Status& s) {
   if ((s.IsDeadlock() || s.IsTimedOut()) &&
       (FLAGS_use_multiget || FLAGS_use_multi_get_entity)) {
     return true;
@@ -4532,6 +4532,8 @@ void InitializeOptionsFromFlags(
   options.memtable_protection_bytes_per_key =
       FLAGS_memtable_protection_bytes_per_key;
   options.block_protection_bytes_per_key = FLAGS_block_protection_bytes_per_key;
+  options.verify_output_flags =
+      static_cast<VerifyOutputFlags>(FLAGS_verify_output_flags);
   options.paranoid_memory_checks = FLAGS_paranoid_memory_checks;
   options.memtable_veirfy_per_key_checksum_on_seek =
       FLAGS_memtable_veirfy_per_key_checksum_on_seek;
