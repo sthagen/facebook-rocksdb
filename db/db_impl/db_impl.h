@@ -1555,10 +1555,17 @@ class DBImpl : public DB {
   // @param memtable_updated Whether the same write that ingests wbwi has
   // updated memtable. This is useful for determining whether to set bg
   // error when IngestWBWIAsMemtable fails.
+  // @param ingest_wbwi_for_commit Whether wbwi ingestion is publishing the
+  // committed data of a prepared transaction. This means a failure can leave
+  // committed data durable in WAL but not published in memtables.
+  // @param ignore_missing_cf If true, skip column families not found in the DB
+  // instead of returning an error.
   Status IngestWBWIAsMemtable(std::shared_ptr<WriteBatchWithIndex> wbwi,
                               const WBWIMemTable::SeqnoRange& assigned_seqno,
                               uint64_t min_prep_log, SequenceNumber last_seqno,
-                              bool memtable_updated, bool ignore_missing_cf);
+                              bool memtable_updated,
+                              bool ingest_wbwi_for_commit,
+                              bool ignore_missing_cf);
 
   // If disable_memtable is set the application logic must guarantee that the
   // batch will still be skipped from memtable during the recovery. An excption
@@ -1648,6 +1655,10 @@ class DBImpl : public DB {
       const uint64_t log_ref, uint64_t* seq_used, const size_t sub_batch_cnt,
       PreReleaseCallback* pre_release_callback, const AssignOrder assign_order,
       const PublishLastSeq publish_last_seq, const bool disable_memtable);
+
+  void MaybeTraceWriteGroupForPreservedWriteOrder(
+      const WriteThread::WriteGroup& write_group,
+      WriteBatchWithIndex* wbwi = nullptr, bool ingest_wbwi_for_commit = true);
 
   // write cached_recoverable_state_ to memtable if it is not empty
   // The writer must be the leader in write_thread_ and holding mutex_

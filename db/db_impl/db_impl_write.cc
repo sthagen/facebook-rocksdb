@@ -281,7 +281,7 @@ Status DBImpl::IngestWBWIAsMemtable(
     std::shared_ptr<WriteBatchWithIndex> wbwi,
     const WBWIMemTable::SeqnoRange& assigned_seqno, uint64_t min_prep_log,
     SequenceNumber last_seqno_after_ingest, bool memtable_updated,
-    bool ignore_missing_cf) {
+    bool ingest_wbwi_for_commit, bool ignore_missing_cf) {
   // Keys in new memtable have seqno > last_seqno_after_ingest >= keys in wbwi.
   assert(assigned_seqno.upper_bound <= last_seqno_after_ingest);
   // Keys in the current memtable have seqno <= LastSequence() < keys in wbwi.
@@ -310,8 +310,16 @@ Status DBImpl::IngestWBWIAsMemtable(
           std::to_string(cf_id));
       if (memtable_updated) {
         s = Status::Corruption(
-            "Part of the write batch is applied. Memtable is in a inconsistent "
-            "state. " +
+            "Part of the write batch is applied. Memtable is in an "
+            "inconsistent state due to invalid column family. " +
+            s.ToString());
+        error_handler_.SetBGError(s, BackgroundErrorReason::kMemTable);
+      } else if (ingest_wbwi_for_commit) {
+        s = Status::Corruption(
+            "Commit marker is durable in WAL, but publishing committed WBWI "
+            "data to memtable failed due to invalid column family. This DB "
+            "instance cannot safely resume; close and reopen the DB for WAL "
+            "recovery. " +
             s.ToString());
         error_handler_.SetBGError(s, BackgroundErrorReason::kMemTable);
       }
@@ -376,8 +384,16 @@ Status DBImpl::IngestWBWIAsMemtable(
       if (i != 0 || memtable_updated) {
         // escalate error to non-recoverable
         s = Status::Corruption(
-            "Part of the write batch is applied. Memtable is in a inconsistent "
-            "state. " +
+            "Part of the write batch is applied. Memtable is in an "
+            "inconsistent state due to SwitchMemtable failure. " +
+            s.ToString());
+        error_handler_.SetBGError(s, BackgroundErrorReason::kMemTable);
+      } else if (ingest_wbwi_for_commit) {
+        s = Status::Corruption(
+            "Commit marker is durable in WAL, but publishing committed WBWI "
+            "data to memtable failed due to SwitchMemtable failure. This DB "
+            "instance cannot safely resume; close and reopen the DB for WAL "
+            "recovery. " +
             s.ToString());
         error_handler_.SetBGError(s, BackgroundErrorReason::kMemTable);
       } else {
@@ -619,6 +635,35 @@ Status DBImpl::SyncBlobDirectWriteManagers(
   }
 
   return Status::OK();
+}
+
+void DBImpl::MaybeTraceWriteGroupForPreservedWriteOrder(
+    const WriteThread::WriteGroup& write_group, WriteBatchWithIndex* wbwi,
+    bool ingest_wbwi_for_commit) {
+  // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
+  // grabs but does not seem thread-safe.
+  if (tracer_) {
+    InstrumentedMutexLock lock(&trace_mutex_);
+    if (tracer_ != nullptr && tracer_->IsWriteOrderPreserved()) {
+      WriteBatch* wbwi_trace_batch = nullptr;
+      if (wbwi != nullptr && !ingest_wbwi_for_commit) {
+        // For transaction write, preserved-order tracing only needs the
+        // logical commit marker once, so trace the WBWI batch instead of the
+        // commit-time batch stored in each writer.
+        wbwi_trace_batch = wbwi->GetWriteBatch();
+      }
+      for (auto* writer : write_group) {
+        if (writer->CallbackFailed()) {
+          continue;
+        }
+        WriteBatch* trace_batch = wbwi_trace_batch != nullptr
+                                      ? wbwi_trace_batch
+                                      : writer->trace_batch;
+        // TODO: maybe handle the tracing status?
+        tracer_->Write(trace_batch).PermitUncheckedError();
+      }
+    }
+  }
 }
 
 Status DBImpl::WriteImpl(const WriteOptions& write_options,
@@ -1015,26 +1060,6 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
         }
       }
     }
-    // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
-    // grabs but does not seem thread-safe.
-    if (tracer_) {
-      InstrumentedMutexLock lock(&trace_mutex_);
-      if (tracer_ && tracer_->IsWriteOrderPreserved()) {
-        for (auto* writer : write_group) {
-          if (writer->CallbackFailed()) {
-            continue;
-          }
-          // TODO: maybe handle the tracing status?
-          if (wbwi && !ingest_wbwi_for_commit) {
-            // for transaction write, tracer only needs the commit marker which
-            // is in writer->batch
-            tracer_->Write(wbwi->GetWriteBatch()).PermitUncheckedError();
-          } else {
-            tracer_->Write(writer->trace_batch).PermitUncheckedError();
-          }
-        }
-      }
-    }
     // Note about seq_per_batch_: either disableWAL is set for the entire write
     // group or not. In either case we inc seq for each write batch with no
     // failed callback. This means that there could be a batch with
@@ -1251,11 +1276,11 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       if (two_write_queues_) {
         assert(ub <= versions_->LastAllocatedSequence());
       }
-      status =
-          IngestWBWIAsMemtable(wbwi, {/*lower_bound=*/lb, /*upper_bound=*/ub},
-                               /*min_prep_log=*/log_ref, last_sequence,
-                               /*memtable_updated=*/memtable_update_count > 0,
-                               write_options.ignore_missing_column_families);
+      status = IngestWBWIAsMemtable(
+          wbwi, {/*lower_bound=*/lb, /*upper_bound=*/ub},
+          /*min_prep_log=*/log_ref, last_sequence,
+          /*memtable_updated=*/memtable_update_count > 0,
+          ingest_wbwi_for_commit, write_options.ignore_missing_column_families);
       RecordTick(stats_, NUMBER_WBWI_INGEST);
     }
   }
@@ -1275,6 +1300,8 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       // Note: if we are to resume after non-OK statuses we need to revisit how
       // we react to non-OK statuses here.
       if (w.status.ok()) {  // Don't publish a partial batch write
+        MaybeTraceWriteGroupForPreservedWriteOrder(write_group, wbwi.get(),
+                                                   ingest_wbwi_for_commit);
         versions_->SetLastSequence(last_sequence);
       }
     }
@@ -1345,22 +1372,6 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
                 total_byte_size, WriteBatchInternal::ByteSize(writer->batch));
             next_sequence += count;
             total_count += count;
-          }
-        }
-      }
-      // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
-      // grabs but does not seem thread-safe.
-      if (tracer_) {
-        InstrumentedMutexLock lock(&trace_mutex_);
-        if (tracer_ != nullptr && tracer_->IsWriteOrderPreserved()) {
-          for (auto* writer : wal_write_group) {
-            if (writer->CallbackFailed()) {
-              // When optimisitc txn conflict checking fails, we should
-              // not record to trace.
-              continue;
-            }
-            // TODO: maybe handle the tracing status?
-            tracer_->Write(writer->trace_batch).PermitUncheckedError();
           }
         }
       }
@@ -1448,6 +1459,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
           seq_per_batch_, batch_per_txn_);
       if (memtable_write_group.status
               .ok()) {  // Don't publish a partial batch write
+        MaybeTraceWriteGroupForPreservedWriteOrder(memtable_write_group);
         versions_->SetLastSequence(memtable_write_group.last_sequence);
       } else {
         HandleMemTableInsertFailure(memtable_write_group.status);
@@ -1481,6 +1493,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
 
     if (write_thread_.CompleteParallelMemTableWriter(&w)) {
       if (w.status.ok()) {  // Don't publish a partial batch write
+        MaybeTraceWriteGroupForPreservedWriteOrder(*w.write_group);
         versions_->SetLastSequence(w.write_group->last_sequence);
       } else {
         HandleMemTableInsertFailure(w.status);
@@ -1635,20 +1648,6 @@ Status DBImpl::WriteImplWALOnly(
 
   // Note: no need to update last_batch_group_size_ here since the batch writes
   // to WAL only
-  // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
-  // grabs but does not seem thread-safe.
-  if (tracer_) {
-    InstrumentedMutexLock lock(&trace_mutex_);
-    if (tracer_ != nullptr && tracer_->IsWriteOrderPreserved()) {
-      for (auto* writer : write_group) {
-        if (writer->CallbackFailed()) {
-          continue;
-        }
-        // TODO: maybe handle the tracing status?
-        tracer_->Write(writer->trace_batch).PermitUncheckedError();
-      }
-    }
-  }
 
   const bool concurrent_update = true;
   // Update stats while we are an exclusive group leader, so we know
@@ -1749,6 +1748,9 @@ Status DBImpl::WriteImplWALOnly(
         }
       }
     }
+  }
+  if (status.ok()) {
+    MaybeTraceWriteGroupForPreservedWriteOrder(write_group);
   }
   if (publish_last_seq == kDoPublishLastSeq) {
     versions_->SetLastSequence(last_sequence + seq_inc);
@@ -2898,6 +2900,7 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
     // of mutable_cf_options.write_buffer_size.
     io_s = CreateWAL(write_options, new_log_number, recycle_log_number,
                      preallocate_block_size, info, &new_log);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::SwitchMemtable:AfterCreateWAL", &io_s);
     if (s.ok()) {
       s = io_s;
     }
