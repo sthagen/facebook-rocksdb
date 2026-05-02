@@ -7240,7 +7240,8 @@ TEST_F(ExternalTableTest, BasicTest) {
         ExternalTableBuilderOptions(ReadOptions(), WriteOptions(),
                                     std::shared_ptr<const SliceTransform>(),
                                     BytewiseComparator(), "default",
-                                    TableFileCreationReason::kMisc),
+                                    TableFileCreationReason::kMisc,
+                                    /*fs=*/nullptr),
         file_path, /*file=*/nullptr));
     builder->Add("foo", "bar");
     ASSERT_OK(builder->Finish());
@@ -8634,7 +8635,7 @@ TEST_P(UserDefinedIndexTest, ValueTypeMappingViaDBFlush) {
   if (is_reverse_comparator_) {
     // Skip for reverse comparator — the key ordering makes this test
     // unnecessarily complex and the mapping logic is comparator-independent.
-    ROCKSDB_GTEST_SKIP("Skipped for reverse comparator");
+    ROCKSDB_GTEST_BYPASS("Skipped for reverse comparator");
     return;
   }
   std::string dbname = test::PerThreadDBPath("udi_valuetype_mapping_test");
@@ -8702,7 +8703,7 @@ TEST_P(UserDefinedIndexTest, CompactionWithSnapshotsAndUDI) {
   // Verify that compaction with snapshots (producing multiple versions of the
   // same user key) works correctly with UDI.
   if (is_reverse_comparator_) {
-    ROCKSDB_GTEST_SKIP("Skipped for reverse comparator");
+    ROCKSDB_GTEST_BYPASS("Skipped for reverse comparator");
     return;
   }
   std::string dbname = test::PerThreadDBPath("udi_compaction_snapshot_test");
