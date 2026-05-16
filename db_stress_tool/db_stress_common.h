@@ -114,6 +114,7 @@ DECLARE_double(memtable_prefix_bloom_size_ratio);
 DECLARE_bool(memtable_whole_key_filtering);
 DECLARE_int32(open_files);
 DECLARE_bool(open_files_async);
+DECLARE_bool(async_wal_precreate);
 DECLARE_uint64(compressed_secondary_cache_size);
 DECLARE_int32(compressed_secondary_cache_numshardbits);
 DECLARE_int32(secondary_cache_update_interval);
@@ -471,6 +472,8 @@ DECLARE_int32(compaction_on_deletion_trigger_count);
 DECLARE_int32(compaction_on_deletion_window_size);
 DECLARE_double(compaction_on_deletion_ratio);
 DECLARE_double(read_triggered_compaction_threshold);
+
+DECLARE_string(listener_uri);
 
 constexpr long KB = 1024;
 constexpr int kRandomValueMaxFactor = 3;
