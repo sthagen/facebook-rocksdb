@@ -19,9 +19,12 @@ remain_argv = None
 is_remote_db = False
 
 _SIGTERM_STDOUT_MARKER = "Received signal 15 (Terminated)"
+# Keep this timeout filter narrow: Poll/AbortIO only retry Linux
+# -EINTR (-4) and -EAGAIN (-11), so terminal wait_cqe errors still fail.
 _IGNORED_SIGTERM_STDERR_RE = re.compile(
-    r"^PosixRandomAccessFile::MultiRead: io_uring_submit_and_wait "
-    r"returned terminal error: -9\.$"
+    r"^(?:PosixRandomAccessFile::MultiRead: io_uring_submit_and_wait "
+    r"returned terminal error: -9\."
+    r"|(?:Poll|AbortIO): io_uring_wait_cqe failed: -(?:4|11))$"
 )
 _NO_SPACE_SUBSTRINGS = (
     "no space left on device",
@@ -345,6 +348,8 @@ default_params = {
     "avoid_unnecessary_blocking_io": random.randint(0, 1),
     "write_dbid_to_manifest": random.randint(0, 1),
     "write_identity_file": random.randint(0, 1),
+    "optimize_manifest_for_recovery": lambda: 1 if random.randint(1, 5) == 1 else 0,
+    "reuse_manifest_on_open": lambda: 1 if random.randint(1, 5) == 1 else 0,
     "avoid_flush_during_recovery": lambda: random.choice(
         [1 if t == 0 else 0 for t in range(0, 8)]
     ),
