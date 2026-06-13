@@ -732,6 +732,11 @@ DEFINE_bool(mmap_write, ROCKSDB_NAMESPACE::Options().allow_mmap_writes,
 DEFINE_bool(use_direct_reads, ROCKSDB_NAMESPACE::Options().use_direct_reads,
             "Use O_DIRECT for reading data");
 
+DEFINE_bool(use_direct_io_for_compaction_reads,
+            ROCKSDB_NAMESPACE::Options().use_direct_io_for_compaction_reads,
+            "Use O_DIRECT for compaction-input SST reads only, while keeping "
+            "user reads buffered");
+
 DEFINE_bool(use_direct_io_for_flush_and_compaction,
             ROCKSDB_NAMESPACE::Options().use_direct_io_for_flush_and_compaction,
             "Use O_DIRECT for writing data");
@@ -861,6 +866,13 @@ DEFINE_int32(ingest_external_file_one_in, 0,
 
 DEFINE_int32(ingest_external_file_width, 100,
              "The width of the ingested external files.");
+
+DEFINE_int32(ingest_external_file_prepare_commit_one_in, 0,
+             "If non-zero, an ingestion that would call IngestExternalFile() "
+             "instead uses the two-phase PrepareFileIngestion()/"
+             "CommitFileIngestion() API once for every N such ingestions on "
+             "average, occasionally dropping the prepared handle without "
+             "committing to exercise the rollback path. 0 disables it.");
 
 DEFINE_int32(compact_files_one_in, 0,
              "If non-zero, then CompactFiles() will be called once for every N "
@@ -1021,7 +1033,8 @@ DEFINE_int32(iterpercent, 10,
 static const bool FLAGS_iterpercent_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_iterpercent, &ValidateInt32Percent);
 
-DEFINE_uint64(num_iterations, 10, "Number of iterations per MultiIterate run");
+DEFINE_uint64(num_iterations, 10,
+              "Number of iterations per iterator or MultiScan run");
 static const bool FLAGS_num_iterations_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_num_iterations, &ValidateUint32Range);
 

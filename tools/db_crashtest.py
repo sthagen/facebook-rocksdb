@@ -215,6 +215,7 @@ default_params = {
     "index_block_search_type": lambda: random.choice([0, 1, 2]),
     "uniform_cv_threshold": lambda: random.choice([-1, 0.2, 1000]),
     "ingest_external_file_one_in": lambda: random.choice([1000, 1000000]),
+    "ingest_external_file_prepare_commit_one_in": lambda: random.choice([0, 1, 2]),
     "test_ingest_standalone_range_deletion_one_in": lambda: random.choice([0, 5, 10]),
     "iterpercent": 10,
     "lock_wal_one_in": lambda: random.choice([10000, 1000000]),
@@ -263,6 +264,7 @@ default_params = {
     "top_level_index_pinning": lambda: random.randint(0, 3),
     "unpartitioned_pinning": lambda: random.randint(0, 3),
     "use_direct_reads": lambda: random.randint(0, 1),
+    "use_direct_io_for_compaction_reads": lambda: random.randint(0, 1),
     "use_direct_io_for_flush_and_compaction": lambda: random.randint(0, 1),
     "use_sqfc_for_range_queries": lambda: random.choice([0, 1, 1, 1]),
     "mock_direct_io": False,
@@ -521,8 +523,7 @@ default_params = {
     "use_multiscan": random.choice([1] + [0] * 3),
     # By default, `statistics` use kExceptDetailedTimers level
     "statistics": random.choice([0, 1]),
-    # TODO: re-enable after resolving "Req failed: Unknown error -14" errors
-    "multiscan_use_async_io": 0,  # random.randint(0, 1),
+    "multiscan_use_async_io": lambda: random.randint(0, 1),
 }
 
 _TEST_DIR_ENV_VAR = "TEST_TMPDIR"
@@ -933,6 +934,7 @@ def finalize_and_sanitize(src_params):
     if dest_params["mmap_read"] == 1:
         dest_params["use_direct_io_for_flush_and_compaction"] = 0
         dest_params["use_direct_reads"] = 0
+        dest_params["use_direct_io_for_compaction_reads"] = 0
         dest_params["multiscan_use_async_io"] = 0
     if dest_params.get("min_tombstones_for_range_conversion", 0) > 0:
         # SQFC range-query filtering installs ReadOptions::table_filter on
@@ -945,13 +947,16 @@ def finalize_and_sanitize(src_params):
     if (
         dest_params["use_direct_io_for_flush_and_compaction"] == 1
         or dest_params["use_direct_reads"] == 1
+        or dest_params["use_direct_io_for_compaction_reads"] == 1
     ) and not is_direct_io_supported(dest_params["db"]):
         if is_release_mode():
             print(
-                "{} does not support direct IO. Disabling use_direct_reads and "
+                "{} does not support direct IO. Disabling use_direct_reads, "
+                "use_direct_io_for_compaction_reads and "
                 "use_direct_io_for_flush_and_compaction.\n".format(dest_params["db"])
             )
             dest_params["use_direct_reads"] = 0
+            dest_params["use_direct_io_for_compaction_reads"] = 0
             dest_params["use_direct_io_for_flush_and_compaction"] = 0
         else:
             dest_params["mock_direct_io"] = True
