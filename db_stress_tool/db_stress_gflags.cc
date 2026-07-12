@@ -130,6 +130,14 @@ DEFINE_bool(enable_pipelined_write, false, "Pipeline WAL/memtable writes");
 
 DEFINE_bool(verify_before_write, false, "Verify before write");
 
+DEFINE_string(
+    verify_cpu_corruption_dir, "",
+    "When non-empty, activates a slow, meticulous verification mode intended "
+    "only for use with a CPU fault injector; on the first corruption found it "
+    "writes a result file here and fails the run. See "
+    "StressTest::MaybeVerifyCpuCorruption for the full behavior and "
+    "output-file contract. Empty (default) = off.");
+
 DEFINE_bool(histogram, false, "Print histogram of operation timings");
 
 DEFINE_bool(destroy_db_initially, true,
@@ -1714,6 +1722,11 @@ DEFINE_bool(
 
 DEFINE_bool(use_multiscan, false,
             "If set, use the batched MultiScan API for scans.");
+
+DEFINE_bool(multiscan_reverse, false,
+            "If set with use_multiscan, scan each MultiScan range in reverse "
+            "using SeekForPrev and Prev. This does not require "
+            "test_backward_scan.");
 
 DEFINE_bool(multiscan_use_async_io, false,
             "If set, enable async_io for MultiScan operations.");

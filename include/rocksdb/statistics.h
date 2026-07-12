@@ -311,6 +311,22 @@ enum Tickers : uint32_t {
 
   // Number of refill intervals where rate limiter's bytes are fully consumed.
   NUMBER_RATE_LIMITER_DRAINS,
+  // Bytes granted by the rate limiter for read requests.
+  RATE_LIMITER_BYTES_READ,
+  // Bytes granted by the rate limiter for write requests.
+  RATE_LIMITER_BYTES_WRITE,
+  // Number of read requests granted by the rate limiter.
+  RATE_LIMITER_REQUESTS_READ,
+  // Number of write requests granted by the rate limiter.
+  RATE_LIMITER_REQUESTS_WRITE,
+  // Number of read requests that waited for a future rate limiter refill.
+  RATE_LIMITER_DELAYED_REQUESTS_READ,
+  // Number of write requests that waited for a future rate limiter refill.
+  RATE_LIMITER_DELAYED_REQUESTS_WRITE,
+  // Total time read requests spent waiting for rate limiter refills.
+  RATE_LIMITER_TOTAL_WAIT_MICROS_READ,
+  // Total time write requests spent waiting for rate limiter refills.
+  RATE_LIMITER_TOTAL_WAIT_MICROS_WRITE,
 
   // BlobDB specific stats
   // # of Put/PutWithTTL to BlobDB. Only applicable to legacy BlobDB.
@@ -613,6 +629,26 @@ enum Tickers : uint32_t {
   // # of times MANIFEST content validation detected corruption on DB close
   MANIFEST_VALIDATION_FAILURE_COUNT,
 
+  // Number of flushes triggered because the memtable reached write_buffer_size.
+  FLUSH_REASON_WRITE_BUFFER_FULL,
+  // Number of flushes triggered by WriteBufferManager memory pressure.
+  FLUSH_REASON_WRITE_BUFFER_MANAGER,
+  // Number of flushes triggered because the memtable reached
+  // memtable_max_range_deletions.
+  FLUSH_REASON_MEMTABLE_MAX_RANGE_DELETIONS,
+  // Number of atomic flush requests triggered because a memtable reached
+  // write_buffer_size.
+  ATOMIC_FLUSH_REQUEST_REASON_WRITE_BUFFER_FULL,
+  // Number of atomic flush requests triggered by WriteBufferManager memory
+  // pressure.
+  ATOMIC_FLUSH_REQUEST_REASON_WRITE_BUFFER_MANAGER,
+  // Number of atomic flush requests triggered because a memtable reached
+  // memtable_max_range_deletions.
+  ATOMIC_FLUSH_REQUEST_REASON_MEMTABLE_MAX_RANGE_DELETIONS,
+  // Number of atomic flush requests triggered for reasons that do not have a
+  // dedicated atomic flush request reason ticker.
+  ATOMIC_FLUSH_REQUEST_REASON_OTHER,
+
   TICKER_ENUM_MAX
 };
 
@@ -774,6 +810,20 @@ enum Histograms : uint32_t {
   // (work under the DB mutex while writes are blocked). One sample per
   // successful call; requires stats level > kExceptTimers.
   INGEST_EXTERNAL_FILE_RUN_TIME,
+
+  // Time read requests spent waiting for rate limiter refills.
+  RATE_LIMITER_WAIT_MICROS_READ,
+  // Time write requests spent waiting for rate limiter refills.
+  RATE_LIMITER_WAIT_MICROS_WRITE,
+
+  // Distribution of total memtable memory usage at flush start.
+  FLUSH_MEMTABLE_MEMORY_BYTES,
+  // Distribution of total memtable data size at flush start.
+  FLUSH_MEMTABLE_TOTAL_DATA_SIZE,
+  // Distribution of total memtable memory usage for write-buffer-full flushes.
+  FLUSH_WRITE_BUFFER_FULL_MEMTABLE_MEMORY_BYTES,
+  // Distribution of total memtable memory usage for WBM-triggered flushes.
+  FLUSH_WRITE_BUFFER_MANAGER_MEMTABLE_MEMORY_BYTES,
 
   HISTOGRAM_ENUM_MAX
 };
