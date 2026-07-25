@@ -296,14 +296,14 @@ Status DBIter::BlobReader::RetrieveAndSetBlobValue(
       prefetch_buffer, &blob_value_, bytes_read);
 }
 
-BlobFetcher DBIter::BlobReader::CreateBlobFetcher() const {
+VersionBlobFetcher DBIter::BlobReader::CreateBlobFetcher() const {
   ReadOptions read_options;
   read_options.read_tier = read_tier_;
   read_options.verify_checksums = verify_checksums_;
   read_options.fill_cache = fill_cache_;
   read_options.io_activity = io_activity_;
-  return BlobFetcher(version_, read_options, blob_file_cache_,
-                     allow_write_path_fallback_);
+  return VersionBlobFetcher(version_, read_options, blob_file_cache_,
+                            allow_write_path_fallback_);
 }
 
 bool DBIter::SetValueAndColumnsFromBlobImpl(const Slice& user_key,
@@ -368,7 +368,8 @@ bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
   }
   if (LIKELY(!has_blob_columns)) {
     WideColumns& wide_columns = state.wide_columns();
-    const Status s = WideColumnSerialization::Deserialize(slice, wide_columns);
+    const Status s =
+        WideColumnSerialization::DeserializeSimple(slice, wide_columns);
 
     if (!s.ok()) {
       status_ = s;
@@ -390,9 +391,9 @@ bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
   state.SaveEntitySliceIfNeeded(slice);
 
   {
-    Slice input_copy = state.PrepareForLazyEntityDeserialize();
-    const Status s = WideColumnSerialization::DeserializeV2(
-        input_copy, state.lazy_entity_columns(), state.lazy_blob_columns());
+    const Slice entity = state.PrepareForLazyEntityDeserialize();
+    const Status s = WideColumnSerialization::Deserialize(
+        entity, state.lazy_entity_columns(), &state.lazy_blob_columns());
 
     if (!s.ok()) {
       status_ = s;
@@ -1644,7 +1645,7 @@ bool DBIter::MergeWithWideColumnBaseValue(const Slice& entity,
                                           const Slice& user_key) {
   // Resolve V2 entity blob columns if present, since TimedFullMerge only
   // supports V1 format.
-  BlobFetcher blob_fetcher = blob_state_->reader.CreateBlobFetcher();
+  VersionBlobFetcher blob_fetcher = blob_state_->reader.CreateBlobFetcher();
   std::string resolved_entity;
   Slice effective_entity;
   Status s_resolve = WideColumnSerialization::ResolveEntityForMerge(

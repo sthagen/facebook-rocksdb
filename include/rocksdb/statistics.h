@@ -796,6 +796,15 @@ enum Histograms : uint32_t {
   // Distribution of blocks prefetched per MultiScan Prepare()
   MULTISCAN_BLOCKS_PER_PREPARE,
 
+  // Time (microseconds) from IODispatcher async read submission until
+  // completion callback execution.
+  IO_DISPATCHER_ASYNC_READ_OBSERVED_COMPLETION_MICROS,
+  // Time (microseconds) IODispatcher spends waiting in FileSystem::Poll().
+  IO_DISPATCHER_ASYNC_READ_POLL_WAIT_MICROS,
+  // Time (microseconds) from async read submission until the block consumer
+  // starts polling for completion.
+  IO_DISPATCHER_ASYNC_READ_PREFETCH_LEAD_MICROS,
+
   // Coefficient of variation of key gaps in blocks, scaled by 10000
   // (e.g., CV of 0.4532 is recorded as 4532). Currently only used by index
   // blocks for uniform key distribution tracking.
@@ -824,6 +833,9 @@ enum Histograms : uint32_t {
   FLUSH_WRITE_BUFFER_FULL_MEMTABLE_MEMORY_BYTES,
   // Distribution of total memtable memory usage for WBM-triggered flushes.
   FLUSH_WRITE_BUFFER_MANAGER_MEMTABLE_MEMORY_BYTES,
+
+  // Time spent opening the secondary DB inside DB::OpenAndCompact().
+  OPEN_AND_COMPACT_DB_OPEN_MICROS,
 
   HISTOGRAM_ENUM_MAX
 };
