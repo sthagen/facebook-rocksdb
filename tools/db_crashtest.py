@@ -155,6 +155,10 @@ default_params = {
     "charge_table_reader": lambda: random.choice([0, 1]),
     "charge_file_metadata": lambda: random.choice([0, 1]),
     "checkpoint_one_in": lambda: random.choice([0, 0, 10000, 1000000]),
+    "checkpoint_engine_max_background_operations": lambda: random.choice([4, 8]),
+    "checkpoint_engine_use_link_file_when_available": lambda: random.randint(0, 1),
+    "parallel_checkpoint_one_in": lambda: random.choice([0, 1, 2]),
+    "subset_cf_checkpoint_one_in": lambda: random.choice([0, 1, 2]),
     "compression_type": lambda: random.choice(
         ["none", "snappy", "zlib", "lz4", "lz4hc", "xpress", "zstd"]
     ),
@@ -239,7 +243,7 @@ default_params = {
     # the random seed, so the same keys are chosen by every run for disallowing
     # overwrites.
     "nooverwritepercent": 1,
-    "open_files": lambda: random.choice([-1, -1, 100, 500000]),
+    "open_files": lambda: random.choice([-1, -1, -1, -1, 100, 500000]),
     "open_files_async": lambda: random.choice([0, 1]),
     "async_wal_precreate": lambda: random.choice([0, 1]),
     "optimize_filters_for_memory": lambda: random.randint(0, 1),
@@ -251,6 +255,7 @@ default_params = {
     "disable_file_deletions_one_in": lambda: random.choice([10000, 1000000]),
     "disable_manual_compaction_one_in": lambda: random.choice([10000, 1000000]),
     "abort_and_resume_compactions_one_in": lambda: random.choice([10000, 1000000]),
+    "abort_and_resume_cf_compactions_one_in": lambda: random.choice([10000, 1000000]),
     "prefix_size": lambda: random.choice([-1, 1, 5, 7, 8]),
     "prefixpercent": 5,
     "progress_reports": 0,
@@ -314,8 +319,11 @@ default_params = {
     "separate_key_value_in_data_block": lambda: random.choice([0, 1, 1]),
     "index_block_restart_interval": lambda: random.choice(range(1, 16)),
     "use_multiget": lambda: random.randint(0, 1),
+    "use_async_db_api": lambda: random.choice([0] * 5 + [1]),
     "use_get_entity": lambda: random.choice([0] * 7 + [1]),
     "use_multi_get_entity": lambda: random.choice([0] * 7 + [1]),
+    # NOTE: only takes effect when open_files == -1 (required by the lazy API)
+    "lazy_entity_read_one_in": lambda: random.choice([0, 0, 0, 10, 100]),
     "periodic_compaction_seconds": lambda: random.choice([0, 0, 1, 2, 10, 100, 1000]),
     "max_compaction_trigger_wakeup_seconds": lambda: random.choice([43200, 600, 30]),
     "read_triggered_compaction_threshold": lambda: random.choice([0.0, 0.001, 0.01]),
@@ -944,6 +952,7 @@ def finalize_and_sanitize(src_params):
         dest_params["use_direct_reads"] = 0
         dest_params["use_direct_io_for_compaction_reads"] = 0
         dest_params["multiscan_use_async_io"] = 0
+        dest_params["open_read_only_one_in"] = 0
     if dest_params.get("min_tombstones_for_range_conversion", 0) > 0:
         # SQFC range-query filtering installs ReadOptions::table_filter on
         # iterators. Read-write iterators reject table_filter when read-path

@@ -21,6 +21,7 @@
 #include "options/db_options.h"
 #include "port/port.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/options.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/utilities/customizable_util.h"
@@ -770,6 +771,8 @@ std::string Env::IOActivityToString(IOActivity activity) {
       return "MultiGetEntity";
     case Env::IOActivity::kGetFileChecksumsFromCurrentManifest:
       return "GetFileChecksumsFromCurrentManifest";
+    case Env::IOActivity::kLazyResolve:
+      return "LazyResolve";
     case Env::IOActivity::kUnknown:
       return "Unknown";
     default:

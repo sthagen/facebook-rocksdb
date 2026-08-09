@@ -218,7 +218,7 @@ class CfConsistencyStressTest : public StressTest {
           column_families_[rand_column_families[thread->rand.Next() %
                                                 rand_column_families.size()]];
       std::string from_db;
-      s = db_->Get(readoptions, cfh, key, &from_db);
+      s = DbStressGet(db_, readoptions, cfh, key, &from_db);
     } else {
       // 1/2 chance, comparing one key is the same across all CFs
       const Snapshot* snapshot = db_->GetSnapshot();
@@ -226,8 +226,8 @@ class CfConsistencyStressTest : public StressTest {
       readoptionscopy.snapshot = snapshot;
 
       std::string value0;
-      s = db_->Get(readoptionscopy, column_families_[rand_column_families[0]],
-                   key, &value0);
+      s = DbStressGet(db_, readoptionscopy,
+                      column_families_[rand_column_families[0]], key, &value0);
 
       // Temporarily disable error injection for verification
       if (db_fault_injection_fs_) {
@@ -241,8 +241,9 @@ class CfConsistencyStressTest : public StressTest {
         bool found = s.ok();
         for (size_t i = 1; i < rand_column_families.size(); i++) {
           std::string value1;
-          s = db_->Get(readoptionscopy,
-                       column_families_[rand_column_families[i]], key, &value1);
+          s = DbStressGet(db_, readoptionscopy,
+                          column_families_[rand_column_families[i]], key,
+                          &value1);
           if (!s.ok() && !s.IsNotFound()) {
             break;
           }
@@ -326,8 +327,8 @@ class CfConsistencyStressTest : public StressTest {
       key_str.emplace_back(Key(rand_keys[i]));
       keys.emplace_back(key_str.back());
     }
-    db_->MultiGet(readoptionscopy, cfh, num_keys, keys.data(), values.data(),
-                  statuses.data());
+    DbStressMultiGet(db_, readoptionscopy, cfh, num_keys, keys.data(),
+                     values.data(), statuses.data());
     for (const auto& s : statuses) {
       if (s.ok()) {
         // found case
@@ -381,6 +382,10 @@ class CfConsistencyStressTest : public StressTest {
           is_consistent = false;
         }
       }
+
+      // Random single-CF read: no pinned snapshot to share with a reference, so
+      // run a self-contained lazy read (it pins its own snapshot).
+      MaybeTestGetEntityLazy(thread, read_opts, cfh, key);
     } else {
       // With a 1/2 chance, compare one key across all CFs
       ManagedSnapshot snapshot_guard(db_);
@@ -419,6 +424,15 @@ class CfConsistencyStressTest : public StressTest {
                     WideColumnsToHex(cmp_result.columns()).c_str());
             is_consistent = false;
           }
+        }
+
+        // Reuse the CF[0] entity we just read (under read_opts_copy's snapshot,
+        // and verified above) as the lazy read's reference for that CF.
+        if (cmp_found && is_consistent) {
+          const WideColumns& eager_ref = cmp_result.columns();
+          MaybeTestGetEntityLazy(thread, read_opts_copy,
+                                 column_families_[rand_column_families[0]], key,
+                                 &eager_ref);
         }
 
         if (is_consistent) {
@@ -679,7 +693,7 @@ class CfConsistencyStressTest : public StressTest {
             continue;
           }
 
-          assert(s.ok());
+          DB_STRESS_ASSERT_OK(s);
           if (cmp_s.IsNotFound()) {
             fprintf(stderr,
                     "MultiGetEntity (AttributeGroup) returns different results "
@@ -734,6 +748,16 @@ class CfConsistencyStressTest : public StressTest {
           thread->stats.AddGets(1, 0);
         }
       }
+
+      std::vector<EagerEntityRef> eager_refs(num_keys);
+      for (size_t i = 0; i < num_keys; ++i) {
+        eager_refs[i].status = results[i][0].status();
+        if (eager_refs[i].status.ok()) {
+          eager_refs[i].columns = &results[i][0].columns();
+        }
+      }
+      MaybeTestMultiGetEntityLazy(thread, read_opts_copy, cfhs[0], num_keys,
+                                  key_slices.data(), &eager_refs);
 
     } else {
       // Non-AttributeGroup MultiGetEntity verification
@@ -792,7 +816,7 @@ class CfConsistencyStressTest : public StressTest {
             continue;
           }
 
-          assert(s.ok());
+          DB_STRESS_ASSERT_OK(s);
           if (cmp_s.IsNotFound()) {
             fprintf(
                 stderr,
@@ -859,6 +883,26 @@ class CfConsistencyStressTest : public StressTest {
         }
       }
     }
+
+    // Cross-CF note: the lazy read API has no cross-column-family (`CF**`)
+    // overload yet -- MultiGetEntityLazy is single-CF -- so we exercise it on
+    // just cfhs[0] (a cross-CF lazy overload is a planned follow-up; see the
+    // lazy blob resolution plan). The attribute-group branch above reuses its
+    // already-read cfhs[0] columns as the reference; the non-attribute branch
+    // reads each key across CFs one at a time and so holds no batch of cfhs[0]
+    // results to reuse -- fall back to a self-contained lazy read there.
+    if (!FLAGS_use_attribute_group && LazyEntityReadEnabled()) {
+      std::vector<std::string> lazy_key_strs;
+      std::vector<Slice> lazy_key_slices;
+      lazy_key_strs.reserve(num_keys);
+      lazy_key_slices.reserve(num_keys);
+      for (size_t i = 0; i < num_keys; ++i) {
+        lazy_key_strs.emplace_back(Key(rand_keys[i]));
+        lazy_key_slices.emplace_back(lazy_key_strs.back());
+      }
+      MaybeTestMultiGetEntityLazy(thread, read_opts_copy, cfhs[0], num_keys,
+                                  lazy_key_slices.data());
+    }
   }
 
   Status TestPrefixScan(ThreadState* thread, const ReadOptions& readoptions,
@@ -876,6 +920,7 @@ class CfConsistencyStressTest : public StressTest {
 
     std::string upper_bound;
     Slice ub_slice;
+    std::function<bool(const TableProperties&)> table_filter;
 
     ReadOptions ro_copy = readoptions;
     std::unique_ptr<ManagedSnapshot> snapshot = nullptr;
@@ -890,8 +935,9 @@ class CfConsistencyStressTest : public StressTest {
       ub_slice = Slice(upper_bound);
       ro_copy.iterate_upper_bound = &ub_slice;
       if (FLAGS_use_sqfc_for_range_queries) {
-        ro_copy.table_filter =
+        table_filter =
             sqfc_factory_->GetTableFilterForRangeQuery(prefix, ub_slice);
+        ro_copy.table_filter = &table_filter;
       }
     }
 
@@ -1477,14 +1523,14 @@ class CfConsistencyStressTest : public StressTest {
           db_->GetEntity(snapshot_read_opts, cfh, key, &snapshot_entity);
       std::string snapshot_value;
       const Status snapshot_value_status =
-          db_->Get(snapshot_read_opts, cfh, key, &snapshot_value);
+          DbStressGet(db_, snapshot_read_opts, cfh, key, &snapshot_value);
 
       PinnableWideColumns latest_entity;
       const Status latest_entity_status =
           db_->GetEntity(latest_read_opts, cfh, key, &latest_entity);
       std::string latest_value;
       const Status latest_value_status =
-          db_->Get(latest_read_opts, cfh, key, &latest_value);
+          DbStressGet(db_, latest_read_opts, cfh, key, &latest_value);
 
       std::string snapshot_verify = "n/a";
       if (snapshot_entity_status.ok()) {

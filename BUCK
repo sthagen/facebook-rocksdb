@@ -103,7 +103,6 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/snapshot_impl.cc",
         "db/table_cache.cc",
         "db/table_properties_collector.cc",
-        "db/transaction_log_impl.cc",
         "db/trim_history_scheduler.cc",
         "db/version_builder.cc",
         "db/version_edit.cc",
@@ -111,7 +110,9 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/version_set.cc",
         "db/version_util.cc",
         "db/wal_edit.cc",
+        "db/wal_iterator_impl.cc",
         "db/wal_manager.cc",
+        "db/wide/lazy_wide_columns.cc",
         "db/wide/read_path_blob_resolver.cc",
         "db/wide/wide_column_serialization.cc",
         "db/wide/wide_columns.cc",
@@ -268,6 +269,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "util/compression.cc",
         "util/compression_context_cache.cc",
         "util/concurrent_task_limiter_impl.cc",
+        "util/coro_stats_util.cc",
         "util/crc32c.cc",
         "util/crc32c_arm64.cc",
         "util/data_structure.cc",
@@ -380,11 +382,21 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/write_batch_with_index/write_batch_with_index_internal.cc",
     ], deps=[
         "//folly/container:f14_hash",
+        "//folly/coro:baton",
         "//folly/coro:blocking_wait",
         "//folly/coro:collect",
         "//folly/coro:coroutine",
+        "//folly/coro:nothrow",
         "//folly/coro:task",
+        "//folly/executors/thread_factory:named_thread_factory",
+        "//folly/executors:io_executor",
+        "//folly/executors:io_thread_pool_executor",
+        "//folly/io/async:async_base",
+        "//folly/io/async:event_base_manager",
+        "//folly/io/async:io_uring_backend",
+        "//folly/io/async:request_context",
         "//folly/synchronization:distributed_mutex",
+        "//folly:executor",
     ], headers=glob(["**/*.h"]), link_whole=False, extra_test_libs=False)
 
 cpp_library_wrapper(name="rocksdb_whole_archive_lib", srcs=[], deps=[":rocksdb_lib"], headers=[], link_whole=True, extra_test_libs=False)
@@ -4932,6 +4944,12 @@ cpp_unittest_wrapper(name="db_iterator_test",
 
 cpp_unittest_wrapper(name="db_kv_checksum_test",
             srcs=["db/db_kv_checksum_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="db_lazy_entity_test",
+            srcs=["db/wide/db_lazy_entity_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
