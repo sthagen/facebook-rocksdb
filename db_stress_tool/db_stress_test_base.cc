@@ -785,7 +785,10 @@ void StressTest::MaybeTestMultiGetEntityLazy(
     const size_t i = chosen[j].first;
     const size_t c = chosen[j].second;
     // Randomly fuzz a partial (byte-range) read vs a whole-column read, sized
-    // against the reference when available, else the known logical size.
+    // against the reference when available, else the known logical size; and
+    // independently fuzz force_verify (which forces a whole, checksum-verified
+    // read even for a sub-range) -- the resolved bytes are unchanged either
+    // way.
     const WideColumns* reference = entity_ref[i];
     const std::optional<uint64_t> size_hint =
         reference ? std::optional<uint64_t>((*reference)[c].value().size())
@@ -793,6 +796,7 @@ void StressTest::MaybeTestMultiGetEntityLazy(
     reads[j].column = &batch[i][c];
     PickLazyReadRange(&thread->rand, size_hint, &reads[j].offset,
                       &reads[j].length);
+    reads[j].force_verify = thread->rand.OneIn(4);
     reads[j].result = &results[j];
     reads[j].status = &statuses[j];
   }
@@ -910,13 +914,17 @@ void StressTest::ResolveLazyEntity(ThreadState* thread, const std::string& key,
   for (size_t j = 0; j < chosen.size(); ++j) {
     const size_t c = chosen[j];
     // Randomly fuzz a partial (byte-range) read vs a whole-column read, sized
-    // against the reference when available, else the known logical size.
+    // against the reference when available, else the known logical size; and
+    // independently fuzz force_verify (which forces a whole, checksum-verified
+    // read even for a sub-range) -- the resolved bytes are unchanged either
+    // way.
     const std::optional<uint64_t> size_hint =
         reference ? std::optional<uint64_t>((*reference)[c].value().size())
                   : lazy[c].logical_size();
     reads[j].column = &lazy[c];
     PickLazyReadRange(&thread->rand, size_hint, &reads[j].offset,
                       &reads[j].length);
+    reads[j].force_verify = thread->rand.OneIn(4);
     reads[j].result = &results[j];
     reads[j].status = &statuses[j];
   }
@@ -1489,8 +1497,19 @@ Status StressTest::AssertSame(DB* db, ColumnFamilyHandle* cf,
   ropt.auto_refresh_iterator_with_snapshot =
       FLAGS_auto_refresh_iterator_with_snapshot;
   Slice ts;
+  std::string validation_ts_str;
   if (!snap_state.timestamp.empty()) {
-    ts = snap_state.timestamp;
+    if (!FLAGS_persist_user_defined_timestamps) {
+      // Timestamp-enabled reads require a read timestamp. In memtable-only UDT
+      // mode, the saved timestamp is not part of the long-running snapshot
+      // contract because full_history_ts_low can advance while the snapshot is
+      // held. Use a fresh timestamp to validate the pinned sequence-number
+      // view.
+      validation_ts_str = GetReadTimestamp();
+      ts = validation_ts_str;
+    } else {
+      ts = snap_state.timestamp;
+    }
     ropt.timestamp = &ts;
   }
   PinnableSlice exp_v(&snap_state.value);
@@ -5704,15 +5723,18 @@ void StressTest::RecordManifestStateBeforeReopen() {
     return;
   }
 
+  if (FLAGS_metadata_write_fault_one_in != 0 ||
+      FLAGS_open_metadata_write_fault_one_in != 0) {
+    manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+    return;
+  }
+
   if (reuse_manifest && optimize_manifest) {
     // Check if ALL conditions for complete avoidance are met.
     // If so, use STRICT mode where failures are fatal.
-    const bool no_fault_injection = FLAGS_metadata_write_fault_one_in == 0 &&
-                                    FLAGS_open_metadata_write_fault_one_in == 0;
     const bool no_manifest_writes_expected =
         FLAGS_avoid_flush_during_recovery &&  // No flush during recovery
-        !FLAGS_write_dbid_to_manifest &&      // No DB_ID write on open
-        no_fault_injection;
+        !FLAGS_write_dbid_to_manifest;        // No DB_ID write on open
     // Note: avoid_flush_during_shutdown is NOT required for STRICT mode.
     // If avoid_flush_during_shutdown=true leaves data in WAL, but
     // avoid_flush_during_recovery=true prevents flushing it, so MANIFEST
@@ -6195,6 +6217,9 @@ void InitializeOptionsFromFlags(
   block_based_options.data_block_index_type =
       static_cast<BlockBasedTableOptions::DataBlockIndexType>(
           FLAGS_data_block_index_type);
+  block_based_options.optimize_key_common_prefix =
+      static_cast<BlockBasedTableOptions::OptimizeKeyCommonPrefix>(
+          FLAGS_optimize_key_common_prefix);
   block_based_options.index_block_search_type =
       static_cast<BlockBasedTableOptions::BlockSearchType>(
           FLAGS_index_block_search_type);
@@ -6358,6 +6383,8 @@ void InitializeOptionsFromFlags(
       static_cast<unsigned int>(FLAGS_stats_dump_period_sec);
   options.max_compaction_trigger_wakeup_seconds =
       FLAGS_max_compaction_trigger_wakeup_seconds;
+  options.periodic_compaction_phase_recovery_percent =
+      FLAGS_periodic_compaction_phase_recovery_percent;
   options.ttl = FLAGS_compaction_ttl;
   options.enable_pipelined_write = FLAGS_enable_pipelined_write;
   options.enable_write_thread_adaptive_yield =

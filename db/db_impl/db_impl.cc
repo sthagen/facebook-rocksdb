@@ -347,6 +347,22 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   const ReadOptions read_options(io_activity);
   const WriteOptions write_options(io_activity);
 
+  assert(static_cast<size_t>(unscheduled_flushes_) <= flush_queue_.size());
+  // Recovery rebuilds flush requests for every column family with pending
+  // immutable data after scheduled workers exit, so every existing request is
+  // redundant and safe to remove. A worker can exit on the background error
+  // without popping a request, leaving it out of unscheduled_flushes_.
+  while (!flush_queue_.empty()) {
+    FlushRequest flush_req = PopFirstFromFlushQueue();
+    for (const auto& item : flush_req.cfd_to_max_mem_id_to_persist) {
+      ColumnFamilyData* cfd = item.first;
+      assert(cfd);
+      cfd->UnrefAndTryDelete();
+    }
+  }
+  unscheduled_flushes_ = 0;
+
+  TEST_SYNC_POINT("DBImpl::ResumeImpl:BeforeWaitForBackgroundWork");
   WaitForBackgroundWork();
 
   TEST_SYNC_POINT("DBImpl::ResumeImpl:Start");
@@ -474,9 +490,8 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     s = Status::ShutdownInProgress();
   }
   if (s.ok() && context.flush_after_recovery) {
-    // Since we drop all non-recovery flush requests during recovery,
-    // and new memtable may fill up during recovery,
-    // schedule one more round of flush.
+    // Normal flush requests are discarded during recovery, and a new memtable
+    // may fill while recovery releases the DB mutex. Schedule a catch-up flush.
     Status status = RetryFlushesForErrorRecovery(
         FlushReason::kCatchUpAfterErrorRecovery, false /* wait */);
     if (!status.ok()) {
@@ -1662,6 +1677,21 @@ Status DBImpl::SetOptions(
     VersionEdit dummy_edit;
     dummy_edit.MarkNoManifestWriteDummy();
     TEST_SYNC_POINT_CALLBACK("DBImpl::SetOptions:dummy_edit", &dummy_edit);
+    // If any CF is changing periodic_compaction_seconds, (re)anchor phasing to
+    // now BEFORE the new Version is built below, so the new Version's scoring
+    // spreads a turn-down's newly past-due cohort over the phase grid (within
+    // ~N/4 of now) instead of firing it all at once (a herd). Anchoring is
+    // DB-level and benign to CFs that are not changing their interval.
+    bool changing_periodic_compaction_seconds = false;
+    for (const auto& cfd_opts : column_family_datas) {
+      if (cfd_opts.second->count("periodic_compaction_seconds") > 0) {
+        changing_periodic_compaction_seconds = true;
+        break;
+      }
+    }
+    if (changing_periodic_compaction_seconds) {
+      versions_->ReanchorCompactionPhase();
+    }
     for (const auto& cfd_opts : column_family_datas) {
       auto* cfd = cfd_opts.first;
       const auto* options_map_ptr = cfd_opts.second;
@@ -2706,36 +2736,6 @@ ColumnFamilyHandle* DBImpl::PersistentStatsColumnFamily() const {
   return persist_stats_cf_handle_;
 }
 
-Status DBImpl::GetEntity(const ReadOptions& _read_options,
-                         ColumnFamilyHandle* column_family, const Slice& key,
-                         PinnableWideColumns* columns) {
-  if (!column_family) {
-    return Status::InvalidArgument(
-        "Cannot call GetEntity without a column family handle");
-  }
-  if (!columns) {
-    return Status::InvalidArgument(
-        "Cannot call GetEntity without a PinnableWideColumns object");
-  }
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
-      _read_options.io_activity != Env::IOActivity::kGetEntity) {
-    return Status::InvalidArgument(
-        "Can only call GetEntity with `ReadOptions::io_activity` set to "
-        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kGetEntity`");
-  }
-  ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
-    read_options.io_activity = Env::IOActivity::kGetEntity;
-  }
-  columns->Reset();
-
-  GetImplOptions get_impl_options;
-  get_impl_options.column_family = column_family;
-  get_impl_options.columns = columns;
-
-  return GetImpl(read_options, key, get_impl_options);
-}
-
 Status DBImpl::GetEntityLazyImpl(const ReadOptions& read_options,
                                  ColumnFamilyHandle* column_family,
                                  const Slice& key, LazyWideColumns* result) {
@@ -2891,73 +2891,6 @@ void DBImpl::MultiGetEntityLazy(const ReadOptions& _read_options,
   if (own_snapshot) {
     ReleaseSnapshot(snapshot);
   }
-}
-
-Status DBImpl::GetEntity(const ReadOptions& _read_options, const Slice& key,
-                         PinnableAttributeGroups* result) {
-  if (!result) {
-    return Status::InvalidArgument(
-        "Cannot call GetEntity without PinnableAttributeGroups object");
-  }
-  Status s;
-  const size_t num_column_families = result->size();
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
-      _read_options.io_activity != Env::IOActivity::kGetEntity) {
-    s = Status::InvalidArgument(
-        "Can only call GetEntity with `ReadOptions::io_activity` set to "
-        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kGetEntity`");
-    for (size_t i = 0; i < num_column_families; ++i) {
-      (*result)[i].SetStatus(s);
-    }
-    return s;
-  }
-  // return early if no CF was passed in
-  if (num_column_families == 0) {
-    return s;
-  }
-  ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
-    read_options.io_activity = Env::IOActivity::kGetEntity;
-  }
-  std::vector<Slice> keys;
-  std::vector<ColumnFamilyHandle*> column_families;
-  for (size_t i = 0; i < num_column_families; ++i) {
-    // If any of the CFH is null, break early since the entire query will fail
-    if (!(*result)[i].column_family()) {
-      s = Status::InvalidArgument(
-          "DB failed to query because one or more group(s) have null column "
-          "family handle");
-      (*result)[i].SetStatus(
-          Status::InvalidArgument("Column family handle cannot be null"));
-      break;
-    }
-    // Adding the same key slice for different CFs
-    keys.emplace_back(key);
-    column_families.emplace_back((*result)[i].column_family());
-  }
-  if (!s.ok()) {
-    for (size_t i = 0; i < num_column_families; ++i) {
-      if ((*result)[i].status().ok()) {
-        (*result)[i].SetStatus(
-            Status::Incomplete("DB not queried due to invalid argument(s) in "
-                               "one or more of the attribute groups"));
-      }
-    }
-    return s;
-  }
-  std::vector<PinnableWideColumns> columns(num_column_families);
-  std::vector<Status> statuses(num_column_families);
-  MultiGetCommon(
-      read_options, num_column_families, column_families.data(), keys.data(),
-      /* values */ nullptr, columns.data(),
-      /* timestamps */ nullptr, statuses.data(), /* sorted_input */ false);
-  // Set results
-  for (size_t i = 0; i < num_column_families; ++i) {
-    (*result)[i].Reset();
-    (*result)[i].SetStatus(statuses[i]);
-    (*result)[i].SetColumns(std::move(columns[i]));
-  }
-  return s;
 }
 
 bool DBImpl::ShouldReferenceSuperVersion(const MergeContext& merge_context) {
@@ -6538,12 +6471,23 @@ Status DBImpl::PrepareFileIngestion(
     }
   }
 
+  std::vector<ExternalSstFileIngestionJob> ingestion_jobs;
+  ingestion_jobs.reserve(num_cfs);
+  for (const auto& arg : args) {
+    auto* cfd = static_cast<ColumnFamilyHandleImpl*>(arg.column_family)->cfd();
+    ingestion_jobs.emplace_back(versions_.get(), cfd, immutable_db_options_,
+                                mutable_db_options_, file_options_, &snapshots_,
+                                arg.options, &directories_, &event_logger_,
+                                io_tracer_);
+  }
+
   // TODO (yanqin) maybe handle the case in which column_families have
   // duplicates
   std::unique_ptr<std::list<uint64_t>::iterator> pending_output_elem;
   size_t total = 0;
-  for (const auto& arg : args) {
-    total += arg.external_files.size();
+  for (size_t i = 0; i != num_cfs; ++i) {
+    total += ingestion_jobs[i].NumFilesToPrepare(args[i].external_files.size(),
+                                                 args[i].atomic_replace_range);
   }
   uint64_t next_file_number = 0;
   Status status = ReserveFileNumbersBeforeIngestion(
@@ -6555,20 +6499,11 @@ Status DBImpl::PrepareFileIngestion(
     return status;
   }
 
-  std::vector<ExternalSstFileIngestionJob> ingestion_jobs;
-  ingestion_jobs.reserve(num_cfs);
-  for (const auto& arg : args) {
-    auto* cfd = static_cast<ColumnFamilyHandleImpl*>(arg.column_family)->cfd();
-    ingestion_jobs.emplace_back(versions_.get(), cfd, immutable_db_options_,
-                                mutable_db_options_, file_options_, &snapshots_,
-                                arg.options, &directories_, &event_logger_,
-                                io_tracer_);
-  }
-
   // TODO(yanqin) maybe make jobs run in parallel
   uint64_t start_file_number = next_file_number;
   for (size_t i = 1; i != num_cfs; ++i) {
-    start_file_number += args[i - 1].external_files.size();
+    start_file_number += ingestion_jobs[i - 1].NumFilesToPrepare(
+        args[i - 1].external_files.size(), args[i - 1].atomic_replace_range);
     SuperVersion* super_version =
         ingestion_jobs[i].GetColumnFamilyData()->GetReferencedSuperVersion(
             this);
@@ -7688,6 +7623,7 @@ void DBImpl::RecordSeqnoToTimeMapping() {
     new_seqno_to_time_mapping->CopyFrom(seqno_to_time_mapping_);
 
     // Update in SV of all applicable CFs
+    bool enqueued_any = false;
     for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
       if (cfd->IsDropped()) {
         continue;
@@ -7697,13 +7633,57 @@ void DBImpl::RecordSeqnoToTimeMapping() {
         sv_context.NewSuperVersion();
         cfd->InstallSuperVersion(&sv_context, &mutex_,
                                  new_seqno_to_time_mapping);
+        // Recording a new sample can move the preserve-window boundary, aging a
+        // bottommost file out of it. When that happens, recompute bottommost
+        // marking and enqueue now: on a quiet DB nothing else would create a
+        // new Version to pick up the change, so the compaction would otherwise
+        // be delayed until unrelated activity.
+        if (MaybeUpdatePreserveTimeMinSeqno(cfd) && !cfd->AllowIngestBehind()) {
+          VersionStorageInfo* vstorage = cfd->current()->storage_info();
+          vstorage->ComputeBottommostFilesMarkedForCompaction(
+              /*allow_ingest_behind=*/false, cfd->ioptions().user_comparator,
+              cfd->GetFullHistoryTsLow());
+          if (!vstorage->BottommostFilesMarkedForCompaction().empty()) {
+            EnqueuePendingCompaction(cfd);
+            enqueued_any = true;
+          }
+        }
       }
+    }
+    if (enqueued_any) {
+      MaybeScheduleFlushOrCompaction();
     }
     bg_cv_.SignalAll();
   }
 
   // clean up & report outside db mutex
   sv_context.Clean();
+}
+
+bool DBImpl::MaybeUpdatePreserveTimeMinSeqno(ColumnFamilyData* cfd) {
+  mutex_.AssertHeld();
+  VersionStorageInfo* vstorage = cfd->current()->storage_info();
+  const SequenceNumber prev = vstorage->GetPreserveTimeMinSeqno();
+  const MutableCFOptions& mopts = cfd->GetLatestMutableCFOptions();
+  MinAndMaxPreserveSeconds preserve_info{mopts};
+  if (!preserve_info.IsEnabled()) {
+    // Preserve/preclude disabled: no restriction on bottommost seqno zeroing.
+    vstorage->SetPreserveTimeMinSeqno(kMaxSequenceNumber);
+    return prev != kMaxSequenceNumber;
+  }
+  int64_t current_time = 0;
+  if (!immutable_db_options_.clock->GetCurrentTime(&current_time).ok()) {
+    // Leave the previous value in place; being stale is safe (a hot key's
+    // largest seqno stays above any past boundary and remains unmarked).
+    return false;
+  }
+  SequenceNumber preserve_time_min_seqno = kMaxSequenceNumber;
+  seqno_to_time_mapping_.GetCurrentTieringCutoffSeqnos(
+      static_cast<uint64_t>(current_time), mopts.preserve_internal_time_seconds,
+      mopts.preclude_last_level_data_seconds, &preserve_time_min_seqno,
+      /*preclude_last_level_min_seqno=*/nullptr);
+  vstorage->SetPreserveTimeMinSeqno(preserve_time_min_seqno);
+  return prev != preserve_time_min_seqno;
 }
 
 void DBImpl::TriggerPeriodicCompaction() {

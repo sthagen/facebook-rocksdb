@@ -5232,6 +5232,13 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_db_host_id(
 extern ROCKSDB_LIBRARY_API const char* rocksdb_options_get_db_host_id(
     rocksdb_options_t* opt, size_t* size);
 
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_remote_compaction_manifest_floor(rocksdb_options_t* opt,
+                                                     unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_remote_compaction_manifest_floor(rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_lowest_used_cache_tier(
     rocksdb_options_t* opt, int v);
 
@@ -5251,6 +5258,14 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_daily_offpeak_time_utc(
 extern ROCKSDB_LIBRARY_API const char*
 rocksdb_options_get_daily_offpeak_time_utc(rocksdb_options_t* opt,
                                            size_t* size);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_periodic_compaction_phase_recovery_percent(
+    rocksdb_options_t* opt, int v);
+
+extern ROCKSDB_LIBRARY_API int
+rocksdb_options_get_periodic_compaction_phase_recovery_percent(
+    rocksdb_options_t* opt);
 
 extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_follower_refresh_catchup_period_ms(rocksdb_options_t* opt,
@@ -6153,6 +6168,14 @@ rocksdb_block_based_options_set_uniform_cv_threshold(
 
 extern ROCKSDB_LIBRARY_API double
 rocksdb_block_based_options_get_uniform_cv_threshold(
+    rocksdb_block_based_table_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_block_based_options_set_optimize_key_common_prefix(
+    rocksdb_block_based_table_options_t* opt, int v);
+
+extern ROCKSDB_LIBRARY_API int
+rocksdb_block_based_options_get_optimize_key_common_prefix(
     rocksdb_block_based_table_options_t* opt);
 
 extern ROCKSDB_LIBRARY_API void

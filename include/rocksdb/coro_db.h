@@ -41,6 +41,11 @@ class CoroStackableDBBase;
 // thread, so reading TLS after awaiting them is not valid. To consume coroutine
 // stats, override the protected CoroStackableDB hook and copy the TLS values
 // immediately after awaiting the wrapped operation, before suspending again.
+//
+// Stats are generally more expensive in coroutine APIs than sync counterpart
+// due to request context overhead. For optimal performance when stats are not
+// needed, set PerfLevel::kDisable and disable I/O stats with
+// get_iostats_context()->disable_iostats = true before each read request.
 class CoroDB {
  public:
   virtual ~CoroDB() = default;
@@ -130,6 +135,20 @@ class CoroDB {
                       /*timestamps=*/nullptr, statuses, sorted_input);
   }
 
+  static folly::coro::Task<Status> CoGetEntity(
+      DB* db, const ReadOptions& options, ColumnFamilyHandle* column_family,
+      const Slice& key, PinnableWideColumns* columns);
+
+  static folly::coro::Task<Status> CoGetEntity(DB* db,
+                                               const ReadOptions& options,
+                                               const Slice& key,
+                                               PinnableWideColumns* columns);
+
+  static folly::coro::Task<Status> CoGetEntity(DB* db,
+                                               const ReadOptions& options,
+                                               const Slice& key,
+                                               PinnableAttributeGroups* result);
+
  protected:
   friend class DB;
   template <typename Base>
@@ -148,6 +167,14 @@ class CoroDB {
       ColumnFamilyHandle** column_families, const Slice* keys,
       PinnableSlice* values, std::string* timestamps, Status* statuses,
       bool sorted_input) = 0;
+
+  virtual folly::coro::Task<Status> GetEntityCoroutine(
+      const ReadOptions& options, ColumnFamilyHandle* column_family,
+      const Slice& key, PinnableWideColumns* columns) = 0;
+
+  virtual folly::coro::Task<Status> GetEntityCoroutine(
+      const ReadOptions& options, const Slice& key,
+      PinnableAttributeGroups* result) = 0;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -45,6 +45,7 @@
 #include "db/version_set.h"
 #include "env/composite_env_wrapper.h"
 #include "monitoring/histogram.h"
+#include "monitoring/iostats_context_imp.h"
 #include "monitoring/statistics_impl.h"
 #include "options/cf_options.h"
 #include "port/port.h"
@@ -57,6 +58,7 @@
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/io_dispatcher.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/lazy_wide_columns.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/options.h"
 #include "rocksdb/perf_context.h"
@@ -66,6 +68,7 @@
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/sst_file_writer.h"
+#include "rocksdb/sst_partitioner.h"
 #include "rocksdb/stats_history.h"
 #include "rocksdb/table.h"
 #include "rocksdb/tool_hooks.h"
@@ -265,6 +268,10 @@ DEFINE_string(
     "\tfillembeddedblob -- Create and ingest an SST of whole-value embedded "
     "(same-file) blobs; read with readrandom. Requires format_version>=7\n"
     "\treadrandomentity -- read N times in random order via GetEntity\n"
+    "\treadrandomentitylazy -- read N times in random order via GetEntityLazy, "
+    "resolving lazy_entity_read_length bytes of each column "
+    "(byte-range/partial "
+    "blob reads); requires open_files=-1\n"
     "\tmultireadentity -- read N in random batches via MultiGetEntity\n"
     "\topenandcompact -- Open DB and compact all files to bottommost level, "
     "writing output to separate directory without modifying source DB. "
@@ -816,6 +823,10 @@ DEFINE_bool(separate_key_value_in_data_block,
                 .separate_key_value_in_data_block,
             "If true, data blocks store keys and values separately.");
 
+DEFINE_string(optimize_key_common_prefix, "",
+              "BlockBasedTableOptions::optimize_key_common_prefix: one of "
+              "'disabled', 'auto', 'enabled'. Empty leaves the default.");
+
 DEFINE_int64(prepopulate_block_cache, 0,
              "Pre-populate hot/warm blocks in block cache. 0 to disable, 1 "
              "to insert during flush, and 2 to insert during flush and "
@@ -1289,6 +1300,14 @@ DEFINE_int32(num_short_wide_columns, 1,
              "default column is one of these inline columns; if 0, the default "
              "column is an embedded blob.");
 
+DEFINE_int64(
+    lazy_entity_read_length, -1,
+    "For the readrandomentitylazy benchmark: number of bytes to resolve from "
+    "the start of each column via LazyWideColumns::MultiResolve. -1 resolves "
+    "the whole column; a smaller value exercises byte-range (partial) blob "
+    "reads, which read only the requested bytes of an uncompressed blob column "
+    "(see rocksdb.blobdb.lazy.* statistics). Requires -open_files=-1.");
+
 // Secondary DB instance Options
 DEFINE_bool(use_secondary_db, false,
             "Open a RocksDB secondary instance. A primary instance can be "
@@ -1722,6 +1741,8 @@ DEFINE_int32(thread_status_per_interval, 0,
 DEFINE_int32(perf_level, ROCKSDB_NAMESPACE::PerfLevel::kDisable,
              "Level of perf collection");
 
+DEFINE_bool(io_stats, true, "Enable IOStatsContext collection");
+
 DEFINE_uint64(soft_pending_compaction_bytes_limit, 64ull * 1024 * 1024 * 1024,
               "Slowdown writes if pending compaction bytes exceed this number");
 
@@ -1983,6 +2004,11 @@ DEFINE_bool(
     seek_missing_prefix, false,
     "Iterator seek to keys with non-exist prefixes. Require prefix_size > 8");
 
+DEFINE_int32(sst_partitioner_fixed_prefix_len, 0,
+             "If non-zero, configure a SstPartitionerFixedPrefixFactory with "
+             "this prefix length so compaction splits output SST files on that "
+             "fixed key prefix. 0 disables (no SST partitioner).");
+
 DEFINE_int32(memtable_insert_with_hint_prefix_size, 0,
              "If non-zero, enable "
              "memtable insert with hint with the given prefix size.");
@@ -2001,6 +2027,11 @@ DEFINE_uint64(
     max_compaction_trigger_wakeup_seconds,
     ROCKSDB_NAMESPACE::Options().max_compaction_trigger_wakeup_seconds,
     "Maximum interval in seconds between periodic compaction trigger checks.");
+DEFINE_int32(
+    periodic_compaction_phase_recovery_percent,
+    ROCKSDB_NAMESPACE::Options().periodic_compaction_phase_recovery_percent,
+    "Sets DB option periodic_compaction_phase_recovery_percent (0 disables "
+    "periodic compaction phasing).");
 DEFINE_uint64(stats_persist_period_sec,
               ROCKSDB_NAMESPACE::Options().stats_persist_period_sec,
               "Gap between persisting stats in seconds");
@@ -3444,6 +3475,7 @@ class Benchmark {
   bool read_operands_;     // read via GetMergeOperands()
   bool read_entity_;       // read via GetEntity() (readrandomentity)
   bool multiread_entity_;  // read via MultiGetEntity() (multireadentity)
+  bool read_entity_lazy_;  // read via GetEntityLazy() (readrandomentitylazy)
   std::vector<std::string> keys_;
 
   class ErrorHandlerListener : public EventListener {
@@ -3555,6 +3587,10 @@ class Benchmark {
     fprintf(stdout, "Entries:    %" PRIu64 "\n", num_);
     fprintf(stdout, "Prefix:    %d bytes\n", FLAGS_prefix_size);
     fprintf(stdout, "Keys per prefix:    %" PRIu64 "\n", keys_per_prefix_);
+    if (FLAGS_sst_partitioner_fixed_prefix_len > 0) {
+      fprintf(stdout, "SST partitioner: fixed prefix len %d\n",
+              FLAGS_sst_partitioner_fixed_prefix_len);
+    }
     fprintf(stdout, "RawSize:    %.1f MB (estimated)\n",
             ((static_cast<int64_t>(FLAGS_key_size + avg_value_size) * num_) /
              1048576.0));
@@ -3962,7 +3998,8 @@ class Benchmark {
         use_blob_db_(FLAGS_use_blob_db),  // Stacked BlobDB
         read_operands_(false),
         read_entity_(false),
-        multiread_entity_(false) {
+        multiread_entity_(false),
+        read_entity_lazy_(false) {
     // use simcache instead of cache
     if (FLAGS_simcache_size >= 0) {
       if (FLAGS_cache_numshardbits >= 1) {
@@ -4248,6 +4285,7 @@ class Benchmark {
       read_operands_ = false;
       read_entity_ = false;
       multiread_entity_ = false;
+      read_entity_lazy_ = false;
 
       int num_repeat = 1;
       int num_warmup = 0;
@@ -4381,6 +4419,9 @@ class Benchmark {
       } else if (name == "readrandomentity") {
         method = &Benchmark::ReadRandom;
         read_entity_ = true;
+      } else if (name == "readrandomentitylazy") {
+        method = &Benchmark::ReadRandom;
+        read_entity_lazy_ = true;
       } else if (name == "multireadentity") {
         fprintf(stderr, "entries_per_batch = %" PRIi64 "\n",
                 entries_per_batch_);
@@ -4866,6 +4907,7 @@ class Benchmark {
     }
 
     SetPerfLevel(static_cast<PerfLevel>(shared->perf_level));
+    IOSTATS_SET_DISABLE(!FLAGS_io_stats);
     perf_context.EnablePerLevelPerfContext();
     thread->stats.Start(thread->tid);
     {
@@ -5252,6 +5294,8 @@ class Benchmark {
         static_cast<unsigned int>(FLAGS_stats_dump_period_sec);
     options.max_compaction_trigger_wakeup_seconds =
         FLAGS_max_compaction_trigger_wakeup_seconds;
+    options.periodic_compaction_phase_recovery_percent =
+        FLAGS_periodic_compaction_phase_recovery_percent;
     options.stats_persist_period_sec =
         static_cast<unsigned int>(FLAGS_stats_persist_period_sec);
     options.persist_stats_to_disk = FLAGS_persist_stats_to_disk;
@@ -5259,7 +5303,6 @@ class Benchmark {
         static_cast<size_t>(FLAGS_stats_history_buffer_size);
     options.avoid_flush_during_recovery = FLAGS_avoid_flush_during_recovery;
     options.avoid_flush_during_shutdown = FLAGS_avoid_flush_during_shutdown;
-
     options.compression_opts.level = FLAGS_compression_level;
     options.compression_opts.max_dict_bytes = FLAGS_compression_max_dict_bytes;
     options.compression_opts.zstd_max_train_bytes =
@@ -5315,6 +5358,10 @@ class Benchmark {
     options.compaction_options_fifo.use_kv_ratio_compaction =
         FLAGS_fifo_compaction_use_kv_ratio_compaction;
     options.prefix_extractor = prefix_extractor_;
+    if (FLAGS_sst_partitioner_fixed_prefix_len > 0) {
+      options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(
+          FLAGS_sst_partitioner_fixed_prefix_len);
+    }
     if (FLAGS_use_uint64_comparator) {
       options.comparator = test::Uint64Comparator();
       if (FLAGS_key_size != 8) {
@@ -5529,6 +5576,22 @@ class Benchmark {
       block_based_options.block_align = FLAGS_block_align;
       block_based_options.separate_key_value_in_data_block =
           FLAGS_separate_key_value_in_data_block;
+      if (!FLAGS_optimize_key_common_prefix.empty()) {
+        if (FLAGS_optimize_key_common_prefix == "disabled") {
+          block_based_options.optimize_key_common_prefix =
+              BlockBasedTableOptions::OptimizeKeyCommonPrefix::kDisabled;
+        } else if (FLAGS_optimize_key_common_prefix == "auto") {
+          block_based_options.optimize_key_common_prefix =
+              BlockBasedTableOptions::OptimizeKeyCommonPrefix::kIfFastSeek;
+        } else if (FLAGS_optimize_key_common_prefix == "enabled") {
+          block_based_options.optimize_key_common_prefix =
+              BlockBasedTableOptions::OptimizeKeyCommonPrefix::kEnabled;
+        } else {
+          fprintf(stderr, "Unknown --optimize_key_common_prefix: %s\n",
+                  FLAGS_optimize_key_common_prefix.c_str());
+          exit(1);
+        }
+      }
       block_based_options.uniform_cv_threshold = FLAGS_uniform_cv_threshold;
       block_based_options.whole_key_filtering = FLAGS_whole_key_filtering;
       block_based_options.max_auto_readahead_size =
@@ -7461,6 +7524,29 @@ class Benchmark {
       fprintf(stderr, "readrandomentity does not support user timestamps\n");
       db_bench_exit(1);
     }
+    if (read_entity_lazy_) {
+      if (user_timestamp_size_ > 0) {
+        fprintf(stderr,
+                "readrandomentitylazy does not support user timestamps\n");
+        db_bench_exit(1);
+      }
+      if (open_options_.max_open_files != -1) {
+        // The lazy API pins table readers via the immortal-table-cache mode.
+        fprintf(stderr, "readrandomentitylazy requires max_open_files == -1\n");
+        db_bench_exit(1);
+      }
+    }
+    // Reusable buffers for the lazy (readrandomentitylazy) path; empty and
+    // unused otherwise. lazy_read_length == kLazyWholeColumn resolves whole
+    // columns; a smaller value drives byte-range (partial) blob reads.
+    LazyWideColumns lazy_columns;
+    std::vector<PinnableSlice> lazy_results;
+    std::vector<Status> lazy_statuses;
+    std::vector<LazyColumnReadRequest> lazy_reads;
+    const size_t lazy_read_length =
+        FLAGS_lazy_entity_read_length < 0
+            ? kLazyWholeColumn
+            : static_cast<size_t>(FLAGS_lazy_entity_read_length);
     std::unique_ptr<char[]> ts_guard;
     Slice ts;
     if (user_timestamp_size_ > 0) {
@@ -7499,6 +7585,9 @@ class Benchmark {
       Status s;
       pinnable_val.Reset();
       pinnable_columns.Reset();
+      // Release the previous iteration's resolved slices before GetEntityLazy
+      // resets lazy_columns (whose resolver backs those slices).
+      lazy_results.clear();
       for (size_t i = 0; i < pinnable_vals.size(); ++i) {
         pinnable_vals[i].Reset();
       }
@@ -7530,6 +7619,8 @@ class Benchmark {
         }
       } else if (read_entity_) {
         s = db_with_cfh->db->GetEntity(options, cfh, key, &pinnable_columns);
+      } else if (read_entity_lazy_) {
+        s = db_with_cfh->db->GetEntityLazy(options, cfh, key, &lazy_columns);
       } else {
         s = db_with_cfh->db->Get(options, cfh, key, &pinnable_val, ts_ptr);
       }
@@ -7544,6 +7635,37 @@ class Benchmark {
         if (read_entity_) {
           for (const auto& column : pinnable_columns.columns()) {
             bytes += column.name().size() + column.value().size();
+          }
+        }
+        if (read_entity_lazy_) {
+          // Resolve lazy_read_length bytes of each column in one MultiResolve
+          // call. For an uncompressed blob column a strict sub-range reads only
+          // the requested bytes from storage (see rocksdb.blobdb.lazy.*);
+          // inline columns and whole-column reads resolve as usual.
+          const size_t n = lazy_columns.size();
+          lazy_results.resize(n);
+          lazy_statuses.assign(n, Status::OK());
+          lazy_reads.resize(n);
+          for (size_t c = 0; c < n; ++c) {
+            lazy_reads[c].column = &lazy_columns[c];
+            lazy_reads[c].offset = 0;
+            lazy_reads[c].length = lazy_read_length;
+            lazy_reads[c].result = &lazy_results[c];
+            lazy_reads[c].status = &lazy_statuses[c];
+          }
+          const Status rs = lazy_columns.MultiResolve(lazy_reads);
+          if (rs.ok()) {
+            for (size_t c = 0; c < n; ++c) {
+              if (lazy_statuses[c].ok()) {
+                bytes += lazy_columns[c].name().size() + lazy_results[c].size();
+              } else if (!lazy_statuses[c].IsNotFound()) {
+                HandleBenchmarkIOError(lazy_statuses[c],
+                                       "MultiResolve column read returned "
+                                       "an error");
+              }
+            }
+          } else if (!rs.IsNotFound()) {
+            HandleBenchmarkIOError(rs, "MultiResolve returned an error");
           }
         }
       } else if (!s.IsNotFound()) {
@@ -7718,6 +7840,7 @@ class Benchmark {
 
   void PrepareCoroutineJobPerfContext(PerfContext* job_perf_context) {
     SetPerfLevel(static_cast<PerfLevel>(FLAGS_perf_level));
+    IOSTATS_SET_DISABLE(!FLAGS_io_stats);
     if (job_perf_context == nullptr) {
       return;
     }

@@ -151,6 +151,12 @@ static void rocksdb_roundtrip_test_rocksdb_block_based_options(void) {
   rocksdb_block_based_options_set_optimize_filters_for_memory(obj, 0);
   CheckCondition(
       rocksdb_block_based_options_get_optimize_filters_for_memory(obj) == 0);
+  rocksdb_block_based_options_set_optimize_key_common_prefix(obj, 1);
+  CheckCondition(
+      rocksdb_block_based_options_get_optimize_key_common_prefix(obj) == 1);
+  rocksdb_block_based_options_set_optimize_key_common_prefix(obj, 0);
+  CheckCondition(
+      rocksdb_block_based_options_get_optimize_key_common_prefix(obj) == 0);
   rocksdb_block_based_options_set_partition_filters(obj, 1);
   CheckCondition(rocksdb_block_based_options_get_partition_filters(obj) == 1);
   rocksdb_block_based_options_set_partition_filters(obj, 0);
@@ -833,6 +839,12 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_paranoid_memory_checks(obj) == 1);
   rocksdb_options_set_paranoid_memory_checks(obj, 0);
   CheckCondition(rocksdb_options_get_paranoid_memory_checks(obj) == 0);
+  rocksdb_options_set_periodic_compaction_phase_recovery_percent(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_periodic_compaction_phase_recovery_percent(obj) == 1);
+  rocksdb_options_set_periodic_compaction_phase_recovery_percent(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_periodic_compaction_phase_recovery_percent(obj) == 0);
   rocksdb_options_set_persist_stats_to_disk(obj, 1);
   CheckCondition(rocksdb_options_get_persist_stats_to_disk(obj) == 1);
   rocksdb_options_set_persist_stats_to_disk(obj, 0);
@@ -859,6 +871,12 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_read_io_executor_threads(obj) == 1);
   rocksdb_options_set_read_io_executor_threads(obj, 0);
   CheckCondition(rocksdb_options_get_read_io_executor_threads(obj) == 0);
+  rocksdb_options_set_remote_compaction_manifest_floor(obj, 1);
+  CheckCondition(rocksdb_options_get_remote_compaction_manifest_floor(obj) ==
+                 1);
+  rocksdb_options_set_remote_compaction_manifest_floor(obj, 0);
+  CheckCondition(rocksdb_options_get_remote_compaction_manifest_floor(obj) ==
+                 0);
   rocksdb_options_set_reuse_manifest_on_open(obj, 1);
   CheckCondition(rocksdb_options_get_reuse_manifest_on_open(obj) == 1);
   rocksdb_options_set_reuse_manifest_on_open(obj, 0);
