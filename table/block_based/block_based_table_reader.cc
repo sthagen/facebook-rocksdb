@@ -9,7 +9,6 @@
 #include "table/block_based/block_based_table_reader.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <limits>
@@ -547,86 +546,6 @@ bool IsFeatureSupported(const TableProperties& table_properties,
     }
   }
   return true;
-}
-
-// Caller has to ensure seqno is not nullptr.
-// Set *seqno to the global sequence number for reading this file.
-Status GetGlobalSequenceNumber(const TableProperties& table_properties,
-                               SequenceNumber largest_seqno,
-                               SequenceNumber* seqno) {
-  const auto& props = table_properties.user_collected_properties;
-  const auto version_pos = props.find(ExternalSstFilePropertyNames::kVersion);
-  const auto seqno_pos = props.find(ExternalSstFilePropertyNames::kGlobalSeqno);
-
-  *seqno = kDisableGlobalSequenceNumber;
-  if (version_pos == props.end()) {
-    if (seqno_pos != props.end()) {
-      std::array<char, 200> msg_buf;
-      // This is not an external sst file, global_seqno is not supported.
-      snprintf(
-          msg_buf.data(), msg_buf.max_size(),
-          "A non-external sst file have global seqno property with value %s",
-          seqno_pos->second.c_str());
-      return Status::Corruption(msg_buf.data());
-    }
-    return Status::OK();
-  }
-
-  uint32_t version = DecodeFixed32(version_pos->second.c_str());
-  if (version != 2) {
-    std::array<char, 200> msg_buf;
-    if (version != 1) {
-      snprintf(msg_buf.data(), msg_buf.max_size(),
-               "An external sst file has corrupted version %u.", version);
-      return Status::Corruption(msg_buf.data());
-    }
-    if (seqno_pos != props.end()) {
-      // This is a v1 external sst file, global_seqno is not supported.
-      snprintf(msg_buf.data(), msg_buf.max_size(),
-               "An external sst file with version %u has global seqno "
-               "property with value %s",
-               version, seqno_pos->second.c_str());
-      return Status::Corruption(msg_buf.data());
-    }
-    return Status::OK();
-  }
-
-  // Since we have a plan to deprecate global_seqno, we do not return failure
-  // if seqno_pos == props.end(). We rely on version_pos to detect whether the
-  // SST is external.
-  SequenceNumber global_seqno(0);
-  if (seqno_pos != props.end()) {
-    global_seqno = DecodeFixed64(seqno_pos->second.c_str());
-  }
-  // SstTableReader open table reader with kMaxSequenceNumber as largest_seqno
-  // to denote it is unknown.
-  if (largest_seqno < kMaxSequenceNumber) {
-    if (global_seqno == 0) {
-      global_seqno = largest_seqno;
-    }
-    if (global_seqno != largest_seqno) {
-      std::array<char, 200> msg_buf;
-      snprintf(
-          msg_buf.data(), msg_buf.max_size(),
-          "An external sst file with version %u have global seqno property "
-          "with value %s, while largest seqno in the file is %llu",
-          version, seqno_pos->second.c_str(),
-          static_cast<unsigned long long>(largest_seqno));
-      return Status::Corruption(msg_buf.data());
-    }
-  }
-  *seqno = global_seqno;
-
-  if (global_seqno > kMaxSequenceNumber) {
-    std::array<char, 200> msg_buf;
-    snprintf(msg_buf.data(), msg_buf.max_size(),
-             "An external sst file with version %u have global seqno property "
-             "with value %llu, which is greater than kMaxSequenceNumber",
-             version, static_cast<unsigned long long>(global_seqno));
-    return Status::Corruption(msg_buf.data());
-  }
-
-  return Status::OK();
 }
 
 Status GetDecompressor(const std::string& compression_name,
@@ -1429,6 +1348,65 @@ Status BlockBasedTable::ResolveEmbeddedBlobRangeCached(
       payload_size, rep_->footer.checksum_type(),
       rep_->footer.base_context_checksum(), blob_index.compression(),
       range_offset, range_length, value, /*bytes_read=*/nullptr);
+}
+
+void BlockBasedTable::MultiGetSameFileBlob(
+    const ReadOptions& read_options, size_t num_reads,
+    SameFileBlobReadRequest* reqs) const {
+  // Partition the requests into coalesceable whole-record and sub-range groups
+  // (dispatched to BlobSource as one MultiRead each). Force-verify reads
+  // (kVerifyIfPresent) and the no-BlobSource fallback go through the scalar
+  // GetSameFileBlob path since they cannot share the batch's single verify flag
+  // / BlobSource-backed cache path.
+  std::vector<SimpleGen2BlobReadRequest> whole_reqs;
+  std::vector<SimpleGen2BlobRangeReadRequest> range_reqs;
+
+  for (size_t i = 0; i < num_reads; ++i) {
+    SameFileBlobReadRequest& req = reqs[i];
+    assert(req.blob_index);
+    assert(req.result);
+    assert(req.status);
+
+    if (req.verify_policy == BlobVerifyPolicy::kVerifyIfPresent ||
+        rep_->blob_source_ == nullptr) {
+      *req.status =
+          GetSameFileBlob(read_options, *req.blob_index, req.range_offset,
+                          req.range_length, req.verify_policy, req.result);
+      continue;
+    }
+
+    size_t payload_size = 0;
+    size_t record_size = 0;
+    const Status vs =
+        ValidateEmbeddedBlobIndex(*req.blob_index, &payload_size, &record_size);
+    if (!vs.ok()) {
+      *req.status = vs;
+      continue;
+    }
+
+    if (req.range_length == kWholeBlobLength) {
+      whole_reqs.push_back(SimpleGen2BlobReadRequest{
+          req.blob_index->offset(), payload_size, req.blob_index->compression(),
+          req.result, req.status});
+    } else {
+      range_reqs.push_back(SimpleGen2BlobRangeReadRequest{
+          req.blob_index->offset(), payload_size, req.range_offset,
+          req.range_length, req.blob_index->compression(), req.result,
+          req.status});
+    }
+  }
+
+  if (!whole_reqs.empty()) {
+    rep_->blob_source_->MultiGetSimpleGen2Blob(
+        read_options, rep_->base_cache_key, rep_->file.get(),
+        rep_->footer.checksum_type(), rep_->footer.base_context_checksum(),
+        whole_reqs.size(), whole_reqs.data());
+  }
+  if (!range_reqs.empty()) {
+    rep_->blob_source_->MultiGetSimpleGen2BlobRange(
+        read_options, rep_->base_cache_key, rep_->file.get(), range_reqs.size(),
+        range_reqs.data());
+  }
 }
 
 Status BlockBasedTable::MaybeResolveEmbeddedValue(

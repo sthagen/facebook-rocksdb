@@ -4,10 +4,13 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #include "table/meta_blocks.h"
 
+#include <array>
+#include <cstdio>
 #include <map>
 #include <string>
 
 #include "block_fetcher.h"
+#include "db/dbformat.h"
 #include "db/table_properties_collector.h"
 #include "file/random_access_file_reader.h"
 #include "logging/logging.h"
@@ -31,6 +34,82 @@ const std::string kPropertiesBlockName = "rocksdb.properties";
 const std::string kIndexBlockName = "rocksdb.index";
 const std::string kCompressionDictBlockName = "rocksdb.compression_dict";
 const std::string kRangeDelBlockName = "rocksdb.range_del";
+
+Status GetGlobalSequenceNumber(const TableProperties& table_properties,
+                               SequenceNumber largest_seqno,
+                               SequenceNumber* global_seqno) {
+  const auto& props = table_properties.user_collected_properties;
+  const auto version_pos = props.find(ExternalSstFilePropertyNames::kVersion);
+  const auto seqno_pos = props.find(ExternalSstFilePropertyNames::kGlobalSeqno);
+
+  *global_seqno = kDisableGlobalSequenceNumber;
+  if (version_pos == props.end()) {
+    if (seqno_pos != props.end()) {
+      std::array<char, 200> msg_buf{};
+      snprintf(
+          msg_buf.data(), msg_buf.max_size(),
+          "A non-external sst file have global seqno property with value %s",
+          seqno_pos->second.c_str());
+      return Status::Corruption(msg_buf.data());
+    }
+    return Status::OK();
+  }
+
+  const uint32_t version = DecodeFixed32(version_pos->second.c_str());
+  if (version != 2) {
+    std::array<char, 200> msg_buf{};
+    if (version != 1) {
+      snprintf(msg_buf.data(), msg_buf.max_size(),
+               "An external sst file has corrupted version %u.", version);
+      return Status::Corruption(msg_buf.data());
+    }
+    if (seqno_pos != props.end()) {
+      snprintf(msg_buf.data(), msg_buf.max_size(),
+               "An external sst file with version %u has global seqno "
+               "property with value %s",
+               version, seqno_pos->second.c_str());
+      return Status::Corruption(msg_buf.data());
+    }
+    return Status::OK();
+  }
+
+  // Since we have a plan to deprecate global_seqno, we do not return failure
+  // if seqno_pos == props.end(). We rely on version_pos to detect whether the
+  // SST is external.
+  SequenceNumber resolved_global_seqno = 0;
+  if (seqno_pos != props.end()) {
+    resolved_global_seqno = DecodeFixed64(seqno_pos->second.c_str());
+  }
+  // SstTableReader opens a table reader with kMaxSequenceNumber as
+  // largest_seqno to denote it is unknown.
+  if (largest_seqno < kMaxSequenceNumber) {
+    if (resolved_global_seqno == 0) {
+      resolved_global_seqno = largest_seqno;
+    }
+    if (resolved_global_seqno != largest_seqno) {
+      std::array<char, 200> msg_buf{};
+      snprintf(
+          msg_buf.data(), msg_buf.max_size(),
+          "An external sst file with version %u have global seqno property "
+          "with value %s, while largest seqno in the file is %llu",
+          version, seqno_pos->second.c_str(),
+          static_cast<unsigned long long>(largest_seqno));
+      return Status::Corruption(msg_buf.data());
+    }
+  }
+  *global_seqno = resolved_global_seqno;
+
+  if (resolved_global_seqno > kMaxSequenceNumber) {
+    std::array<char, 200> msg_buf{};
+    snprintf(msg_buf.data(), msg_buf.max_size(),
+             "An external sst file with version %u have global seqno property "
+             "with value %llu, which is greater than kMaxSequenceNumber",
+             version, static_cast<unsigned long long>(resolved_global_seqno));
+    return Status::Corruption(msg_buf.data());
+  }
+
+  return Status::OK();
+}
 
 MetaIndexBuilder::MetaIndexBuilder()
     : meta_index_block_(new BlockBuilder(BlockBuilder::ForMetaBlock{},
@@ -86,6 +165,8 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kRawKeySize, props.raw_key_size);
   Add(TablePropertiesNames::kRawValueSize, props.raw_value_size);
   Add(TablePropertiesNames::kDataSize, props.data_size);
+  Add(TablePropertiesNames::kUncompressedDataSize,
+      props.uncompressed_data_size);
   Add(TablePropertiesNames::kIndexSize, props.index_size);
   if (props.index_partitions != 0) {
     Add(TablePropertiesNames::kIndexPartitions, props.index_partitions);
@@ -195,6 +276,9 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
     Add(TablePropertiesNames::kSeparateKeyValueInDataBlock,
         props.separate_key_value_in_data_block);
   }
+  if (props.lsm_info_at_creation != 0) {
+    Add(TablePropertiesNames::kLsmInfoAtCreation, props.lsm_info_at_creation);
+  }
 }
 
 Slice PropertyBlockBuilder::Finish() {
@@ -295,6 +379,10 @@ Status ParsePropertiesBlock(
       {TablePropertiesNames::kOriginalFileNumber,
        &new_table_properties->orig_file_number},
       {TablePropertiesNames::kDataSize, &new_table_properties->data_size},
+      {TablePropertiesNames::kUncompressedDataSize,
+       &new_table_properties->uncompressed_data_size},
+      {TablePropertiesNames::kLsmInfoAtCreation,
+       &new_table_properties->lsm_info_at_creation},
       {TablePropertiesNames::kIndexSize, &new_table_properties->index_size},
       {TablePropertiesNames::kIndexPartitions,
        &new_table_properties->index_partitions},

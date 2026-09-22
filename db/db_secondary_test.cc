@@ -1748,6 +1748,75 @@ TEST_F(DBSecondaryTest, CatchUpKeepsUnflushedWalData) {
   VerifySecondaryValue(handles_secondary_[1], "bar", "v1");
 }
 
+TEST_F(DBSecondaryTest, NewIteratorsConsistentViewDuringCatchUp) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  CreateAndReopenWithCF({"cf1"}, options);
+
+  ASSERT_OK(Put(0, "key", "old"));
+  ASSERT_OK(Put(1, "key", "old"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({"cf1"}, secondary_options);
+  ASSERT_EQ(2, handles_secondary_.size());
+
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  ASSERT_OK(db_->Put(write_options, handles_[0], "key", "new"));
+  ASSERT_OK(db_->Put(write_options, handles_[1], "key", "new"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[0], nullptr, nullptr));
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr, nullptr));
+
+  bool caught_up = false;
+  Status catch_up_status;
+  const auto catch_up = [&](void*) {
+    if (!caught_up) {
+      caught_up = true;
+      catch_up_status = db_secondary_->TryCatchUpWithPrimary();
+    }
+  };
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::MultiCFSnapshot::AfterRefSV",
+                                        catch_up);
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::NewIterators:AfterCreateIterator", catch_up);
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::vector<Iterator*> iterators;
+  const Status new_iterators_status = db_secondary_->NewIterators(
+      ReadOptions(), handles_secondary_, &iterators);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  std::vector<std::unique_ptr<Iterator>> owned_iterators;
+  owned_iterators.reserve(iterators.size());
+  for (Iterator* iterator : iterators) {
+    owned_iterators.emplace_back(iterator);
+  }
+
+  ASSERT_OK(catch_up_status);
+  ASSERT_TRUE(caught_up);
+  ASSERT_OK(new_iterators_status);
+  ASSERT_EQ(2, owned_iterators.size());
+  for (const auto& iterator : owned_iterators) {
+    iterator->Seek("key");
+    ASSERT_OK(iterator->status());
+    ASSERT_TRUE(iterator->Valid());
+    ASSERT_EQ("old", iterator->value());
+  }
+
+  VerifySecondaryValue(handles_secondary_[0], "key", "new");
+  VerifySecondaryValue(handles_secondary_[1], "key", "new");
+}
+
 TEST_F(DBSecondaryTest, RefreshIterator) {
   Options options;
   options.env = env_;
@@ -2277,6 +2346,69 @@ TEST_F(DBSecondaryTest, CatchUpAfterFlush) {
   iter3->Seek("key1");
   ASSERT_FALSE(iter3->Valid());
   ASSERT_OK(iter3->status());
+}
+
+TEST_F(DBSecondaryTest, NewIteratorsPerColumnFamilyOptionsConsistentView) {
+  const std::string kCFName = "cf_1";
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  CreateAndReopenWithCF({kCFName}, options);
+
+  ASSERT_OK(Put(0, "key", "old_default"));
+  ASSERT_OK(Put(1, "key", "old_cf_1"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({kCFName}, secondary_options);
+
+  ASSERT_OK(Put(0, "key", "new_default"));
+  ASSERT_OK(Put(1, "key", "new_cf_1"));
+  ASSERT_OK(db_->FlushWAL(/*sync=*/true));
+
+  bool caught_up = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::NewIterators:AfterCreateIterator", [&](void* /*arg*/) {
+        if (!caught_up) {
+          ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+          caught_up = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::vector<ReadOptions> read_options(2);
+  read_options[0].total_order_seek = false;
+  read_options[1].total_order_seek = true;
+  std::vector<Iterator*> iterators;
+  ASSERT_OK(db_secondary_->NewIterators(read_options, handles_secondary_,
+                                        &iterators));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(caught_up);
+  ASSERT_EQ(2U, iterators.size());
+  const std::vector<std::string> expected_values = {"old_default", "old_cf_1"};
+  for (size_t i = 0; i < iterators.size(); ++i) {
+    iterators[i]->Seek("key");
+    ASSERT_OK(iterators[i]->status());
+    ASSERT_TRUE(iterators[i]->Valid());
+    ASSERT_EQ(expected_values[i], iterators[i]->value());
+    delete iterators[i];
+  }
+
+  iterators.clear();
+  ASSERT_OK(db_secondary_->NewIterators(read_options, handles_secondary_,
+                                        &iterators));
+  const std::vector<std::string> new_values = {"new_default", "new_cf_1"};
+  for (size_t i = 0; i < iterators.size(); ++i) {
+    iterators[i]->Seek("key");
+    ASSERT_OK(iterators[i]->status());
+    ASSERT_TRUE(iterators[i]->Valid());
+    ASSERT_EQ(new_values[i], iterators[i]->value());
+    delete iterators[i];
+  }
 }
 
 TEST_F(DBSecondaryTest, StartFromInconsistent) {

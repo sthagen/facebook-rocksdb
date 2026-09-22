@@ -2912,6 +2912,47 @@ Status DBImpl::GetEntityLazyImpl(const ReadOptions& read_options,
   return s;
 }
 
+Status DBImpl::GetEntityLazyForBatch(const ReadOptions& read_options,
+                                     ColumnFamilyHandle* column_family,
+                                     SuperVersion* super_version,
+                                     SequenceNumber snapshot_seq,
+                                     const Slice& key,
+                                     LazyWideColumns* result) {
+  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+  auto cfd = cfh->cfd();
+
+  PinnableWideColumns* entity_buffer =
+      LazyWideColumnsHelper::EntityBuffer(result);
+
+  const SameFileBlobReader* same_file_reader = nullptr;
+  const Version* version = nullptr;
+
+  GetImplOptions get_impl_options;
+  get_impl_options.column_family = column_family;
+  get_impl_options.columns = entity_buffer;
+  get_impl_options.lazy_columns_version = &version;
+  get_impl_options.lazy_columns_same_file_reader = &same_file_reader;
+  // Read against the batch's shared SuperVersion + consistent sequence number
+  // (no per-key SuperVersion acquisition, no per-key pin).
+  get_impl_options.lazy_columns_shared_sv = super_version;
+  get_impl_options.lazy_columns_snapshot_seq = snapshot_seq;
+
+  Status s = GetImpl(read_options, key, get_impl_options);
+  if (!s.ok()) {
+    result->Reset();
+    return s;
+  }
+
+  s = LazyWideColumnsHelper::FinalizeInBatch(
+      result, key, version, read_options, cfd->blob_file_cache(),
+      /*allow_write_path_fallback=*/cfd->blob_partition_manager() != nullptr,
+      same_file_reader);
+  if (!s.ok()) {
+    result->Reset();
+  }
+  return s;
+}
+
 Status DBImpl::GetEntityLazy(const ReadOptions& _read_options,
                              ColumnFamilyHandle* column_family,
                              const Slice& key, LazyWideColumns* result) {
@@ -2988,6 +3029,25 @@ void DBImpl::MultiGetEntityLazy(const ReadOptions& _read_options,
     return;
   }
 
+  // Validate the read timestamp against the column family up front -- before
+  // MultiCFSnapshot, whose collapsed-history check (FailIfReadCollapsedHistory)
+  // assumes a correctly-sized timestamp and would otherwise assert in debug (or
+  // read past a wrong-width timestamp buffer in release) when
+  // full_history_ts_low is set. Mirrors NewIterator; the per-key GetImpl below
+  // re-validates as defense in depth.
+  {
+    const Status ts_status =
+        _read_options.timestamp
+            ? FailIfTsMismatchCf(column_family, *(_read_options.timestamp))
+            : FailIfCfHasTs(column_family);
+    if (!ts_status.ok()) {
+      for (size_t i = 0; i < num_keys; ++i) {
+        statuses[i] = ts_status;
+      }
+      return;
+    }
+  }
+
   LazyWideColumnsHelper::InitBatch(result, num_keys);
 
   ReadOptions read_options(_read_options);
@@ -2995,40 +3055,56 @@ void DBImpl::MultiGetEntityLazy(const ReadOptions& _read_options,
     read_options.io_activity = Env::IOActivity::kMultiGetEntity;
   }
 
-  // The current phase implements MultiGetEntityLazy as a loop of single-key
-  // lazy lookups. Each iteration acquires (and hands back to the result) its
-  // own SuperVersion reference, and each single-key lookup independently
-  // derives its read sequence number. To still present one consistent
-  // point-in-time view across all keys (as MultiGet guarantees), pin an
-  // explicit snapshot for the duration of the loop when the caller did not
-  // supply one: it fixes the read sequence number for every key and prevents
-  // compaction from dropping a version some later key still needs to observe.
-  //
-  // TODO(lazy-blob-resolution-phase3): replace this loop with a genuinely
-  // batched read that acquires a single SuperVersion and one consistent
-  // (implicit) sequence number for the whole batch -- the mechanism batched
-  // MultiGet already uses -- and holds one shared pin per column family instead
-  // of one per key. That removes the need for an explicit snapshot here (which
-  // takes the DB mutex and adds a snapshot list entry) and enables
-  // coalescing/parallelizing the per-key work.
-  const Snapshot* snapshot = read_options.snapshot;
-  const bool own_snapshot = snapshot == nullptr;
-  if (own_snapshot) {
-    snapshot = GetSnapshot();
-    read_options.snapshot = snapshot;
+  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+  auto cfd = cfh->cfd();
+
+  // Acquire ONE SuperVersion + one consistent (implicit) sequence number for
+  // the whole batch (single column family), retaining the SuperVersion
+  // reference (extra_sv_ref) so it can be transferred into the batch as a
+  // single shared pin -- exactly as multi-CF iterators do (NewIterators). This
+  // replaces the former per-key SuperVersion + explicit-snapshot loop:
+  // MultiCFSnapshot fixes one read sequence number for every key (falling back
+  // to the DB mutex only if a flush races) without adding a snapshot-list
+  // entry, and every key reads from the same Version so cross-key blob
+  // resolution coalesces maximally.
+  std::array<ColumnFamilySuperVersionPair, 1> cf_sv_pairs{};
+  cf_sv_pairs[0] = ColumnFamilySuperVersionPair(column_family, nullptr);
+  SequenceNumber consistent_seqnum = kMaxSequenceNumber;
+  bool sv_from_thread_local = false;
+  Status s = MultiCFSnapshot<std::array<ColumnFamilySuperVersionPair, 1>>(
+      read_options, /*callback=*/nullptr,
+      [](std::array<ColumnFamilySuperVersionPair, 1>::iterator& cf_iter) {
+        return &(*cf_iter);
+      },
+      &cf_sv_pairs,
+      /*extra_sv_ref=*/true, &consistent_seqnum, &sv_from_thread_local);
+  if (!s.ok()) {
+    for (size_t i = 0; i < num_keys; ++i) {
+      statuses[i] = s;
+    }
+    return;
   }
+  (void)sv_from_thread_local;  // extra_sv_ref: always an independent reference
+
+  SuperVersion* const sv = cf_sv_pairs[0].super_version;
 
   for (size_t i = 0; i < num_keys; ++i) {
     statuses[i] =
-        GetEntityLazyImpl(read_options, column_family, keys[i], &(*result)[i]);
+        GetEntityLazyForBatch(read_options, column_family, sv,
+                              consistent_seqnum, keys[i], &(*result)[i]);
   }
+
+  // Transfer one shared SuperVersion pin into the batch (keyed by column
+  // family), then release the call-scoped reference acquired above. Because
+  // extra_sv_ref requested an independent reference, it is released via
+  // CleanupSuperVersion (not the thread-local return path).
+  TransferSuperVersionPin(
+      sv, LazyWideColumnsHelper::BatchCfPin(result, cfd->GetID()));
+  CleanupSuperVersion(sv);
+
   // Link the populated entities back to the batch so batch reads can validate
   // column ownership.
   LazyWideColumnsHelper::FinalizeBatch(result);
-
-  if (own_snapshot) {
-    ReleaseSnapshot(snapshot);
-  }
 }
 
 bool DBImpl::ShouldReferenceSuperVersion(const MergeContext& merge_context) {
@@ -4692,87 +4768,155 @@ Status DBImpl::NewIterators(
     const ReadOptions& _read_options,
     const std::vector<ColumnFamilyHandle*>& column_families,
     std::vector<Iterator*>* iterators) {
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
-      _read_options.io_activity != Env::IOActivity::kDBIterator) {
+  if (column_families.empty()) {
+    if (_read_options.io_activity != Env::IOActivity::kUnknown &&
+        _read_options.io_activity != Env::IOActivity::kDBIterator) {
+      return Status::InvalidArgument(
+          "Can only call NewIterators with `ReadOptions::io_activity` is "
+          "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
+    }
+    if (_read_options.read_tier == kPersistedTier) {
+      return Status::NotSupported(
+          "ReadTier::kPersistedData is not yet supported in iterators.");
+    }
+  }
+  return NewIterators(
+      std::vector<ReadOptions>(column_families.size(), _read_options),
+      column_families, iterators);
+}
+
+Status DBImpl::NewIterators(
+    const std::vector<ReadOptions>& read_options,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<Iterator*>* iterators) {
+  if (read_options.size() != column_families.size()) {
     return Status::InvalidArgument(
-        "Can only call NewIterators with `ReadOptions::io_activity` is "
-        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
+        "read_options and column_families must have the same size");
   }
-  ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
-    read_options.io_activity = Env::IOActivity::kDBIterator;
-  }
-  if (read_options.read_tier == kPersistedTier) {
-    return Status::NotSupported(
-        "ReadTier::kPersistedData is not yet supported in iterators.");
+  if (iterators == nullptr) {
+    return Status::InvalidArgument("iterators not allowed to be nullptr");
   }
 
+  if (column_families.empty()) {
+    iterators->clear();
+    return Status::OK();
+  }
+
+  const Snapshot* const snapshot = read_options.front().snapshot;
+  const bool tailing = read_options.front().tailing;
+  std::vector<ReadOptions> normalized_read_options;
+  normalized_read_options.reserve(read_options.size());
   autovector<ColumnFamilySuperVersionPair, MultiGetContext::MAX_BATCH_SIZE>
       cf_sv_pairs;
 
-  Status s;
-  for (auto* cf : column_families) {
+  for (size_t i = 0; i < read_options.size(); ++i) {
+    const ReadOptions& options = read_options[i];
+    if (options.io_activity != Env::IOActivity::kUnknown &&
+        options.io_activity != Env::IOActivity::kDBIterator) {
+      return Status::InvalidArgument(
+          "Can only call NewIterators with `ReadOptions::io_activity` is "
+          "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
+    }
+    if (options.read_tier == kPersistedTier) {
+      return Status::NotSupported(
+          "ReadTier::kPersistedData is not yet supported in iterators.");
+    }
+    if (options.snapshot != snapshot) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same snapshot");
+    }
+    if (options.tailing != tailing) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same tailing setting");
+    }
+
+    auto* cf = column_families[i];
     assert(cf);
-    if (read_options.timestamp) {
-      s = FailIfTsMismatchCf(cf, *(read_options.timestamp));
+    Status s;
+    if (options.timestamp) {
+      s = FailIfTsMismatchCf(cf, *(options.timestamp));
     } else {
       s = FailIfCfHasTs(cf);
     }
     if (!s.ok()) {
       return s;
     }
+
+    normalized_read_options.emplace_back(options);
+    if (normalized_read_options.back().io_activity ==
+        Env::IOActivity::kUnknown) {
+      normalized_read_options.back().io_activity = Env::IOActivity::kDBIterator;
+    }
     cf_sv_pairs.emplace_back(cf, nullptr);
   }
+
   iterators->clear();
   iterators->reserve(column_families.size());
 
+  ReadOptions snapshot_options(normalized_read_options.front());
+  snapshot_options.timestamp = nullptr;
   SequenceNumber consistent_seqnum = kMaxSequenceNumber;
   bool sv_from_thread_local = false;
-  s = MultiCFSnapshot<autovector<ColumnFamilySuperVersionPair,
-                                 MultiGetContext::MAX_BATCH_SIZE>>(
-      read_options, nullptr /* read_callback*/,
+  Status s = MultiCFSnapshot<autovector<ColumnFamilySuperVersionPair,
+                                        MultiGetContext::MAX_BATCH_SIZE>>(
+      snapshot_options, nullptr /* read_callback */,
       [](autovector<ColumnFamilySuperVersionPair,
                     MultiGetContext::MAX_BATCH_SIZE>::iterator& cf_iter) {
         return &(*cf_iter);
       },
-      &cf_sv_pairs,
-      /* extra_sv_ref */ true, &consistent_seqnum, &sv_from_thread_local);
+      &cf_sv_pairs, /* extra_sv_ref */ true, &consistent_seqnum,
+      &sv_from_thread_local);
   if (!s.ok()) {
     return s;
   }
 
-  assert(cf_sv_pairs.size() == column_families.size());
-  for (const auto& cf_sv_pair : cf_sv_pairs) {
-    s = FailIfTableFilterWithRangeConversion(
-        read_options, cf_sv_pair.super_version->mutable_cf_options);
-    if (!s.ok()) {
-      for (const auto& cleanup_pair : cf_sv_pairs) {
-        CleanupSuperVersion(cleanup_pair.super_version);
+  const auto cleanup_super_versions = [&]() {
+    for (const auto& cf_sv_pair : cf_sv_pairs) {
+      CleanupSuperVersion(cf_sv_pair.super_version);
+    }
+  };
+  assert(cf_sv_pairs.size() == normalized_read_options.size());
+  for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {
+    const auto& options = normalized_read_options[i];
+    const auto& cf_sv_pair = cf_sv_pairs[i];
+    if (options.timestamp && !options.timestamp->empty()) {
+      s = FailIfReadCollapsedHistory(cf_sv_pair.cfd, cf_sv_pair.super_version,
+                                     *(options.timestamp));
+      if (!s.ok()) {
+        cleanup_super_versions();
+        return s;
       }
+    }
+    s = FailIfTableFilterWithRangeConversion(
+        options, cf_sv_pair.super_version->mutable_cf_options);
+    if (!s.ok()) {
+      cleanup_super_versions();
       return s;
     }
   }
-  if (read_options.tailing) {
-    read_options.total_order_seek |=
-        immutable_db_options_.prefix_seek_opt_in_only;
 
-    for (const auto& cf_sv_pair : cf_sv_pairs) {
-      auto iter = new ForwardIterator(this, read_options, cf_sv_pair.cfd,
-                                      cf_sv_pair.super_version,
-                                      /* allow_unprepared_value */ true);
+  if (tailing) {
+    for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {
+      ReadOptions options(normalized_read_options[i]);
+      options.total_order_seek |= immutable_db_options_.prefix_seek_opt_in_only;
+      const auto& cf_sv_pair = cf_sv_pairs[i];
+      auto* iter = new ForwardIterator(this, options, cf_sv_pair.cfd,
+                                       cf_sv_pair.super_version,
+                                       /* allow_unprepared_value */ true);
       iterators->push_back(DBIter::NewIter(
-          env_, read_options, cf_sv_pair.cfd->ioptions(),
+          env_, options, cf_sv_pair.cfd->ioptions(),
           cf_sv_pair.super_version->mutable_cf_options,
           cf_sv_pair.cfd->user_comparator(), iter,
           cf_sv_pair.super_version->current, kMaxSequenceNumber,
-          nullptr /*read_callback*/, /*active_mem=*/nullptr, cf_sv_pair.cfh,
-          /*expose_blob_index=*/false, /*arena=*/nullptr));
+          nullptr /* read_callback */, /* active_mem */ nullptr, cf_sv_pair.cfh,
+          /* expose_blob_index */ false, /* arena */ nullptr));
     }
   } else {
-    for (const auto& cf_sv_pair : cf_sv_pairs) {
+    for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {
+      const auto& cf_sv_pair = cf_sv_pairs[i];
       iterators->push_back(NewIteratorImpl(
-          read_options, cf_sv_pair.cfh, cf_sv_pair.super_version,
-          consistent_seqnum, nullptr /*read_callback*/));
+          normalized_read_options[i], cf_sv_pair.cfh, cf_sv_pair.super_version,
+          consistent_seqnum, nullptr /* read_callback */));
     }
   }
   return Status::OK();

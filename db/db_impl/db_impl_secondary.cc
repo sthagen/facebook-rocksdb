@@ -622,8 +622,9 @@ ArenaWrappedDBIter* DBImplSecondary::NewIteratorImpl(
     SuperVersion* super_version, SequenceNumber snapshot,
     ReadCallback* read_callback, bool expose_blob_index, bool allow_refresh) {
   assert(nullptr != cfh);
-  assert(snapshot == kMaxSequenceNumber);
-  snapshot = versions_->LastSequence();
+  if (snapshot == kMaxSequenceNumber) {
+    snapshot = versions_->LastSequence();
+  }
   assert(snapshot != kMaxSequenceNumber);
   return NewArenaWrappedDbIterator(env_, read_options, cfh, super_version,
                                    snapshot, read_callback, this,
@@ -635,76 +636,143 @@ Status DBImplSecondary::NewIterators(
     const ReadOptions& _read_options,
     const std::vector<ColumnFamilyHandle*>& column_families,
     std::vector<Iterator*>* iterators) {
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
-      _read_options.io_activity != Env::IOActivity::kDBIterator) {
+  if (column_families.empty()) {
+    if (_read_options.io_activity != Env::IOActivity::kUnknown &&
+        _read_options.io_activity != Env::IOActivity::kDBIterator) {
+      return Status::InvalidArgument(
+          "Can only call NewIterators with `ReadOptions::io_activity` is "
+          "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
+    }
+    if (_read_options.read_tier == kPersistedTier) {
+      return Status::NotSupported(
+          "ReadTier::kPersistedData is not yet supported in iterators.");
+    }
+    if (_read_options.tailing) {
+      return Status::NotSupported(
+          "tailing iterator not supported in secondary mode");
+    }
+    if (_read_options.snapshot != nullptr) {
+      return Status::NotSupported("snapshot not supported in secondary mode");
+    }
+  }
+  return NewIteratorsImpl(
+      std::vector<ReadOptions>(column_families.size(), _read_options),
+      column_families, iterators);
+}
+
+Status DBImplSecondary::NewIterators(
+    const std::vector<ReadOptions>& read_options,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<Iterator*>* iterators) {
+  return NewIteratorsImpl(read_options, column_families, iterators);
+}
+
+Status DBImplSecondary::NewIteratorsImpl(
+    const std::vector<ReadOptions>& read_options,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<Iterator*>* iterators) {
+  if (read_options.size() != column_families.size()) {
     return Status::InvalidArgument(
-        "Can only call NewIterators with `ReadOptions::io_activity` is "
-        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
+        "read_options and column_families must have the same size");
   }
-  ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
-    read_options.io_activity = Env::IOActivity::kDBIterator;
-  }
-  if (read_options.read_tier == kPersistedTier) {
-    return Status::NotSupported(
-        "ReadTier::kPersistedData is not yet supported in iterators.");
-  }
-  ReadCallback* read_callback = nullptr;  // No read callback provided.
   if (iterators == nullptr) {
     return Status::InvalidArgument("iterators not allowed to be nullptr");
   }
 
-  if (read_options.timestamp) {
-    for (auto* cf : column_families) {
-      assert(cf);
-      const Status s = FailIfTsMismatchCf(cf, *(read_options.timestamp));
-      if (!s.ok()) {
-        return s;
-      }
+  if (column_families.empty()) {
+    iterators->clear();
+    return Status::OK();
+  }
+
+  const Snapshot* const snapshot = read_options.front().snapshot;
+  const bool tailing = read_options.front().tailing;
+  std::vector<ReadOptions> normalized_read_options;
+  normalized_read_options.reserve(read_options.size());
+  for (size_t i = 0; i < read_options.size(); ++i) {
+    const ReadOptions& options = read_options[i];
+    if (options.io_activity != Env::IOActivity::kUnknown &&
+        options.io_activity != Env::IOActivity::kDBIterator) {
+      return Status::InvalidArgument(
+          "Can only call NewIterators with `ReadOptions::io_activity` is "
+          "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
     }
-  } else {
+    if (options.read_tier == kPersistedTier) {
+      return Status::NotSupported(
+          "ReadTier::kPersistedData is not yet supported in iterators.");
+    }
+    if (options.snapshot != snapshot) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same snapshot");
+    }
+    if (options.tailing != tailing) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same tailing setting");
+    }
+    if (options.tailing) {
+      return Status::NotSupported(
+          "tailing iterator not supported in secondary mode");
+    }
+    if (options.snapshot != nullptr) {
+      return Status::NotSupported("snapshot not supported in secondary mode");
+    }
+
+    auto* cf = column_families[i];
+    assert(cf);
+    Status s;
+    if (options.timestamp) {
+      s = FailIfTsMismatchCf(cf, *(options.timestamp));
+    } else {
+      s = FailIfCfHasTs(cf);
+    }
+    if (!s.ok()) {
+      return s;
+    }
+
+    normalized_read_options.emplace_back(options);
+    if (normalized_read_options.back().io_activity ==
+        Env::IOActivity::kUnknown) {
+      normalized_read_options.back().io_activity = Env::IOActivity::kDBIterator;
+    }
+  }
+
+  iterators->clear();
+  iterators->reserve(column_families.size());
+
+  SequenceNumber read_seq;
+  autovector<ColumnFamilySuperVersionPair, MultiGetContext::MAX_BATCH_SIZE>
+      cf_sv_pairs;
+  {
+    InstrumentedMutexLock lock_guard(&mutex_);
+    read_seq = versions_->LastSequence();
     for (auto* cf : column_families) {
-      assert(cf);
-      const Status s = FailIfCfHasTs(cf);
+      auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(cf);
+      cf_sv_pairs.emplace_back(cfh, cfh->cfd()->GetSuperVersion()->Ref());
+    }
+  }
+
+  const auto cleanup_super_versions = [&]() {
+    for (const auto& cf_sv_pair : cf_sv_pairs) {
+      CleanupSuperVersion(cf_sv_pair.super_version);
+    }
+  };
+  for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {
+    const auto& cf_sv_pair = cf_sv_pairs[i];
+    const ReadOptions& options = normalized_read_options[i];
+    if (options.timestamp && !options.timestamp->empty()) {
+      const Status s = FailIfReadCollapsedHistory(
+          cf_sv_pair.cfd, cf_sv_pair.super_version, *(options.timestamp));
       if (!s.ok()) {
+        cleanup_super_versions();
         return s;
       }
     }
   }
-  iterators->clear();
-  iterators->reserve(column_families.size());
-  if (read_options.tailing) {
-    return Status::NotSupported(
-        "tailing iterator not supported in secondary mode");
-  } else if (read_options.snapshot != nullptr) {
-    // TODO (yanqin) support snapshot.
-    return Status::NotSupported("snapshot not supported in secondary mode");
-  } else {
-    SequenceNumber read_seq(kMaxSequenceNumber);
-    autovector<std::tuple<ColumnFamilyHandleImpl*, SuperVersion*>> cfh_to_sv;
-    const bool check_read_ts =
-        read_options.timestamp && read_options.timestamp->size() > 0;
-    for (auto cf : column_families) {
-      auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(cf);
-      auto cfd = cfh->cfd();
-      SuperVersion* sv = cfd->GetReferencedSuperVersion(this);
-      cfh_to_sv.emplace_back(cfh, sv);
-      if (check_read_ts) {
-        const Status s =
-            FailIfReadCollapsedHistory(cfd, sv, *(read_options.timestamp));
-        if (!s.ok()) {
-          for (auto prev_entry : cfh_to_sv) {
-            CleanupSuperVersion(std::get<1>(prev_entry));
-          }
-          return s;
-        }
-      }
-    }
-    assert(cfh_to_sv.size() == column_families.size());
-    for (auto [cfh, sv] : cfh_to_sv) {
-      iterators->push_back(
-          NewIteratorImpl(read_options, cfh, sv, read_seq, read_callback));
-    }
+  for (size_t i = 0; i < cf_sv_pairs.size(); ++i) {
+    const auto& cf_sv_pair = cf_sv_pairs[i];
+    iterators->push_back(NewIteratorImpl(
+        normalized_read_options[i], cf_sv_pair.cfh, cf_sv_pair.super_version,
+        read_seq, nullptr /* read_callback */));
+    TEST_SYNC_POINT("DBImplSecondary::NewIterators:AfterCreateIterator");
   }
   return Status::OK();
 }

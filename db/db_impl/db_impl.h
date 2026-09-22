@@ -438,6 +438,9 @@ class DBImpl : public DB
   Status NewIterators(const ReadOptions& _read_options,
                       const std::vector<ColumnFamilyHandle*>& column_families,
                       std::vector<Iterator*>* iterators) override;
+  Status NewIterators(const std::vector<ReadOptions>& read_options,
+                      const std::vector<ColumnFamilyHandle*>& column_families,
+                      std::vector<Iterator*>* iterators) override;
 
   using DB::NewMultiScan;
   std::unique_ptr<MultiScan> NewMultiScan(
@@ -815,6 +818,18 @@ class DBImpl : public DB
     Cleanable* lazy_columns_pin = nullptr;
     const Version** lazy_columns_version = nullptr;
     const SameFileBlobReader** lazy_columns_same_file_reader = nullptr;
+
+    // Batched lazy read (MultiGetEntityLazy). When `lazy_columns_shared_sv` is
+    // non-null, GetImpl reads against this externally-owned SuperVersion at
+    // `lazy_columns_snapshot_seq` (the consistent per-batch sequence number)
+    // instead of acquiring its own SuperVersion and deriving its own sequence
+    // number, and it does NOT transfer a per-key pin -- the batch holds one
+    // shared SuperVersion pin per column family. `lazy_columns_pin` must then
+    // be null; `lazy_columns_version` / `lazy_columns_same_file_reader` are
+    // still filled. (Single-key GetEntityLazy leaves this null and uses
+    // `lazy_columns_pin`.)
+    SuperVersion* lazy_columns_shared_sv = nullptr;
+    SequenceNumber lazy_columns_snapshot_seq = kMaxSequenceNumber;
   };
 
   DECLARE_SYNC_AND_ASYNC(Status, GetImpl, const ReadOptions& read_options,
@@ -851,6 +866,18 @@ class DBImpl : public DB
   Status GetEntityLazyImpl(const ReadOptions& read_options,
                            ColumnFamilyHandle* column_family, const Slice& key,
                            LazyWideColumns* result);
+
+  // Batched-read counterpart of GetEntityLazyImpl for one key of
+  // MultiGetEntityLazy: performs the lazy point lookup against the batch's
+  // shared `super_version` at the batch's consistent `snapshot_seq` (rather
+  // than acquiring its own), and binds the entity's resolver to that Version
+  // without taking a per-key pin (the batch owns one shared pin per column
+  // family).
+  Status GetEntityLazyForBatch(const ReadOptions& read_options,
+                               ColumnFamilyHandle* column_family,
+                               SuperVersion* super_version,
+                               SequenceNumber snapshot_seq, const Slice& key,
+                               LazyWideColumns* result);
 
   // If `snapshot` == kMaxSequenceNumber, set a recent one inside the file.
   ArenaWrappedDBIter* NewIteratorImpl(const ReadOptions& options,

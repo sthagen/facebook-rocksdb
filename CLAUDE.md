@@ -59,6 +59,8 @@ Specifically:
 
 **Backwards Compatibility:** RocksDB maintains strong backwards compatibility guarantees. Breaking changes are rare and require extensive justification. When deprecating features, follow the project's deprecation policy (typically spanning multiple releases).
 
+**Behavioral Compatibility:** Behavior changes are human judgment calls that must be intentional, well-documented (including release notes), and well researched for potential downstream production impact. Agents and reviewers must call out potential gaps, ambiguity, or adverse impacts in intentionality, documentation, and production impact. For an existing accepted input—including an undocumented, discouraged, or historically ignored value—the analysis should compare old and new observable behavior, including performance and resource impact, identify known direct callers and stored configurations, and add or update regression coverage as appropriate.
+
 **API Consistency:** New APIs should be consistent with existing patterns. Use similar naming conventions, parameter ordering, and return types. Reviewers will suggest changes to improve consistency with the broader codebase.
 
 **Documentation:** Public APIs must be thoroughly documented, without unnecessary embelishment nor dwelling on implementation details nor project planning. When non-obvious, include usage examples, parameter descriptions, known bugs or limitations, notes on thread safety, performance characteristics, and compatibility considerations. Re-read comments for ambiguous terminology and phrasing, such as ambiguously re-purposed programming jargon.
@@ -372,6 +374,9 @@ rather than relying on libstdc++ transitive includes.
 ### Adding new public API
     Refer to claude_md/add_public_api.md
 
+### Changing existing public API behavior
+    Follow the Behavioral Compatibility requirements above.
+
 ### Adding new option
     Refer to claude_md/add_option.md
 
@@ -401,7 +406,7 @@ rather than relying on libstdc++ transitive includes.
 * Release note should be kept short at high level for external user consumption.
     Release notes identify what users might care about most in a release. They
     are not exhaustive and are not a guide. PLEASE learn from past agents who
-    ried to build elaborate release notes with implementation details and
+    tried to build elaborate release notes with implementation details and
     elsewhere-documented nuance. That wastes time. Fight the bias that
     "my change" is important so must be worthy of release note mention.
 * If more than single markdown line, consider how their formatting will be
