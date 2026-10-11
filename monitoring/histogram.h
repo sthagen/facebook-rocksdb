@@ -109,7 +109,7 @@ class Histogram {
 
 class HistogramImpl : public Histogram {
  public:
-  HistogramImpl() { Clear(); }
+  HistogramImpl() { HistogramImpl::Clear(); }
 
   HistogramImpl(const HistogramImpl&) = delete;
   HistogramImpl& operator=(const HistogramImpl&) = delete;
@@ -131,7 +131,7 @@ class HistogramImpl : public Histogram {
   double StandardDeviation() const override;
   void Data(HistogramData* const data) const override;
 
-  virtual ~HistogramImpl() {}
+  ~HistogramImpl() override {}
 
   inline HistogramStat& TEST_GetStats() { return stats_; }
 

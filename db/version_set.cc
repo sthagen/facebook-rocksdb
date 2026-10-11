@@ -1215,7 +1215,7 @@ class LevelIterator final : public InternalIterator {
   void SeekForPrev(const Slice& target) override;
   void SeekToFirst() override;
   void SeekToLast() override;
-  void Next() final override;
+  void Next() final;
   bool NextAndGetResult(IterateResult* result) override;
   void Prev() override;
 
@@ -2214,7 +2214,7 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
           file->largest.user_key().ToString(),
           file->stats.num_reads_sampled.load(std::memory_order_relaxed),
           file->being_compacted, file->temperature,
-          file->oldest_blob_file_number, file->TryGetOldestAncesterTime(),
+          file->oldest_blob_file_number, file->TryGetOldestAncestorTime(),
           file->TryGetFileCreationTime(), file->epoch_number,
           file->file_checksum, file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
@@ -2296,7 +2296,7 @@ void Version::GetColumnFamilyMetaData(
           file->largest.user_key().ToString(),
           file->stats.num_reads_sampled.load(std::memory_order_relaxed),
           file->being_compacted, file->temperature,
-          file->oldest_blob_file_number, file->TryGetOldestAncesterTime(),
+          file->oldest_blob_file_number, file->TryGetOldestAncestorTime(),
           file->TryGetFileCreationTime(), file->epoch_number,
           file->file_checksum, file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
@@ -2804,8 +2804,11 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
 
   assert(blob_source_);
   value->Reset();
+  const BlobFileOpenInfo blob_file{blob_file_number,
+                                   blob_file_meta->GetChecksumValue(),
+                                   blob_file_meta->GetChecksumMethod()};
   const Status s = blob_source_->GetBlob(
-      read_options, user_key, blob_file_number, blob_index.offset(),
+      read_options, user_key, blob_file, blob_index.offset(),
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
       blob_index.compression(), prefetch_buffer, value, bytes_read);
 
@@ -2840,8 +2843,11 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
 
   assert(blob_source_);
   value->Reset();
+  const BlobFileOpenInfo blob_file{blob_file_number,
+                                   blob_file_meta->GetChecksumValue(),
+                                   blob_file_meta->GetChecksumMethod()};
   return blob_source_->GetBlobRange(
-      read_options, user_key, blob_file_number, blob_index.offset(),
+      read_options, user_key, blob_file, blob_index.offset(),
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
       blob_index.compression(), range_offset, range_length, value, bytes_read);
 }
@@ -2886,6 +2892,9 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
       continue;
     }
     const uint64_t file_size = blob_file_meta->GetBlobFileSize();
+    const BlobFileOpenInfo blob_file{file_number,
+                                     blob_file_meta->GetChecksumValue(),
+                                     blob_file_meta->GetChecksumMethod()};
 
     if (req.range_length == kWholeBlobLength) {
       // Append to this file's current batch, or start a new batch when the file
@@ -2903,7 +2912,7 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
       } else {
         idx = whole_reqs.size();  // no batch yet for this file, or it is full
         whole_idx[file_number] = idx;
-        whole_reqs.emplace_back(file_number, file_size,
+        whole_reqs.emplace_back(blob_file, file_size,
                                 autovector<BlobReadRequest>());
       }
       std::get<2>(whole_reqs[idx])
@@ -2926,7 +2935,7 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
       } else {
         idx = range_reqs.size();  // no batch yet for this file, or it is full
         range_idx[file_number] = idx;
-        range_reqs.emplace_back(file_number, file_size,
+        range_reqs.emplace_back(blob_file, file_size,
                                 autovector<BlobRangeReadRequest>());
       }
       std::get<2>(range_reqs[idx])
@@ -2995,7 +3004,10 @@ void Version::MultiGetBlob(
     }
     if (blob_reqs_in_file.size() > 0) {
       const auto file_size = blob_file_meta->GetBlobFileSize();
-      blob_reqs.emplace_back(file_number, file_size, blob_reqs_in_file);
+      const BlobFileOpenInfo blob_file{file_number,
+                                       blob_file_meta->GetChecksumValue(),
+                                       blob_file_meta->GetChecksumMethod()};
+      blob_reqs.emplace_back(blob_file, file_size, blob_reqs_in_file);
     }
   }
 
@@ -3570,9 +3582,9 @@ uint32_t GetExpiredTtlFilesCount(const ImmutableOptions& ioptions,
     const uint64_t current_time = static_cast<uint64_t>(_current_time);
     for (FileMetaData* f : files) {
       if (!f->being_compacted) {
-        uint64_t oldest_ancester_time = f->TryGetOldestAncesterTime();
-        if (oldest_ancester_time != 0 &&
-            oldest_ancester_time < (current_time - mutable_cf_options.ttl)) {
+        uint64_t oldest_ancestor_time = f->TryGetOldestAncestorTime();
+        if (oldest_ancestor_time != 0 &&
+            oldest_ancestor_time < (current_time - mutable_cf_options.ttl)) {
           ttl_expired_files_count++;
         }
       }
@@ -3901,9 +3913,9 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
   for (int level = 0; level < num_levels() - 1; level++) {
     for (FileMetaData* f : files_[level]) {
       if (!f->being_compacted) {
-        uint64_t oldest_ancester_time = f->TryGetOldestAncesterTime();
-        if (oldest_ancester_time > 0 &&
-            oldest_ancester_time < (current_time - ttl)) {
+        uint64_t oldest_ancestor_time = f->TryGetOldestAncestorTime();
+        if (oldest_ancestor_time > 0 &&
+            oldest_ancestor_time < (current_time - ttl)) {
           expired_ttl_files_.emplace_back(level, f);
         }
       }
@@ -3954,15 +3966,15 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
       if (!f->being_compacted) {
         // Compute a file's modification time in the following order:
         // 1. Use file_creation_time table property if it is > 0.
-        // 2. Use creation_time table property if it is > 0.
+        // 2. Use oldest_ancestor_time table property if it is > 0.
         // 3. Use file's mtime metadata if the above two table properties are 0.
         // Don't consider the file at all if the modification time cannot be
         // correctly determined based on the above conditions.
         uint64_t file_modification_time = f->TryGetFileCreationTime();
         if (file_modification_time == kUnknownFileCreationTime) {
-          file_modification_time = f->TryGetOldestAncesterTime();
+          file_modification_time = f->TryGetOldestAncestorTime();
         }
-        if (file_modification_time == kUnknownOldestAncesterTime) {
+        if (file_modification_time == kUnknownOldestAncestorTime) {
           auto file_path = TableFileName(ioptions.cf_paths, f->fd.GetNumber(),
                                          f->fd.GetPathId());
           status = ioptions.env->GetFileModificationTime(
@@ -5693,6 +5705,13 @@ void VersionSet::Reset() {
   if (column_family_set_) {
     WriteBufferManager* wbm = column_family_set_->write_buffer_manager();
     WriteController* wc = column_family_set_->write_controller();
+    FlushInitiator* flush_initiator = column_family_set_->flush_initiator();
+    const bool fast_sst_open = column_family_set_->GetFastSstOpen();
+
+    // Destruction removes column families one at a time. Detach the accounting
+    // target first so each removal does not rescan all remaining column
+    // families while falling back to another MANIFEST.
+    column_family_set_->SetFlushInitiator(nullptr);
 
     // Clear TableCache to prevent use-after-free: Reset() deletes old
     // ColumnFamilySet but reuses table_cache_, which may contain
@@ -5706,10 +5725,11 @@ void VersionSet::Reset() {
     // https://github.com/facebook/rocksdb/blob/v7.3.1/db/db_impl/db_impl_open.cc#L527
     // Note: we may not be able to recover db_id from MANIFEST if
     // options.write_dbid_to_manifest is false (default).
-    column_family_set_.reset(new ColumnFamilySet(
-        dbname_, db_options_, file_options_, table_cache_, wbm, wc,
-        block_cache_tracer_, io_tracer_, db_id_, db_session_id_,
-        column_family_set_->GetFastSstOpen()));
+    column_family_set_.reset(
+        new ColumnFamilySet(dbname_, db_options_, file_options_, table_cache_,
+                            wbm, wc, block_cache_tracer_, io_tracer_, db_id_,
+                            db_session_id_, fast_sst_open));
+    column_family_set_->SetFlushInitiator(flush_initiator);
   }
   db_id_.clear();
   next_file_number_.store(2);
@@ -5860,6 +5880,39 @@ Status VersionSet::ProcessManifestWrites(
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
 
+  // Takes this batch, from the queue head through `last_writer`, off
+  // manifest_writers_: records `s` on each writer, runs its callback, and wakes
+  // writers other threads wait on, then the next batch's leader. Every return
+  // path must do this, because the writers in `writers` live on the caller's
+  // stack and a queued pointer to one would outlive them.
+  auto finish_batch = [&](const Status& s) {
+    while (true) {
+      ManifestWriter* ready = manifest_writers_.front();
+      manifest_writers_.pop_front();
+      bool need_signal = true;
+      for (const auto& w : writers) {
+        if (&w == ready) {
+          need_signal = false;
+          break;
+        }
+      }
+      ready->status = s;
+      ready->done = true;
+      if (ready->manifest_write_callback) {
+        (ready->manifest_write_callback)(s);
+      }
+      if (need_signal) {
+        ready->cv.Signal();
+      }
+      if (ready == last_writer) {
+        break;
+      }
+    }
+    if (!manifest_writers_.empty()) {
+      manifest_writers_.front()->cv.Signal();
+    }
+  };
+
   // Supports opening table readers with multiple threads, mostly useful for
   // batched external sst file ingestion.
   int batch_max_file_opening_threads = 1;
@@ -5897,6 +5950,7 @@ Status VersionSet::ProcessManifestWrites(
   } else {
     auto it = manifest_writers_.cbegin();
     size_t group_start = std::numeric_limits<size_t>::max();
+    Status batch_apply_status;
     for (;;) {
       assert(!(*it)->edit_list.front()->IsColumnFamilyManipulation());
       last_writer = *it;
@@ -5905,7 +5959,12 @@ Status VersionSet::ProcessManifestWrites(
                    last_writer->max_file_opening_threads);
       assert(last_writer != nullptr);
       assert(last_writer->cfd != nullptr);
-      if (last_writer->cfd->IsDropped()) {
+      if (!batch_apply_status.ok()) {
+        // An earlier edit failed, so apply no more edits, but keep grouping
+        // until the loop conditions below end the batch as usual. LogAndApply()
+        // returns once a caller's first writer is done, so none of its writers
+        // may be left queued.
+      } else if (last_writer->cfd->IsDropped()) {
         // If we detect a dropped CF at this point, and the corresponding
         // version edits belong to an atomic group, then we need to find out
         // the preceding version edits in the same atomic group, and update
@@ -5921,10 +5980,10 @@ Status VersionSet::ProcessManifestWrites(
             size_t k = 0;
             while (k < edit_list.size()) {
               if (!edit_list[k]->IsInAtomicGroup()) {
-                break;
+                break;  // inner while-`k` loop
               } else if (edit_list[k]->GetRemainingEntries() == 0) {
                 ++k;
-                break;
+                break;  // inner while-`k` loop
               }
               ++k;
             }
@@ -5951,7 +6010,7 @@ Status VersionSet::ProcessManifestWrites(
             builder = builder_guards[i]->version_builder();
             TEST_SYNC_POINT_CALLBACK(
                 "VersionSet::ProcessManifestWrites:SameColumnFamily", &cf_id);
-            break;
+            break;  // inner for-`i` loop
           }
         }
         if (version == nullptr) {
@@ -5985,15 +6044,10 @@ Status VersionSet::ProcessManifestWrites(
           } else if (group_start != std::numeric_limits<size_t>::max()) {
             group_start = std::numeric_limits<size_t>::max();
           }
-          Status s = LogAndApplyHelper(last_writer->cfd, builder, e,
-                                       &max_last_sequence, mu);
-          if (!s.ok()) {
-            // free up the allocated memory
-            for (auto v : versions) {
-              delete v;
-            }
-            // FIXME? manifest_writers_ still has requested updates
-            return s;
+          batch_apply_status = LogAndApplyHelper(last_writer->cfd, builder, e,
+                                                 &max_last_sequence, mu);
+          if (!batch_apply_status.ok()) {
+            break;  // inner for-`e` loop
           }
           batch_edits.push_back(e);
           batch_edits_ts_sz.push_back(edit_ts_sz);
@@ -6016,6 +6070,13 @@ Status VersionSet::ProcessManifestWrites(
         break;
       }
     }
+    if (!batch_apply_status.ok()) {
+      for (auto v : versions) {
+        delete v;
+      }
+      finish_batch(batch_apply_status);
+      return batch_apply_status;
+    }
     for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
       assert(!builder_guards.empty() &&
              builder_guards.size() == versions.size());
@@ -6026,7 +6087,7 @@ Status VersionSet::ProcessManifestWrites(
         for (auto v : versions) {
           delete v;
         }
-        // FIXME? manifest_writers_ still has requested updates
+        finish_batch(s);
         return s;
       }
     }
@@ -6481,32 +6542,7 @@ Status VersionSet::ProcessManifestWrites(
   }
 #endif  // NDEBUG
 
-  // wake up all the waiting writers
-  while (true) {
-    ManifestWriter* ready = manifest_writers_.front();
-    manifest_writers_.pop_front();
-    bool need_signal = true;
-    for (const auto& w : writers) {
-      if (&w == ready) {
-        need_signal = false;
-        break;
-      }
-    }
-    ready->status = s;
-    ready->done = true;
-    if (ready->manifest_write_callback) {
-      (ready->manifest_write_callback)(s);
-    }
-    if (need_signal) {
-      ready->cv.Signal();
-    }
-    if (ready == last_writer) {
-      break;
-    }
-  }
-  if (!manifest_writers_.empty()) {
-    manifest_writers_.front()->cv.Signal();
-  }
+  finish_batch(s);
   return s;
 }
 
@@ -7148,7 +7184,8 @@ Status VersionSet::TryRecoverFromOneManifest(
   VersionEditHandlerPointInTime handler_pit(
       read_only, column_families, const_cast<VersionSet*>(this), io_tracer_,
       read_options, /*allow_incomplete_valid_version=*/true,
-      /*trust_manifest_recovery=*/false, EpochNumberRequirement::kMightMissing);
+      /*trust_manifest_recovery=*/false,
+      /*defer_sst_file_opening=*/false, EpochNumberRequirement::kMightMissing);
 
   handler_pit.Iterate(reader, &s);
 
@@ -7585,7 +7622,7 @@ Status VersionSet::WriteCurrentStateToManifest(
                        f->fd.GetFileSize(), f->smallest, f->largest,
                        f->fd.smallest_seqno, f->fd.largest_seqno,
                        f->marked_for_compaction, f->temperature,
-                       f->oldest_blob_file_number, f->oldest_ancester_time,
+                       f->oldest_blob_file_number, f->oldest_ancestor_time,
                        f->file_creation_time, f->epoch_number, f->file_checksum,
                        f->file_checksum_func_name, f->unique_id,
                        f->compensated_range_deletion_size, f->tail_size,
@@ -8151,7 +8188,7 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.file_checksum = file->file_checksum;
         filemetadata.file_checksum_func_name = file->file_checksum_func_name;
         filemetadata.temperature = file->temperature;
-        filemetadata.oldest_ancester_time = file->TryGetOldestAncesterTime();
+        filemetadata.oldest_ancestor_time = file->TryGetOldestAncestorTime();
         filemetadata.file_creation_time = file->TryGetFileCreationTime();
         filemetadata.epoch_number = file->epoch_number;
         metadata->push_back(filemetadata);
@@ -8342,12 +8379,13 @@ ReactiveVersionSet::ReactiveVersionSet(
     const FileOptions& _file_options, Cache* table_cache,
     WriteBufferManager* write_buffer_manager, WriteController* write_controller,
     const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
-    const std::string& db_session_id)
+    const std::string& db_session_id, bool defer_sst_file_opening)
     : VersionSet(dbname, imm_db_options, mutable_db_options, _file_options,
                  table_cache, write_buffer_manager, write_controller,
                  /*block_cache_tracer=*/nullptr, io_tracer, db_id,
                  db_session_id, /*daily_offpeak_time_utc*/ "",
-                 /*error_handler=*/nullptr, /*unchanging=*/false) {}
+                 /*error_handler=*/nullptr, /*unchanging=*/false),
+      defer_sst_file_opening_(defer_sst_file_opening) {}
 
 ReactiveVersionSet::~ReactiveVersionSet() = default;
 
@@ -8371,10 +8409,10 @@ Status ReactiveVersionSet::Recover(
   log::Reader* reader = manifest_reader->get();
   assert(reader);
 
-  manifest_tailer_.reset(
-      new ManifestTailer(column_families, const_cast<ReactiveVersionSet*>(this),
-                         io_tracer_, read_options_, trust_manifest_recovery_,
-                         EpochNumberRequirement::kMightMissing));
+  manifest_tailer_.reset(new ManifestTailer(
+      column_families, const_cast<ReactiveVersionSet*>(this), io_tracer_,
+      read_options_, trust_manifest_recovery_, defer_sst_file_opening_,
+      EpochNumberRequirement::kMightMissing));
 
   manifest_tailer_->Iterate(*reader, manifest_reader_status->get());
 

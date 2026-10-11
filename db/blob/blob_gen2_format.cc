@@ -82,8 +82,7 @@ Status ReadAndVerifySimpleGen2BlobRecord(
   IODebugContext dbg;
   Status s = file->PrepareIOOptions(read_options, opts, &dbg);
   if (s.ok()) {
-    s = file->Read(opts, record_offset, record_size, &result, buf, nullptr,
-                   &dbg);
+    s = file->Read(record_offset, record_size, opts, &result, buf, &dbg);
   }
   if (!s.ok()) {
     return s;
@@ -171,8 +170,8 @@ Status ReadSimpleGen2BlobRange(const ReadOptions& read_options,
   IODebugContext dbg;
   Status s = file->PrepareIOOptions(read_options, opts, &dbg);
   if (s.ok()) {
-    s = file->Read(opts, record_offset + range_offset, range_length, &result,
-                   buf, nullptr, &dbg);
+    s = file->Read(record_offset + range_offset, range_length, opts, &result,
+                   buf, &dbg);
   }
   if (!s.ok()) {
     return s;
@@ -424,12 +423,12 @@ IOStatus WriteSimpleGen2BlobRecord(WritableFileWriter* file,
     return io_s;
   }
   if (!payload.empty()) {
-    io_s = file->Append(opts, payload);
+    io_s = file->Append(payload, opts);
     if (!io_s.ok()) {
       return io_s;
     }
   }
-  return file->Append(opts, Slice(trailer.data(), trailer.size()));
+  return file->Append(Slice(trailer.data(), trailer.size()), opts);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

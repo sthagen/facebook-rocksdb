@@ -107,6 +107,7 @@ class DBCrashTestTest(unittest.TestCase):
     def build_params(self, base_params, overrides=None):
         params = dict(base_params)
         params["db"] = self.test_tmpdir
+        params["wbm_flush_policy"] = 0
         if overrides:
             params.update(overrides)
         return params
@@ -122,6 +123,7 @@ class DBCrashTestTest(unittest.TestCase):
             "enable_ts": False,
             "test_multiops_txn": False,
             "test_tiered_storage": False,
+            "test_full_external_table": False,
             "print_stderr_separately": False,
         }
         args.update(overrides)
@@ -332,21 +334,53 @@ class DBCrashTestTest(unittest.TestCase):
         command, finalized = db_crashtest.gen_cmd(params, [])
 
         self.assertEqual(1, finalized["stress_diagnostics_breadcrumbs"])
+        self.assertEqual(1, finalized["stress_diagnostics_scan_witness"])
         self.assertEqual(
             os.path.join(self.test_tmpdir, "rocksdb_crashtest_diagnostics"),
             finalized["stress_diagnostics_dir"],
         )
         self.assertTrue(os.path.isdir(finalized["stress_diagnostics_dir"]))
         self.assertIn("--stress_diagnostics_breadcrumbs=1", command)
+        self.assertIn("--stress_diagnostics_scan_witness=1", command)
         self.assertIn(
             "--stress_diagnostics_dir=" + finalized["stress_diagnostics_dir"],
             command,
         )
 
+    def test_cf_consistency_randomizes_secondary(self):
+        db_crashtest = self.load_db_crashtest()
+
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args("blackbox", cf_consistency=True)
+        )
+
+        with mock.patch.object(db_crashtest.random, "randint", side_effect=[0, 1]):
+            self.assertEqual(0, params["test_secondary"]())
+            self.assertEqual(1, params["test_secondary"]())
+
+    def test_skip_verifydb_disables_verification_knobs(self):
+        db_crashtest = self.load_db_crashtest()
+
+        unfinalized = db_crashtest.gen_cmd_params(
+            self.build_mode_args(
+                "blackbox",
+                cf_consistency=True,
+                test_best_efforts_recovery=True,
+            )
+        )
+        unfinalized["db"] = self.test_tmpdir
+        params = db_crashtest.finalize_and_sanitize(unfinalized)
+
+        # `db_stress` rejects either knob when `skip_verifydb` is set.
+        self.assertEqual(1, params["skip_verifydb"])
+        self.assertEqual(0, params["continuous_verification_interval"])
+        self.assertEqual(0, params["verify_db_one_in"])
+
     def test_stress_diagnostics_disabled_does_not_allocate_dir(self):
         db_crashtest = self.load_db_crashtest()
         params = {
             "stress_diagnostics_breadcrumbs": 0,
+            "stress_diagnostics_scan_witness": 0,
             "stress_diagnostics_dir": "",
         }
 
@@ -354,6 +388,22 @@ class DBCrashTestTest(unittest.TestCase):
 
         self.assertEqual("", params["stress_diagnostics_dir"])
         self.assertIsNone(db_crashtest.diagnostics_dir_global)
+
+    def test_stress_diagnostics_scan_witness_uses_independent_gate(self):
+        db_crashtest = self.load_db_crashtest()
+        self.register_diagnostics_dir_cleanup(db_crashtest)
+        params = {
+            "stress_diagnostics_breadcrumbs": 0,
+            "stress_diagnostics_scan_witness": 1,
+            "stress_diagnostics_dir": "",
+        }
+
+        db_crashtest.set_default_stress_diagnostics_dir(params)
+
+        self.assertEqual(
+            os.path.join(self.test_tmpdir, "rocksdb_crashtest_diagnostics"),
+            params["stress_diagnostics_dir"],
+        )
 
     def test_stress_diagnostics_paths_include_artifact_dir(self):
         db_crashtest = self.load_db_crashtest()
@@ -369,6 +419,108 @@ class DBCrashTestTest(unittest.TestCase):
                 }
             ),
         )
+
+    def test_full_external_table_profile(self):
+        db_crashtest = self.load_db_crashtest()
+        args = self.build_mode_args(
+            test_type="blackbox", test_full_external_table=True
+        )
+
+        # Choose the blob overlay whenever it is consulted. The full external
+        # table profile must bypass that random overlay.
+        with mock.patch.object(
+            db_crashtest.random, "choice", side_effect=lambda values: values[-1]
+        ):
+            params = db_crashtest.gen_cmd_params(args)
+        command_params = dict(params)
+        command_params["enable_compaction_filter"] = 0
+        command_params["db"] = self.test_tmpdir
+        command, finalized = db_crashtest.gen_cmd(command_params, [])
+
+        expected = {
+            "backup_one_in": 0,
+            "column_families": 1,
+            "open_files": 100,
+            "target_file_size_base": 1024 * 1024,
+            "target_file_size_multiplier": 1,
+            "write_buffer_size": 1024 * 1024,
+            "compaction_ttl": 0,
+            "delpercent": 4,
+            "delrangepercent": 1,
+            "get_property_one_in": 0,
+            "get_properties_of_all_tables_one_in": 0,
+            "ingest_external_file_with_embedded_blobs": 0,
+            "ingest_wbwi_one_in": 0,
+            "periodic_compaction_seconds": 0,
+            "preclude_last_level_data_seconds": 0,
+            "preserve_internal_time_seconds": 0,
+            "remote_compaction_worker_threads": 0,
+            "set_options_one_in": 0,
+            "test_backward_scan": 0,
+            "use_full_external_table": 1,
+            "use_timed_put_one_in": 0,
+            "user_timestamp_size": 0,
+        }
+        self.assertEqual(expected, db_crashtest.full_external_table_params)
+        for key, value in expected.items():
+            if key not in ("delpercent", "delrangepercent"):
+                self.assertEqual(value, finalized.get(key))
+        self.assertEqual(
+            5, finalized["delpercent"] + finalized["delrangepercent"]
+        )
+        self.assertIn(finalized["delrangepercent"], (0, 1))
+        for inherited_param in (
+            "adaptive_readahead",
+            "allow_unprepared_value",
+            "async_io",
+            "block_protection_bytes_per_key",
+            "bottommost_compression_type",
+            "check_multiget_consistency",
+            "checksum_type",
+            "compression_auto_skip",
+            "compression_manager",
+            "compression_type",
+            "enable_checksum_handoff",
+            "enable_compaction_filter",
+            "file_checksum_impl",
+            "ingest_external_file_one_in",
+            "inplace_update_support",
+            "mmap_read",
+            "min_tombstones_for_range_conversion",
+            "paranoid_file_checks",
+            "test_batches_snapshots",
+            "use_async_db_api",
+            "use_merge",
+            "use_multiget",
+            "use_multiscan",
+            "use_trie_index",
+            "verify_checksum_one_in",
+            "verify_file_checksums_one_in",
+            "verify_manifest_content_on_close",
+        ):
+            self.assertIs(
+                db_crashtest.default_params[inherited_param],
+                params[inherited_param],
+            )
+        self.assertEqual(10 * 1024 * 1024, finalized["max_bytes_for_level_base"])
+        self.assertEqual(1, finalized["verify_sst_unique_id_in_manifest"])
+        self.assertGreater(finalized["acquire_snapshot_one_in"], 0)
+        self.assertIn("--use_full_external_table=1", command)
+        self.assertFalse(
+            any(arg.startswith("--test_full_external_table=") for arg in command)
+        )
+        for fault_param in (
+            "metadata_read_fault_one_in",
+            "metadata_write_fault_one_in",
+            "open_metadata_read_fault_one_in",
+            "open_metadata_write_fault_one_in",
+            "open_read_fault_one_in",
+            "open_write_fault_one_in",
+            "read_fault_one_in",
+            "sync_fault_injection",
+            "write_fault_one_in",
+        ):
+            self.assertIs(db_crashtest.default_params[fault_param], params[fault_param])
 
     def test_cache_and_write_buffer_size_multiplier_preserves_randomization(self):
         db_crashtest = self.load_db_crashtest()
@@ -399,6 +551,73 @@ class DBCrashTestTest(unittest.TestCase):
                 for arg in first_command
             )
         )
+
+    def test_wbm_flush_policy_coverage(self):
+        db_crashtest = self.load_db_crashtest()
+        for policy in db_crashtest._WBM_FLUSH_POLICIES:
+            params = db_crashtest.gen_cmd_params(
+                self.build_mode_args(
+                    cache_size=8 * 1024 * 1024,
+                    db=self.test_tmpdir,
+                    db_write_buffer_size=1024 * 1024,
+                    num_dbs=1,
+                    use_write_buffer_manager=1,
+                    wbm_flush_policy=policy,
+                )
+            )
+
+            command, _ = db_crashtest.gen_cmd(params, [])
+
+            self.assertIn(f"--wbm_flush_policy={policy}", command)
+            expected_num_dbs = (
+                2
+                if policy == db_crashtest._WBM_FLUSH_LARGEST_ACROSS_DBS
+                else 1
+            )
+            self.assertIn(f"--num_dbs={expected_num_dbs}", command)
+
+    def test_cross_db_wbm_policy_keeps_db_topology_stable(self):
+        db_crashtest = self.load_db_crashtest()
+        policies = iter([db_crashtest._WBM_FLUSH_LARGEST_ACROSS_DBS, 0])
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args(
+                cache_size=8 * 1024 * 1024,
+                db=self.test_tmpdir,
+                db_write_buffer_size=1024 * 1024,
+                num_dbs=1,
+                use_write_buffer_manager=1,
+                wbm_flush_policy=lambda: next(policies),
+            )
+        )
+
+        first_command, _ = db_crashtest.gen_cmd(params, [])
+        second_command, _ = db_crashtest.gen_cmd(params, [])
+
+        self.assertEqual(
+            db_crashtest._WBM_FLUSH_LARGEST_ACROSS_DBS,
+            params["wbm_flush_policy"],
+        )
+        self.assertEqual(2, params["num_dbs"])
+        for command in (first_command, second_command):
+            self.assertIn("--wbm_flush_policy=2", command)
+            self.assertIn("--num_dbs=2", command)
+
+    def test_cross_db_wbm_policy_does_not_force_two_dbs_when_disabled(self):
+        db_crashtest = self.load_db_crashtest()
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args(
+                db=self.test_tmpdir,
+                num_dbs=1,
+                use_write_buffer_manager=0,
+                wbm_flush_policy=db_crashtest._WBM_FLUSH_LARGEST_ACROSS_DBS,
+            )
+        )
+
+        command, _ = db_crashtest.gen_cmd(params, [])
+
+        self.assertEqual(1, params["num_dbs"])
+        self.assertIn("--wbm_flush_policy=0", command)
+        self.assertIn("--num_dbs=1", command)
 
     def test_cache_and_write_buffer_size_multiplier_respects_write_buffer_minimum(
         self,
@@ -465,6 +684,203 @@ class DBCrashTestTest(unittest.TestCase):
         self.assertEqual(1, finalized["enable_blob_direct_write"])
         self.assertEqual(1, finalized["disable_wal"])
         self.assertEqual(0, finalized["test_batches_snapshots"])
+
+    def test_finalize_file_scoped_wal_fault_profile(self):
+        db_crashtest = self.load_db_crashtest()
+        params = self.build_params(
+            db_crashtest.default_params,
+            {
+                "file_scope_wal_write_faults": 1,
+                "write_fault_one_in": 0,
+                "max_write_buffer_number": 3,
+                "disable_wal": 1,
+                "manual_wal_flush_one_in": 10,
+                "use_txn": 1,
+                "two_write_queues": 1,
+                "enable_pipelined_write": 1,
+                "unordered_write": 1,
+                "recycle_log_file_num": 1,
+                "WAL_ttl_seconds": 60,
+                "WAL_size_limit_MB": 1,
+                "track_and_verify_wals": 1,
+                "enable_blob_direct_write": 1,
+                "test_batches_snapshots": 1,
+                "reopen": 10,
+                "exclude_wal_from_write_fault_injection": 1,
+                "inject_error_severity": 2,
+                "sync_fault_injection": 1,
+                "metadata_read_fault_one_in": 10,
+                "metadata_write_fault_one_in": 10,
+                "read_fault_one_in": 10,
+                "open_metadata_read_fault_one_in": 10,
+                "open_metadata_write_fault_one_in": 10,
+                "open_read_fault_one_in": 10,
+                "open_write_fault_one_in": 10,
+            },
+        )
+
+        finalized = db_crashtest.finalize_and_sanitize(params)
+
+        self.assertEqual(1, finalized["file_scope_wal_write_faults"])
+        self.assertEqual(128, finalized["write_fault_one_in"])
+        self.assertEqual(10, finalized["max_write_buffer_number"])
+        self.assertEqual(0, finalized["test_batches_snapshots"])
+        self.assertEqual(1, finalized["inject_error_severity"])
+        for flag in [
+            "disable_wal",
+            "manual_wal_flush_one_in",
+            "use_txn",
+            "use_optimistic_txn",
+            "test_multi_ops_txns",
+            "two_write_queues",
+            "enable_pipelined_write",
+            "unordered_write",
+            "recycle_log_file_num",
+            "WAL_ttl_seconds",
+            "WAL_size_limit_MB",
+            "track_and_verify_wals",
+            "enable_blob_direct_write",
+            "reopen",
+            "exclude_wal_from_write_fault_injection",
+            "sync_fault_injection",
+            "metadata_read_fault_one_in",
+            "metadata_write_fault_one_in",
+            "read_fault_one_in",
+            "secondary_cache_fault_one_in",
+            "open_metadata_read_fault_one_in",
+            "open_metadata_write_fault_one_in",
+            "open_read_fault_one_in",
+            "open_write_fault_one_in",
+        ]:
+            self.assertEqual(0, finalized[flag], flag)
+
+    def test_finalize_disables_ingest_wbwi_for_file_scoped_wal_faults(self):
+        db_crashtest = self.load_db_crashtest()
+        # Isolate the regression: the generic ingest_wbwi_one_in guard only
+        # fires on disable_wal==0 / pipelined / unordered / timestamps, none of
+        # which hold here. disable_wal starts at 1, so that guard leaves
+        # ingest_wbwi_one_in untouched; the file-scoped WAL fault profile then
+        # forces disable_wal=0 later, and must also disable the (now
+        # unsupported) IngestWriteBatchWithIndex path.
+        params = self.build_params(
+            db_crashtest.default_params,
+            {
+                "file_scope_wal_write_faults": 1,
+                "disable_wal": 1,
+                "ingest_wbwi_one_in": 100,
+                "enable_pipelined_write": 0,
+                "unordered_write": 0,
+                "user_timestamp_size": 0,
+                "use_txn": 0,
+                "two_write_queues": 0,
+            },
+        )
+
+        finalized = db_crashtest.finalize_and_sanitize(params)
+
+        self.assertEqual(0, finalized["disable_wal"])
+        self.assertEqual(0, finalized["ingest_wbwi_one_in"])
+
+    def test_auto_file_scoped_wal_faults_preserve_explicit_opt_outs(self):
+        db_crashtest = self.load_db_crashtest()
+
+        def choose_without_blob_profile(values):
+            if values == [0] * 9 + [1]:
+                return 0
+            if values == [0] * 19 + [1]:
+                return 1
+            return values[0]
+
+        for explicit_opt_out in [
+            {"file_scope_wal_write_faults": 0},
+            {"write_fault_one_in": 0},
+            {"exclude_wal_from_write_fault_injection": 1},
+            {"enable_blob_direct_write": 1},
+        ]:
+            with self.subTest(explicit_opt_out=explicit_opt_out):
+                args = self.build_mode_args(
+                    test_type="blackbox", **explicit_opt_out
+                )
+                with mock.patch.object(
+                    db_crashtest.random,
+                    "choice",
+                    side_effect=choose_without_blob_profile,
+                ):
+                    params = db_crashtest.gen_cmd_params(args)
+
+                self.assertEqual(0, params["file_scope_wal_write_faults"])
+
+    def test_auto_file_scoped_wal_faults_skip_batch_mode(self):
+        db_crashtest = self.load_db_crashtest()
+        args = self.build_mode_args(test_type="blackbox")
+        db_crashtest.default_params["test_batches_snapshots"] = 1
+
+        def choose_without_blob_profile(values):
+            if values == [0] * 9 + [1]:
+                return 0
+            if values == [0] * 19 + [1]:
+                return 1
+            return values[0]
+
+        with mock.patch.object(
+            db_crashtest.random,
+            "choice",
+            side_effect=choose_without_blob_profile,
+        ):
+            params = db_crashtest.gen_cmd_params(args)
+
+        self.assertEqual(0, params["file_scope_wal_write_faults"])
+
+    def test_auto_file_scoped_wal_faults_skip_unsupported_inputs(self):
+        db_crashtest = self.load_db_crashtest()
+
+        def choose_without_blob_profile(values):
+            if values == [0] * 9 + [1]:
+                return 0
+            if values == [0] * 19 + [1]:
+                return 1
+            return values[0]
+
+        cases = [
+            ({"best_efforts_recovery": 1}, []),
+            ({"test_cf_consistency": 1}, []),
+            ({}, ["--options_file=/tmp/OPTIONS"]),
+            ({}, ["-options_file", "/tmp/OPTIONS"]),
+            ({}, ["-disable_wal=1"]),
+            ({}, ["-test_cf_consistency=1"]),
+        ]
+        for overrides, unknown_params in cases:
+            with self.subTest(overrides=overrides, unknown_params=unknown_params):
+                args = self.build_mode_args(test_type="blackbox", **overrides)
+                with mock.patch.object(
+                    db_crashtest.random,
+                    "choice",
+                    side_effect=choose_without_blob_profile,
+                ):
+                    params = db_crashtest.gen_cmd_params(args, unknown_params)
+
+                self.assertEqual(0, params["file_scope_wal_write_faults"])
+
+    def test_auto_file_scoped_wal_faults_select_eligible_profile(self):
+        db_crashtest = self.load_db_crashtest()
+        args = self.build_mode_args(test_type="blackbox")
+        db_crashtest.default_params["test_batches_snapshots"] = 0
+
+        def choose_without_blob_profile(values):
+            if values == [0] * 9 + [1]:
+                return 0
+            if values == [0] * 19 + [1]:
+                return 1
+            return values[0]
+
+        with mock.patch.object(
+            db_crashtest.random,
+            "choice",
+            side_effect=choose_without_blob_profile,
+        ):
+            params = db_crashtest.gen_cmd_params(args)
+
+        self.assertEqual(1, params["file_scope_wal_write_faults"])
 
     def test_finalize_disables_sqfc_range_queries_with_range_conversion(self):
         db_crashtest = self.load_db_crashtest()
@@ -867,6 +1283,7 @@ class DBCrashTestTest(unittest.TestCase):
         for fault_param in [
             "error_recovery_with_no_fault_injection",
             "exclude_wal_from_write_fault_injection",
+            "file_scope_wal_write_faults",
             "metadata_read_fault_one_in",
             "metadata_write_fault_one_in",
             "open_metadata_read_fault_one_in",

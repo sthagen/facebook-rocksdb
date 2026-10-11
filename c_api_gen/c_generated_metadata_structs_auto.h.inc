@@ -103,6 +103,10 @@ extern ROCKSDB_LIBRARY_API uint64_t rocksdb_table_properties_column_family_id(
     const rocksdb_table_properties_t* props);
 
 extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_table_properties_oldest_ancestor_time(
+    const rocksdb_table_properties_t* props);
+
+extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_table_properties_creation_time(const rocksdb_table_properties_t* props);
 
 extern ROCKSDB_LIBRARY_API uint64_t rocksdb_table_properties_oldest_key_time(
@@ -120,10 +124,6 @@ rocksdb_table_properties_slow_compression_estimated_data_size(
 
 extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_table_properties_fast_compression_estimated_data_size(
-    const rocksdb_table_properties_t* props);
-
-extern ROCKSDB_LIBRARY_API uint64_t
-rocksdb_table_properties_external_sst_file_global_seqno_offset(
     const rocksdb_table_properties_t* props);
 
 extern ROCKSDB_LIBRARY_API uint64_t rocksdb_table_properties_tail_start_offset(

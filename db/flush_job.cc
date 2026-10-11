@@ -502,9 +502,13 @@ Status FlushJob::MemPurge() {
       }
     }
 
+    // MemPurge output is installed directly into the immutable list, so it
+    // must not advertise memory that can be reclaimed by switching a mutable
+    // memtable.
     new_mem = new MemTable(cfd_->internal_comparator(), cfd_->ioptions(),
                            mutable_cf_options_, cfd_->write_buffer_mgr(),
-                           earliest_seqno, cfd_->GetID());
+                           earliest_seqno, cfd_->GetID(),
+                           nullptr /* flush_initiator */);
     assert(new_mem != nullptr);
 
     Env* env = db_options_.env;
@@ -1002,11 +1006,11 @@ Status FlushJob::WriteLevel0Table() {
       auto status = clock_->GetCurrentTime(&_current_time);
       // Safe to proceed even if GetCurrentTime fails. So, log and proceed.
       if (!status.ok()) {
-        ROCKS_LOG_WARN(
-            db_options_.info_log,
-            "Failed to get current time to populate creation_time property. "
-            "Status: %s",
-            status.ToString().c_str());
+        ROCKS_LOG_WARN(db_options_.info_log,
+                       "Failed to get current time to populate "
+                       "oldest_ancestor_time property. "
+                       "Status: %s",
+                       status.ToString().c_str());
       }
       const uint64_t current_time = static_cast<uint64_t>(_current_time);
 
@@ -1014,12 +1018,12 @@ Status FlushJob::WriteLevel0Table() {
 
       // It's not clear whether oldest_key_time is always available. In case
       // it is not available, use current_time.
-      uint64_t oldest_ancester_time = std::min(current_time, oldest_key_time);
+      uint64_t oldest_ancestor_time = std::min(current_time, oldest_key_time);
 
       TEST_SYNC_POINT_CALLBACK(
-          "FlushJob::WriteLevel0Table:oldest_ancester_time",
-          &oldest_ancester_time);
-      meta_.oldest_ancester_time = oldest_ancester_time;
+          "FlushJob::WriteLevel0Table:oldest_ancestor_time",
+          &oldest_ancestor_time);
+      meta_.oldest_ancestor_time = oldest_ancestor_time;
       meta_.file_creation_time = current_time;
 
       uint64_t memtable_payload_bytes = 0;

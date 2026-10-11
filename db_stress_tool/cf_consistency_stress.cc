@@ -918,6 +918,8 @@ class CfConsistencyStressTest : public StressTest {
 
     const Slice prefix(key.data(), prefix_to_use);
 
+    ScanWitnessLog witness(thread, "prefix_scan_cf_consistency");
+
     std::string upper_bound;
     Slice ub_slice;
     std::function<bool(const TableProperties&)> table_filter;
@@ -948,35 +950,79 @@ class CfConsistencyStressTest : public StressTest {
 
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro_copy, cfh));
 
+    if (witness.Enabled()) {
+      std::ostringstream start_oss;
+      start_oss << "action=start cf=" << cfh->GetName() << " key={"
+                << FormatDiagnosticSlice(Slice(key)) << "} prefix={"
+                << FormatDiagnosticSlice(prefix) << "} upper_bound={"
+                << (upper_bound.empty()
+                        ? "none"
+                        : FormatDiagnosticSlice(Slice(upper_bound)))
+                << "} read_options={"
+                << FormatReadOptionsForDiagnostics(ro_copy) << "}";
+      witness.Add(start_oss.str());
+    }
+
     uint64_t count = 0;
     Status s;
 
-    for (iter->Seek(prefix); iter->Valid() && iter->key().starts_with(prefix);
-         iter->Next()) {
+    iter->Seek(prefix);
+    witness.AddIteratorState("Seek", "prefix_scan", *iter,
+                             !ro_copy.allow_unprepared_value);
+    while (iter->Valid() && iter->key().starts_with(prefix)) {
       ++count;
 
       if (ro_copy.allow_unprepared_value) {
+        witness.AddIteratorState("PrepareValueBefore", "prefix_scan", *iter,
+                                 false);
         if (!iter->PrepareValue()) {
           s = iter->status();
+          witness.AddIteratorState("PrepareValueFailed", "prefix_scan", *iter,
+                                   false);
           break;
         }
+        witness.AddIteratorState("PrepareValue", "prefix_scan", *iter, true);
       }
 
       if (!VerifyWideColumns(iter->value(), iter->columns())) {
         s = Status::Corruption("Value and columns inconsistent",
                                DebugString(iter->value(), iter->columns()));
+        witness.Add("failure=wide_columns_inconsistent key={" +
+                    FormatDiagnosticSlice(iter->key()) +
+                    "} value_size=" + std::to_string(iter->value().size()) +
+                    " status=" + SanitizeDiagnosticValue(s.ToString()));
         break;
       }
+      iter->Next();
+      witness.AddIteratorState("Next", "prefix_scan", *iter,
+                               !ro_copy.allow_unprepared_value);
     }
 
-    assert(prefix_to_use == 0 ||
-           count <= GetPrefixKeyCount(prefix.ToString(), upper_bound));
+    if (prefix_to_use != 0) {
+      if (witness.Enabled()) {
+        const uint64_t expected_count =
+            GetPrefixKeyCount(prefix.ToString(), upper_bound);
+        if (count > expected_count) {
+          std::ostringstream failure_oss;
+          failure_oss << "failure=prefix_count_exceeded count=" << count
+                      << " expected_count=" << expected_count;
+          witness.Add(failure_oss.str());
+          witness.Flush("prefix_scan_cf_consistency_count");
+        }
+        assert(count <= expected_count);
+      } else {
+        assert(count <= GetPrefixKeyCount(prefix.ToString(), upper_bound));
+      }
+    }
 
     if (s.ok()) {
       s = iter->status();
     }
 
     if (!s.ok() && !IsErrorInjectedAndRetryable(s)) {
+      witness.Add("failure=prefix_scan_status status=" +
+                  SanitizeDiagnosticValue(s.ToString()));
+      witness.Flush("prefix_scan_cf_consistency_status");
       fprintf(stderr, "TestPrefixScan error: %s\n", s.ToString().c_str());
       thread->stats.AddErrors(1);
 
@@ -1204,17 +1250,6 @@ class CfConsistencyStressTest : public StressTest {
     SharedState* shared = thread->shared;
     assert(shared);
 
-    if (secondary_db_) {
-      status = secondary_db_->TryCatchUpWithPrimary();
-      if (!status.ok()) {
-        fprintf(stderr, "TryCatchUpWithPrimary: %s\n",
-                status.ToString().c_str());
-        shared->SetShouldStopTest();
-        assert(false);
-        return;
-      }
-    }
-
     const auto checksum_column_family = [](Iterator* iter,
                                            uint32_t* checksum) -> Status {
       assert(nullptr != checksum);
@@ -1238,46 +1273,78 @@ class CfConsistencyStressTest : public StressTest {
     // `FLAGS_rate_limit_user_ops` to avoid slowing any validation.
     ReadOptions ropts(FLAGS_verify_checksum, true);
     ropts.total_order_seek = true;
-    if (nullptr == secondary_db_ || FLAGS_auto_refresh_iterator_with_snapshot) {
+    if (nullptr == secondary_db_) {
       ropts.snapshot = snapshot_guard.snapshot();
       ropts.auto_refresh_iterator_with_snapshot = true;
     }
-    uint32_t crc = 0;
-    {
-      // Compute crc for all key-values of default column family.
-      std::unique_ptr<Iterator> it(db_ptr->NewIterator(ropts));
-      status = checksum_column_family(it.get(), &crc);
-      if (!status.ok()) {
-        fprintf(stderr, "Computing checksum of default cf: %s\n",
-                status.ToString().c_str());
-        assert(false);
-      }
+
+    std::vector<Iterator*> raw_iterators;
+    Status catch_up_status;
+    if (secondary_db_) {
+      // The separate thread intentionally overlaps catch-up with
+      // NewIterators(). Fault injection is disabled separately because its
+      // state is thread-local.
+      port::Thread catch_up_thread([&]() {
+        if (db_fault_injection_fs_) {
+          db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+        }
+        catch_up_status = secondary_db_->TryCatchUpWithPrimary();
+        if (db_fault_injection_fs_) {
+          db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+        }
+      });
+      status = db_ptr->NewIterators(ropts, cfhs, &raw_iterators);
+      catch_up_thread.join();
+    } else {
+      status = db_ptr->NewIterators(ropts, cfhs, &raw_iterators);
     }
-    // Since we currently intentionally disallow reading from the secondary
-    // instance with snapshot, we cannot achieve cross-cf consistency if WAL is
-    // enabled because there is no guarantee that secondary instance replays
-    // the primary's WAL to a consistent point where all cfs have the same
-    // data.
-    if (status.ok() && FLAGS_disable_wal) {
-      uint32_t tmp_crc = 0;
-      for (ColumnFamilyHandle* cfh : cfhs) {
-        if (cfh == db_ptr->DefaultColumnFamily()) {
-          continue;
-        }
-        std::unique_ptr<Iterator> it(db_ptr->NewIterator(ropts, cfh));
-        status = checksum_column_family(it.get(), &tmp_crc);
-        if (!status.ok() || tmp_crc != crc) {
-          break;
-        }
-      }
+
+    std::vector<std::unique_ptr<Iterator>> iterators;
+    iterators.reserve(raw_iterators.size());
+    for (Iterator* iterator : raw_iterators) {
+      iterators.emplace_back(iterator);
+    }
+
+    if (secondary_db_ && !catch_up_status.ok()) {
+      fprintf(stderr, "TryCatchUpWithPrimary: %s\n",
+              catch_up_status.ToString().c_str());
+      shared->SetShouldStopTest();
+      assert(false);
+      return;
+    }
+    if (!status.ok()) {
+      fprintf(stderr, "NewIterators: %s\n", status.ToString().c_str());
+      shared->SetShouldStopTest();
+      assert(false);
+      return;
+    }
+
+    // With WAL enabled, secondary MANIFEST recovery can expose flushed state
+    // beyond the point reached by WAL replay. NewIterators() keeps one
+    // published view but cannot make those column families logically
+    // consistent.
+    const size_t num_cfs_to_verify =
+        FLAGS_disable_wal ? iterators.size()
+                          : std::min<size_t>(1, iterators.size());
+    uint32_t expected_crc = 0;
+    for (size_t i = 0; i < num_cfs_to_verify; ++i) {
+      uint32_t crc = 0;
+      status = checksum_column_family(iterators[i].get(), &crc);
       if (!status.ok()) {
-        fprintf(stderr, "status: %s\n", status.ToString().c_str());
+        fprintf(stderr, "Computing checksum of cf %zu: %s\n", i,
+                status.ToString().c_str());
         shared->SetShouldStopTest();
         assert(false);
-      } else if (tmp_crc != crc) {
-        fprintf(stderr, "tmp_crc=%" PRIu32 " crc=%" PRIu32 "\n", tmp_crc, crc);
+        return;
+      }
+      if (i == 0) {
+        expected_crc = crc;
+      } else if (FLAGS_disable_wal && crc != expected_crc) {
+        fprintf(stderr, "cf %zu crc=%" PRIu32 " expected=%" PRIu32 "\n", i, crc,
+                expected_crc);
         shared->SetShouldStopTest();
         assert(false);
+        return;
       }
     }
   }

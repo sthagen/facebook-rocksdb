@@ -38,6 +38,13 @@ const std::string kRangeDelBlockName = "rocksdb.range_del";
 Status GetGlobalSequenceNumber(const TableProperties& table_properties,
                                SequenceNumber largest_seqno,
                                SequenceNumber* global_seqno) {
+  // A wrapping reader will apply the effective global seqno. Keep this reader
+  // on the stored per-entry sequence numbers to avoid applying it twice.
+  if (largest_seqno == kDisableGlobalSequenceNumber) {
+    *global_seqno = kDisableGlobalSequenceNumber;
+    return Status::OK();
+  }
+
   const auto& props = table_properties.user_collected_properties;
   const auto version_pos = props.find(ExternalSstFilePropertyNames::kVersion);
   const auto seqno_pos = props.find(ExternalSstFilePropertyNames::kGlobalSeqno);
@@ -197,7 +204,7 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kFormatVersion, props.format_version);
   Add(TablePropertiesNames::kFixedKeyLen, props.fixed_key_len);
   Add(TablePropertiesNames::kColumnFamilyId, props.column_family_id);
-  Add(TablePropertiesNames::kCreationTime, props.creation_time);
+  Add(TablePropertiesNames::kOldestAncestorTime, props.oldest_ancestor_time);
   Add(TablePropertiesNames::kOldestKeyTime, props.oldest_key_time);
   Add(TablePropertiesNames::kNewestKeyTime, props.newest_key_time);
   if (props.file_creation_time > 0) {
@@ -370,8 +377,12 @@ bool NotifyCollectTableCollectorsOnFinish(
 }
 
 Status ParsePropertiesBlock(
-    const ImmutableOptions& ioptions, uint64_t offset, Block& properties_block,
-    std::unique_ptr<TableProperties>& new_table_properties) {
+    const ImmutableOptions& ioptions, Block& properties_block,
+    std::unique_ptr<TableProperties>& new_table_properties,
+    uint32_t* global_seqno_value_offset) {
+  if (global_seqno_value_offset != nullptr) {
+    *global_seqno_value_offset = 0;
+  }
   std::unique_ptr<MetaBlockIter> iter(properties_block.NewMetaIterator());
 
   //  All pre-defined properties of type uint64_t
@@ -421,8 +432,8 @@ Status ParsePropertiesBlock(
        &new_table_properties->fixed_key_len},
       {TablePropertiesNames::kColumnFamilyId,
        &new_table_properties->column_family_id},
-      {TablePropertiesNames::kCreationTime,
-       &new_table_properties->creation_time},
+      {TablePropertiesNames::kOldestAncestorTime,
+       &new_table_properties->oldest_ancestor_time},
       {TablePropertiesNames::kOldestKeyTime,
        &new_table_properties->oldest_key_time},
       {TablePropertiesNames::kNewestKeyTime,
@@ -469,9 +480,9 @@ Status ParsePropertiesBlock(
     auto raw_val = iter->value();
     auto pos = predefined_uint64_properties.find(key);
 
-    if (key == ExternalSstFilePropertyNames::kGlobalSeqno) {
-      new_table_properties->external_sst_file_global_seqno_offset =
-          offset + iter->ValueOffset();
+    if (key == ExternalSstFilePropertyNames::kGlobalSeqno &&
+        global_seqno_value_offset != nullptr) {
+      *global_seqno_value_offset = iter->ValueOffset();
     }
 
     if (pos != predefined_uint64_properties.end()) {
@@ -542,14 +553,6 @@ Status ReadTablePropertiesHelper(
   while (true) {
     BlockContents block_contents;
     size_t len = handle.size() + footer.GetBlockTrailerSize();
-    // If this is an external SST file ingested with write_global_seqno set to
-    // true, then we expect the checksum mismatch because checksum was written
-    // by SstFileWriter, but its global seqno in the properties block may have
-    // been changed during ingestion. For this reason, we initially read
-    // and process without checksum verification, then later try checksum
-    // verification so that if it fails, we can copy to a temporary buffer with
-    // global seqno set to its original value, i.e. 0, and attempt checksum
-    // verification again.
     if (!retry) {
       ReadOptions modified_ro = ro;
       modified_ro.verify_checksums = false;
@@ -578,8 +581,8 @@ Status ReadTablePropertiesHelper(
       opts.verify_and_reconstruct_read = true;
       std::unique_ptr<char[]> data(new char[len]);
       Slice result;
-      IOStatus io_s = file->Read(opts, handle.offset(), len, &result,
-                                 data.get(), nullptr, &dbg);
+      IOStatus io_s =
+          file->Read(handle.offset(), len, opts, &result, data.get(), &dbg);
       RecordTick(ioptions.stats, FILE_READ_CORRUPTION_RETRY_COUNT);
       if (!io_s.ok()) {
         ROCKS_LOG_INFO(ioptions.info_log,
@@ -600,26 +603,24 @@ Status ReadTablePropertiesHelper(
     uint64_t block_size = block_contents.data.size();
     Block properties_block(std::move(block_contents));
     std::unique_ptr<TableProperties> new_table_properties{new TableProperties};
-    s = ParsePropertiesBlock(ioptions, handle.offset(), properties_block,
-                             new_table_properties);
+    uint32_t global_seqno_value_offset = 0;
+    s = ParsePropertiesBlock(ioptions, properties_block, new_table_properties,
+                             &global_seqno_value_offset);
 
-    // Modified version of BlockFetcher checksum verification
-    // (See write_global_seqno comment above)
-    if (s.ok() && footer.GetBlockTrailerSize() > 0) {
+    if (s.ok() && ro.verify_checksums && footer.GetBlockTrailerSize() > 0) {
       s = VerifyBlockChecksum(footer, properties_block.data(), block_size,
                               file->file_name(), handle.offset(),
                               BlockType::kProperties);
-      if (s.IsCorruption()) {
-        if (new_table_properties->external_sst_file_global_seqno_offset != 0) {
-          std::string tmp_buf(properties_block.data(), len);
-          uint64_t global_seqno_offset =
-              new_table_properties->external_sst_file_global_seqno_offset -
-              handle.offset();
-          EncodeFixed64(&tmp_buf[static_cast<size_t>(global_seqno_offset)], 0);
-          s = VerifyBlockChecksum(footer, tmp_buf.data(), block_size,
-                                  file->file_name(), handle.offset(),
-                                  BlockType::kProperties);
-        }
+      if (s.IsCorruption() && global_seqno_value_offset != 0 &&
+          block_size >= sizeof(uint64_t) &&
+          global_seqno_value_offset <= block_size - sizeof(uint64_t)) {
+        // Older ingestion could rewrite this value without updating the block
+        // checksum. Verify against the original zero placeholder.
+        std::string tmp_buf(properties_block.data(), len);
+        EncodeFixed64(&tmp_buf[global_seqno_value_offset], 0);
+        s = VerifyBlockChecksum(footer, tmp_buf.data(), block_size,
+                                file->file_name(), handle.offset(),
+                                BlockType::kProperties);
       }
     }
 

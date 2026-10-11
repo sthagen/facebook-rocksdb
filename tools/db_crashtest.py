@@ -65,6 +65,8 @@ _STRESS_DIAGNOSTIC_FILE_RE = re.compile(
 )
 _REMOTE_DB_URI_FLAGS = ("--env_uri", "--fs_uri")
 _MIN_WRITE_BUFFER_SIZE = 64 * 1024
+_WBM_FLUSH_POLICIES = (0, 1, 2)
+_WBM_FLUSH_LARGEST_ACROSS_DBS = 2
 
 
 def get_random_seed(override):
@@ -212,6 +214,9 @@ early_argument_parsing_before_main()
 #   for multiops_txn:
 #       default_params < {blackbox,whitebox,liveness}_default_params <
 #       multiops_txn_params < args
+#   for full external table:
+#       default_params < blackbox_default_params <
+#       full_external_table_params < args
 # Liveness mode reapplies liveness_fault_injection_params after args so the
 # base liveness profile cannot accidentally turn fault injection back on.
 
@@ -274,6 +279,8 @@ default_params = {
     "stress_diagnostics_dir": "",
     "stress_diagnostics_breadcrumbs": 1,
     "stress_diagnostics_breadcrumb_entries": 256,
+    "stress_diagnostics_scan_witness": 1,
+    "stress_diagnostics_scan_witness_entries": 128,
     "num_dbs": 1,
     "enable_pipelined_write": lambda: random.randint(0, 1),
     "enable_compaction_filter": lambda: random.choice([0, 0, 0, 1]),
@@ -456,6 +463,7 @@ default_params = {
         [0, 0, 0, 1024 * 1024, 8 * 1024 * 1024, 128 * 1024 * 1024]
     ),
     "use_write_buffer_manager": lambda: random.randint(0, 1),
+    "wbm_flush_policy": lambda: random.choice(_WBM_FLUSH_POLICIES),
     "avoid_unnecessary_blocking_io": random.randint(0, 1),
     "write_dbid_to_manifest": random.randint(0, 1),
     "write_identity_file": random.randint(0, 1),
@@ -481,6 +489,7 @@ default_params = {
     "read_fault_one_in": lambda: random.choice([0, 32, 1000]),
     "write_fault_one_in": lambda: random.choice([0, 128, 1000]),
     "exclude_wal_from_write_fault_injection": 0,
+    "file_scope_wal_write_faults": 0,
     "open_metadata_write_fault_one_in": lambda: random.choice([0, 0, 8]),
     "open_metadata_read_fault_one_in": lambda: random.choice([0, 0, 8]),
     "open_write_fault_one_in": lambda: random.choice([0, 0, 16]),
@@ -752,7 +761,10 @@ def get_diagnostics_dir():
 
 
 def stress_diagnostics_enabled(params):
-    return params.get("stress_diagnostics_breadcrumbs", 0) == 1
+    return (
+        params.get("stress_diagnostics_breadcrumbs", 0) == 1
+        or params.get("stress_diagnostics_scan_witness", 0) == 1
+    )
 
 
 def set_default_stress_diagnostics_dir(params):
@@ -889,6 +901,7 @@ whitebox_default_params = {
 liveness_fault_injection_params = {
     "error_recovery_with_no_fault_injection": 0,
     "exclude_wal_from_write_fault_injection": 0,
+    "file_scope_wal_write_faults": 0,
     "metadata_read_fault_one_in": 0,
     "metadata_write_fault_one_in": 0,
     "open_metadata_read_fault_one_in": 0,
@@ -958,10 +971,59 @@ blackbox_simple_default_params = {
 
 whitebox_simple_default_params = {}
 
+full_external_table_params = {
+    # Backup verification reconstructs Options from strings, but the test-only
+    # full external table factory is not registered for reconstruction.
+    "backup_one_in": 0,
+    # The db_stress full external table integration currently supports one CF.
+    "column_families": 1,
+    # The simple reader loads each open table into memory, so keep generated
+    # files and the number held open small enough to bound the DB's memory use.
+    "open_files": 100,
+    "target_file_size_base": 1024 * 1024,
+    "target_file_size_multiplier": 1,
+    "write_buffer_size": 1024 * 1024,
+    # RocksDB permits TTL only for factories identifying as block-based.
+    "compaction_ttl": 0,
+    # Exercise range deletions while keeping the workload at 100%.
+    "delpercent": 4,
+    "delrangepercent": 1,
+    # Aggregated table properties are not supported by the simple factory.
+    "get_property_one_in": 0,
+    # This probe cannot distinguish checksum failures from injected read faults.
+    "get_properties_of_all_tables_one_in": 0,
+    # Embedded-blob SST writing requires direct block-based table options.
+    "ingest_external_file_with_embedded_blobs": 0,
+    # WAL-disabled WBWI state can be lost on a crash before the ingested
+    # memtable is flushed, which the expected-state recovery cannot reconstruct.
+    "ingest_wbwi_one_in": 0,
+    # RocksDB permits periodic compaction only for block-based factories.
+    "periodic_compaction_seconds": 0,
+    # Full external tables do not persist sequence-number-to-time mappings.
+    "preclude_last_level_data_seconds": 0,
+    "preserve_internal_time_seconds": 0,
+    # Remote-compaction workers reconstruct factories by name, but this test
+    # factory is not registered.
+    "remote_compaction_worker_threads": 0,
+    # The randomized option table includes a block_based_table_factory update,
+    # which is invalid when the active factory is external.
+    "set_options_one_in": 0,
+    # DBIter::Prev() requires value pinning that the external iterator adapter
+    # does not currently propagate.
+    "test_backward_scan": 0,
+    # Select the table implementation under test.
+    "use_full_external_table": 1,
+    # TimedPut is not an entry type supported by external tables.
+    "use_timed_put_one_in": 0,
+    # External tables reject user-defined timestamps in keys and comparators.
+    "user_timestamp_size": 0,
+}
+
 cf_consistency_params = {
     "disable_wal": lambda: random.randint(0, 1),
     "reopen": 0,
     "test_cf_consistency": 1,
+    "test_secondary": lambda: random.randint(0, 1),
     # use small value for write_buffer_size so that RocksDB triggers flush
     # more frequently
     "write_buffer_size": 1024 * 1024,
@@ -1668,6 +1730,8 @@ def finalize_and_sanitize(src_params):
     if dest_params["use_write_buffer_manager"]:
         if dest_params["cache_size"] <= 0 or dest_params["db_write_buffer_size"] <= 0:
             dest_params["use_write_buffer_manager"] = 0
+    if not dest_params["use_write_buffer_manager"]:
+        dest_params["wbm_flush_policy"] = 0
     if (
         dest_params["user_timestamp_size"] > 0
         and dest_params["persist_user_defined_timestamps"] == 0
@@ -1902,6 +1966,47 @@ def finalize_and_sanitize(src_params):
     if dest_params.get("disable_wal", 0) == 1:
         dest_params["test_batches_snapshots"] = 0
 
+    if dest_params.get("file_scope_wal_write_faults", 0) == 1:
+        # Exercise the supported file-scoped WAL recovery envelope without
+        # unrelated injected faults obscuring failures. The production path
+        # deliberately fails closed for the options disabled here.
+        dest_params["disable_wal"] = 0
+        # IngestWriteBatchWithIndex only supports disableWAL=true; this profile
+        # forces disable_wal=0 after the earlier ingest_wbwi_one_in guard has
+        # already run, so re-disable it here to avoid an unsupported pairing.
+        dest_params["ingest_wbwi_one_in"] = 0
+        dest_params["manual_wal_flush_one_in"] = 0
+        dest_params["use_txn"] = 0
+        dest_params["txn_write_policy"] = 0
+        dest_params["use_optimistic_txn"] = 0
+        dest_params["test_multi_ops_txns"] = 0
+        dest_params["test_batches_snapshots"] = 0
+        dest_params["two_write_queues"] = 0
+        dest_params["enable_pipelined_write"] = 0
+        dest_params["unordered_write"] = 0
+        dest_params["recycle_log_file_num"] = 0
+        dest_params["WAL_ttl_seconds"] = 0
+        dest_params["WAL_size_limit_MB"] = 0
+        dest_params["track_and_verify_wals"] = 0
+        dest_params["enable_blob_direct_write"] = 0
+        dest_params["reopen"] = 0
+        dest_params["exclude_wal_from_write_fault_injection"] = 0
+        dest_params["inject_error_severity"] = 1
+        if dest_params.get("write_fault_one_in", 0) <= 0:
+            dest_params["write_fault_one_in"] = 128
+        dest_params["max_write_buffer_number"] = max(
+            dest_params["max_write_buffer_number"], 10
+        )
+        dest_params["sync_fault_injection"] = 0
+        dest_params["metadata_read_fault_one_in"] = 0
+        dest_params["metadata_write_fault_one_in"] = 0
+        dest_params["read_fault_one_in"] = 0
+        dest_params["secondary_cache_fault_one_in"] = 0
+        dest_params["open_metadata_read_fault_one_in"] = 0
+        dest_params["open_metadata_write_fault_one_in"] = 0
+        dest_params["open_read_fault_one_in"] = 0
+        dest_params["open_write_fault_one_in"] = 0
+
     if dest_params.get("num_dbs", 1) > 1:
         # These features assume a single DB instance.
         # See ValidateNumDbsFlags() in db_stress_tool.cc for C++ guards.
@@ -1923,10 +2028,17 @@ def finalize_and_sanitize(src_params):
         dest_params["cache_size"] = 65536
         dest_params["use_write_buffer_manager"] = 0
 
+    # `db_stress` rejects either verification knob when `skip_verifydb` is set.
+    # Must stay last: sanitization above can turn a verification knob back on
+    # after `skip_verifydb` was decided.
+    if dest_params.get("skip_verifydb", 0):
+        dest_params["continuous_verification_interval"] = 0
+        dest_params["verify_db_one_in"] = 0
+
     return dest_params
 
 
-def gen_cmd_params(args):
+def gen_cmd_params(args, unknown_params=None):
     params = {}
 
     params.update(default_params)
@@ -1956,14 +2068,15 @@ def gen_cmd_params(args):
         params.update(multiops_txn_params)
     if args.test_tiered_storage:
         params.update(tiered_params)
+    if args.test_full_external_table:
+        params.update(full_external_table_params)
 
-    # Best-effort recovery, tiered storage are currently incompatible with
-    # BlobDB and blob direct write. Test BE recovery if specified on the
-    # command line; otherwise, apply one of the blob feature overrides with a
-    # 10% chance.
+    # These specialized profiles use fixed table configurations. Otherwise,
+    # apply a blob feature override with a 10% chance.
     if (
         not args.test_best_efforts_recovery
         and not args.test_tiered_storage
+        and not args.test_full_external_table
         and args.test_type != "liveness"
         and params.get("test_secondary", 0) == 0
         and random.choice([0] * 9 + [1]) == 1
@@ -1988,9 +2101,85 @@ def gen_cmd_params(args):
     for k, v in vars(args).items():
         if v is not None:
             params[k] = v
+
+    # Reserve a small fraction of ordinary crash-test invocations for the
+    # file-scoped WAL recovery state machine. Do this after merging command
+    # line arguments so automatic selection cannot override an explicit opt-out
+    # or an explicitly requested incompatible mode.
+    explicit_incompatible_file_scope_flags = [
+        "best_efforts_recovery",
+        "disable_wal",
+        "manual_wal_flush_one_in",
+        "test_cf_consistency",
+        "use_txn",
+        "test_multi_ops_txns",
+        "test_batches_snapshots",
+        "two_write_queues",
+        "enable_pipelined_write",
+        "unordered_write",
+        "recycle_log_file_num",
+        "WAL_ttl_seconds",
+        "WAL_size_limit_MB",
+        "track_and_verify_wals",
+        "enable_blob_direct_write",
+        "reopen",
+        "exclude_wal_from_write_fault_injection",
+        "sync_fault_injection",
+        "metadata_read_fault_one_in",
+        "metadata_write_fault_one_in",
+        "read_fault_one_in",
+        "secondary_cache_fault_one_in",
+        "open_metadata_read_fault_one_in",
+        "open_metadata_write_fault_one_in",
+        "open_read_fault_one_in",
+        "open_write_fault_one_in",
+    ]
+    has_explicit_file_scope_conflict = any(
+        getattr(args, flag, None) not in (None, 0)
+        for flag in explicit_incompatible_file_scope_flags
+    )
+    # Unknown arguments are forwarded to db_stress after the generated flags,
+    # so they can change the effective configuration without being visible in
+    # `args`. Only auto-select this specialized profile when every option was
+    # parsed and checked here. Explicit selection remains available.
+    has_unparsed_file_scope_args = bool(unknown_params)
+    if (
+        getattr(args, "file_scope_wal_write_faults", None) is None
+        and getattr(args, "write_fault_one_in", None) != 0
+        and (
+            getattr(args, "inject_error_severity", None) is None
+            or getattr(args, "inject_error_severity") == 1
+        )
+        and not has_explicit_file_scope_conflict
+        and not has_unparsed_file_scope_args
+        and args.test_type != "liveness"
+        and not args.cf_consistency
+        and not args.txn
+        and not args.optimistic_txn
+        and not args.test_best_efforts_recovery
+        and not args.enable_ts
+        and not args.test_multiops_txn
+        and not args.test_tiered_storage
+        and params.get("test_batches_snapshots", 0) == 0
+        and params.get("enable_blob_direct_write", 0) == 0
+        and random.choice([0] * 19 + [1]) == 1
+    ):
+        params["file_scope_wal_write_faults"] = 1
     if args.test_type == "liveness":
         apply_liveness_remote_defaults(params, args)
         params.update(liveness_fault_injection_params)
+
+    # DB paths must not change between the crash and recovery processes.
+    wbm_flush_policy = params["wbm_flush_policy"]
+    if callable(wbm_flush_policy):
+        wbm_flush_policy = wbm_flush_policy()
+        params["wbm_flush_policy"] = wbm_flush_policy
+    use_write_buffer_manager = params["use_write_buffer_manager"]
+    if (
+        wbm_flush_policy == _WBM_FLUSH_LARGEST_ACROSS_DBS
+        and (callable(use_write_buffer_manager) or use_write_buffer_manager)
+    ):
+        params["num_dbs"] = max(params.get("num_dbs", 1), 2)
     return params
 
 
@@ -2032,6 +2221,7 @@ def gen_cmd(params, unknown_params):
                 "test_multiops_txn",
                 "stress_cmd",
                 "test_tiered_storage",
+                "test_full_external_table",
                 "cleanup_cmd",
                 "print_stderr_separately",
                 "verify_timeout",
@@ -2477,7 +2667,7 @@ def liveness_timeout(cmd_params):
 
 
 def liveness_main(args, unknown_args):
-    cmd_params = gen_cmd_params(args)
+    cmd_params = gen_cmd_params(args, unknown_args)
     db_parent_dir = get_db_parent_dir("liveness")
     num_dbs = cmd_params.get("num_dbs", 1)
 
@@ -2530,7 +2720,7 @@ def liveness_main(args, unknown_args):
 # This script runs and kills db_stress multiple times. It checks consistency
 # in case of unsafe crashes in RocksDB.
 def blackbox_crash_main(args, unknown_args):
-    cmd_params = gen_cmd_params(args)
+    cmd_params = gen_cmd_params(args, unknown_args)
     db_parent_dir = get_db_parent_dir("blackbox")
     ev_parent_dir = get_ev_parent_dir()
     num_dbs = cmd_params.get("num_dbs", 1)
@@ -2602,7 +2792,7 @@ def blackbox_crash_main(args, unknown_args):
 # This python script runs db_stress multiple times. Some runs with
 # kill_random_test that causes rocksdb to crash at various points in code.
 def whitebox_crash_main(args, unknown_args):
-    cmd_params = gen_cmd_params(args)
+    cmd_params = gen_cmd_params(args, unknown_args)
     db_parent_dir = get_db_parent_dir("whitebox")
     ev_parent_dir = get_ev_parent_dir()
     num_dbs = cmd_params.get("num_dbs", 1)
@@ -2803,6 +2993,7 @@ def main():
     parser.add_argument("--test_multiops_txn", action="store_true")
     parser.add_argument("--stress_cmd")
     parser.add_argument("--test_tiered_storage", action="store_true")
+    parser.add_argument("--test_full_external_table", action="store_true")
     parser.add_argument("--cleanup_cmd")  # ignore old option for now
     parser.add_argument("--print_stderr_separately", action="store_true", default=False)
     parser.add_argument(
@@ -2828,6 +3019,7 @@ def main():
         + list(best_efforts_recovery_params.items())
         + list(cf_consistency_params.items())
         + list(tiered_params.items())
+        + list(full_external_table_params.items())
         + list(txn_params.items())
         + list(optimistic_txn_params.items())
     )

@@ -59,6 +59,7 @@
 #include "table/block_based/user_defined_index_wrapper.h"
 #include "table/format.h"
 #include "table/meta_blocks.h"
+#include "table/range_del_block.h"
 #include "table/table_builder.h"
 #include "test_util/sync_point.h"
 #include "util/bit_fields.h"
@@ -1022,7 +1023,7 @@ struct BlockBasedTableBuilder::Rep {
   // compression dictionary is enabled so we can finalize the dictionary before
   // compressing any data blocks.
   std::vector<std::string> data_block_buffers;
-  BlockBuilder range_del_block;
+  RangeDelBlockBuilder range_del_block;
 
   InternalKeySliceTransform internal_prefix_transform;
   std::unique_ptr<IndexBuilder> index_builder;
@@ -1422,14 +1423,7 @@ struct BlockBasedTableBuilder::Rep {
                    UseCommonPrefixForDataBlock(
                        table_options, tbo.internal_comparator.user_comparator(),
                        ts_sz)),
-        range_del_block(
-            1 /* block_restart_interval */, true /* use_delta_encoding */,
-            false /* use_value_delta_encoding */,
-            BlockBasedTableOptions::kDataBlockBinarySearch /* index_type */,
-            0.75 /* data_block_hash_table_util_ratio */, ts_sz,
-            persist_user_defined_timestamps, false /* is_user_key */,
-            false /* use_separated_kv_storage */, /*statistics=*/nullptr,
-            /*uniform_cv_threshold=*/-1.0, /*use_common_prefix=*/false),
+        range_del_block(ts_sz, persist_user_defined_timestamps),
         internal_prefix_transform(prefix_extractor.get()),
         sample_for_compression(tbo.moptions.sample_for_compression),
         use_delta_encoding_for_index_values(
@@ -2069,17 +2063,8 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
                                       r->ioptions.logger);
 
   } else if (value_type == kTypeRangeDeletion) {
-    Slice persisted_end = value;
-    // When timestamps should not be persisted, we physically strip away range
-    // tombstone end key's user timestamp before passing it along to block
-    // builder. Physically stripping away start key's user timestamp is
-    // handled at the block builder level in the same way as the other data
-    // blocks.
-    if (r->ts_sz > 0 && !r->persist_user_defined_timestamps) {
-      persisted_end = StripTimestampFromUserKey(value, r->ts_sz);
-    }
     // NOTE: WriteBatch guarantees keys < 4GB; here 'value' is also a key
-    r->range_del_block.Add(ikey, persisted_end);
+    r->range_del_block.Add(ikey, value);
     // TODO offset passed in is not accurate for parallel compression case
     NotifyCollectTableCollectorsOnAdd(ikey, value, r->get_offset(),
                                       r->table_properties_collectors,
@@ -2728,10 +2713,10 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
       Crc32cChecksum block_contents_checksum(block_contents_crc32c);
       NotifyFileAppendForTest(block_contents, &block_contents_checksum);
       io_s =
-          r->file->Append(io_options, block_contents, block_contents_checksum);
+          r->file->Append(block_contents, io_options, block_contents_checksum);
     } else {
       NotifyFileAppendForTest(block_contents, nullptr);
-      io_s = r->file->Append(io_options, block_contents);
+      io_s = r->file->Append(block_contents, io_options);
     }
     if (UNLIKELY(!io_s.ok())) {
       return io_s;
@@ -2764,10 +2749,10 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
     if (r->table_options.checksum == kCRC32c) {
       Crc32cChecksum trailer_checksum(trailer_crc32c);
       NotifyFileAppendForTest(trailer_to_write, &trailer_checksum);
-      io_s = r->file->Append(io_options, trailer_to_write, trailer_checksum);
+      io_s = r->file->Append(trailer_to_write, io_options, trailer_checksum);
     } else {
       NotifyFileAppendForTest(trailer_to_write, nullptr);
-      io_s = r->file->Append(io_options, trailer_to_write);
+      io_s = r->file->Append(trailer_to_write, io_options);
     }
     if UNLIKELY (!io_s.ok()) {
       return io_s;
@@ -3380,7 +3365,7 @@ void BlockBasedTableBuilder::WriteFooter(BlockHandle& metaindex_block_handle,
   if (footer_gap > 0) {
     std::string gap_bytes(footer_gap, '\0');
     NotifyFileAppendForTest(Slice(gap_bytes), nullptr);
-    ios = r->file->Append(io_options, Slice(gap_bytes));
+    ios = r->file->Append(Slice(gap_bytes), io_options);
     if (!ios.ok()) {
       r->SetIOStatus(ios);
       return;
@@ -3398,7 +3383,7 @@ void BlockBasedTableBuilder::WriteFooter(BlockHandle& metaindex_block_handle,
     return;
   }
   NotifyFileAppendForTest(footer.GetSlice(), nullptr);
-  ios = r->file->Append(io_options, footer.GetSlice());
+  ios = r->file->Append(footer.GetSlice(), io_options);
   if (ios.ok()) {
     r->pre_compression_size += footer.GetSlice().size();
     r->set_offset(r->get_offset() + footer.GetSlice().size());
@@ -3787,7 +3772,7 @@ void BlockBasedTableBuilder::SetSeqnoTimeTableProperties(
     const SeqnoToTimeMapping& relevant_mapping, uint64_t oldest_ancestor_time) {
   assert(rep_->props.seqno_to_time_mapping.empty());
   relevant_mapping.EncodeTo(rep_->props.seqno_to_time_mapping);
-  rep_->props.creation_time = oldest_ancestor_time;
+  rep_->props.oldest_ancestor_time = oldest_ancestor_time;
 }
 
 const std::string BlockBasedTable::kObsoleteFilterBlockPrefix = "filter.";

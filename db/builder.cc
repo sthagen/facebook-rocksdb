@@ -396,7 +396,7 @@ Status BuildTable(
           relevant_mapping,
           ioptions.compaction_style == CompactionStyle::kCompactionStyleFIFO
               ? meta->file_creation_time
-              : meta->oldest_ancester_time);
+              : meta->oldest_ancestor_time);
       s = builder->Finish();
     }
     if (io_status->ok()) {
@@ -452,7 +452,8 @@ Status BuildTable(
         WritableFileWriter::PrepareIOOptions(tboptions.write_options, opts);
     if (s.ok() && io_status->ok() && !empty) {
       StopWatch sw(ioptions.clock, ioptions.stats, TABLE_SYNC_MICROS);
-      *io_status = file_writer->Sync(opts, ioptions.use_fsync);
+      *io_status = ioptions.use_fsync ? file_writer->Fsync(opts)
+                                      : file_writer->Sync(opts);
     }
     TEST_SYNC_POINT("BuildTable:BeforeCloseTableFile");
     if (s.ok() && io_status->ok() && !empty) {

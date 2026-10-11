@@ -12,6 +12,7 @@
 #include "rocksdb/utilities/backup_engine.h"
 #ifdef GFLAGS
 #include "db_stress_tool/db_stress_common.h"
+#include "util/cast_util.h"
 
 static bool ValidateUint32Range(const char* flagname, uint64_t value) {
   if (value > std::numeric_limits<uint32_t>::max()) {
@@ -195,12 +196,35 @@ static const bool FLAGS_stress_diagnostics_breadcrumb_entries_dummy
         RegisterFlagValidator(&FLAGS_stress_diagnostics_breadcrumb_entries,
                               &ValidateStressDiagnosticEntryCount);
 
+DEFINE_bool(stress_diagnostics_scan_witness, false,
+            "If true, retain a bounded in-memory witness log for PrefixScan "
+            "and MultiScan operations and write it to --stress_diagnostics_dir "
+            "only when the operation reports a verification failure.");
+
+DEFINE_uint64(stress_diagnostics_scan_witness_entries, 128,
+              "Number of recent public iterator events retained per "
+              "PrefixScan/MultiScan operation when "
+              "--stress_diagnostics_scan_witness is true. Maximum is 65536.");
+// NOLINTNEXTLINE(cert-err58-cpp)
+static const bool FLAGS_stress_diagnostics_scan_witness_entries_dummy
+    __attribute__((__unused__)) =
+        RegisterFlagValidator(&FLAGS_stress_diagnostics_scan_witness_entries,
+                              &ValidateStressDiagnosticEntryCount);
+
 DEFINE_uint64(db_write_buffer_size,
               ROCKSDB_NAMESPACE::Options().db_write_buffer_size,
               "Number of bytes to buffer in all memtables before compacting");
 
 DEFINE_bool(use_write_buffer_manager, false,
             "Charge WriteBufferManager memory to the block cache");
+
+DEFINE_int32(
+    wbm_flush_policy,
+    ROCKSDB_NAMESPACE::lossless_cast<int32_t>(
+        ROCKSDB_NAMESPACE::WriteBufferFlushPolicy::kFlushOldest),
+    "Which memtable the WriteBufferManager flushes to free memory (see `enum "
+    "class WriteBufferFlushPolicy` in write_buffer_manager.h): 0 = oldest, 1 = "
+    "largest in the same DB, 2 = largest across all DBs sharing the manager");
 
 DEFINE_int32(
     write_buffer_size,
@@ -744,6 +768,9 @@ DEFINE_bool(use_udi_as_primary_index, false,
             "the standard index and UDI are always built). When false, "
             "the UDI is a secondary index and reads require "
             "ReadOptions::table_index_factory to be set.");
+
+DEFINE_bool(use_full_external_table, false,
+            "Use the simple full external table test factory.");
 
 DEFINE_bool(test_backward_scan, true,
             "Test backward iteration (Prev, SeekForPrev) in stress tests.");
@@ -1411,6 +1438,11 @@ DEFINE_int32(write_fault_one_in, 0,
 
 DEFINE_bool(exclude_wal_from_write_fault_injection, false,
             "If true, we won't inject write fault when writing to WAL file");
+
+DEFINE_bool(file_scope_wal_write_faults, false,
+            "If true, injected write faults on WAL files have file scope so "
+            "the file-scoped WAL recovery protocol is exercised. Other fault "
+            "injection and unsupported recovery options must be disabled");
 
 DEFINE_int32(metadata_write_fault_one_in, 1000,
              "On non-zero, enables fault injection on metadata write (i.e, "

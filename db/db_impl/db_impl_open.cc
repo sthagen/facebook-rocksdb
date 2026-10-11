@@ -683,7 +683,7 @@ Status DBImpl::Recover(
                            f->marked_for_compaction,
                            f->temperature,  // this can be different from
                            // `last_level_temperature`
-                           f->oldest_blob_file_number, f->oldest_ancester_time,
+                           f->oldest_blob_file_number, f->oldest_ancestor_time,
                            f->file_creation_time, f->epoch_number,
                            f->file_checksum, f->file_checksum_func_name,
                            f->unique_id, f->compensated_range_deletion_size,
@@ -2143,7 +2143,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     immutable_db_options_.clock->GetCurrentTime(&_current_time)
         .PermitUncheckedError();  // ignore error
     const uint64_t current_time = static_cast<uint64_t>(_current_time);
-    meta.oldest_ancester_time = current_time;
+    meta.oldest_ancestor_time = current_time;
     meta.epoch_number = cfd->NewEpochNumber();
     {
       auto write_hint = cfd->current()->storage_info()->CalculateSSTWriteHint(
@@ -2277,7 +2277,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
                   meta.fd.GetFileSize(), meta.smallest, meta.largest,
                   meta.fd.smallest_seqno, meta.fd.largest_seqno,
                   meta.marked_for_compaction, meta.temperature,
-                  meta.oldest_blob_file_number, meta.oldest_ancester_time,
+                  meta.oldest_blob_file_number, meta.oldest_ancestor_time,
                   meta.file_creation_time, meta.epoch_number,
                   meta.file_checksum, meta.file_checksum_func_name,
                   meta.unique_id, meta.compensated_range_deletion_size,
@@ -2791,8 +2791,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
             s = WritableFileWriter::PrepareIOOptions(write_options, opts);
           }
           if (s.ok()) {
-            s = log_writer->file()->Sync(opts,
-                                         impl->immutable_db_options_.use_fsync);
+            s = impl->immutable_db_options_.use_fsync
+                    ? log_writer->file()->Fsync(opts)
+                    : log_writer->file()->Sync(opts);
           }
         }
       }
@@ -2979,8 +2980,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         IOOptions opts;
         s = WritableFileWriter::PrepareIOOptions(write_options, opts);
         if (s.ok()) {
-          s = log_writer->file()->Sync(opts,
-                                       impl->immutable_db_options_.use_fsync);
+          s = impl->immutable_db_options_.use_fsync
+                  ? log_writer->file()->Fsync(opts)
+                  : log_writer->file()->Sync(opts);
         }
       }
     }
@@ -3013,6 +3015,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     }
   }
   if (s.ok()) {
+    // Register only after open succeeds and without holding the DB mutex.
+    impl->MaybeRegisterFlushInitiator();
     *dbptr = std::move(impl);
   } else {
     for (auto* h : *handles) {
@@ -3070,8 +3074,18 @@ void DBImpl::ScheduleAsyncFileOpening() {
   bg_async_file_open_state_ = AsyncFileOpenState::kScheduled;
 
   // since this is a one time job, best to schedule it with high priority
+  auto unschedule_callback = [](void* arg) {
+    auto* unscheduled_ctx = static_cast<AsyncFileOpenContext*>(arg);
+    DBImpl* db = unscheduled_ctx->db;
+    db->mutex_.AssertHeld();
+    delete unscheduled_ctx;
+    db->bg_async_file_open_state_ = AsyncFileOpenState::kComplete;
+    db->bg_cv_.SignalAll();
+    TEST_SYNC_POINT("DBImpl::UnscheduleAsyncFileOpenCallback");
+    TEST_SYNC_POINT("DBImpl::BGWorkAsyncFileOpen:Done");
+  };
   env_->Schedule(&DBImpl::BGWorkAsyncFileOpen, ctx, Env::Priority::HIGH,
-                 nullptr);
+                 &bg_async_file_open_state_, unschedule_callback);
 }
 
 void DBImpl::MarkAsyncFileOpenNotNeeded() {
@@ -3101,8 +3115,9 @@ void DBImpl::BGWorkAsyncFileOpen(void* arg) {
     auto* version = ctx->versions[i];
     ColumnFamilyData* cfd = version->cfd();
 
-    // Skip column families that were dropped after scheduling
-    if (cfd->IsDropped()) {
+    // Retained secondary handles remain readable after the primary drops the
+    // column family, so their captured Versions still need pinned readers.
+    if (cfd->IsDropped() && !db->read_only_) {
       continue;
     }
 
@@ -3132,11 +3147,15 @@ void DBImpl::BGWorkAsyncFileOpen(void* arg) {
     if (!s.ok()) {
       ROCKS_LOG_ERROR(
           db->immutable_db_options_.info_log,
-          "BGWorkAsyncFileOpen: LoadTableHandlers failed for CF %s: "
-          "%s",
+          "BGWorkAsyncFileOpen: file validation/opening failed for CF %s: %s",
           cfd->GetName().c_str(), s.ToString().c_str());
       InstrumentedMutexLock l(&db->mutex_);
-      db->error_handler_.SetBGError(s, BackgroundErrorReason::kAsyncFileOpen);
+      if (db->read_only_) {
+        db->error_handler_.SetBGErrorNoAutoRecovery(
+            s, BackgroundErrorReason::kAsyncFileOpen);
+      } else {
+        db->error_handler_.SetBGError(s, BackgroundErrorReason::kAsyncFileOpen);
+      }
       break;
     }
   }

@@ -23,6 +23,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/debug.h"
+#include "rocksdb/write_buffer_manager.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_builder.h"
 #include "table/format.h"
@@ -85,11 +86,9 @@ class MyFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
   explicit MyFlushBlockPolicyFactory(const int num_keys_in_block)
       : num_keys_in_block_(num_keys_in_block) {}
 
-  virtual const char* Name() const override {
-    return "MyFlushBlockPolicyFactory";
-  }
+  const char* Name() const override { return "MyFlushBlockPolicyFactory"; }
 
-  virtual FlushBlockPolicy* NewFlushBlockPolicy(
+  FlushBlockPolicy* NewFlushBlockPolicy(
       const BlockBasedTableOptions& /*table_options*/,
       const BlockBuilder& data_block_builder) const override {
     return new MyFlushBlockPolicy(num_keys_in_block_, data_block_builder);
@@ -5767,6 +5766,9 @@ INSTANTIATE_TEST_CASE_P(BestEffortsRecoverIncompleteVersionTest,
 TEST_F(DBBasicTest, BestEffortsRecoveryTryMultipleManifests) {
   Options options = CurrentOptions();
   options.env = env_;
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(
+      64 << 20, nullptr /* cache */, false /* allow_stall */,
+      WriteBufferFlushPolicy::kFlushLargestAcrossDBs);
   DestroyAndReopen(options);
   ASSERT_OK(Put("foo", "value0"));
   ASSERT_OK(Flush());
@@ -5788,6 +5790,9 @@ TEST_F(DBBasicTest, BestEffortsRecoveryTryMultipleManifests) {
 
   Reopen(options);
   ASSERT_OK(Put("bar", "value"));
+  options.write_buffer_manager->TEST_RefreshFlushInitiatorCandidate();
+  ASSERT_TRUE(
+      options.write_buffer_manager->TEST_ScheduleFlushOnLargestDB(nullptr));
 }
 
 TEST_F(DBBasicTest, RecoverWithNoCurrentFile) {
@@ -6369,9 +6374,9 @@ TEST_P(DBBasicTestWithParallelIO, MultiGet) {
     ASSERT_TRUE(CheckUncompressableValue(key_uncmp[i], values[i].ToString()));
   }
   if (compression_enabled() && !has_compressed_cache()) {
-    expected_reads += (read_from_cache ? 3 : 3);
+    expected_reads += 3;
   } else {
-    expected_reads += (read_from_cache ? 4 : 4);
+    expected_reads += 4;
   }
   ASSERT_EQ(env_->random_read_counter_.Read(), expected_reads);
 
@@ -6438,7 +6443,7 @@ TEST_P(DBBasicTestWithParallelIO, MultiGetDirectIO) {
      public:
       FakeDirectIOSequentialFile(std::unique_ptr<SequentialFile>&& file)
           : SequentialFileWrapper(file.get()), file_(std::move(file)) {}
-      ~FakeDirectIOSequentialFile() {}
+      ~FakeDirectIOSequentialFile() override {}
 
       bool use_direct_io() const override { return true; }
       size_t GetRequiredBufferAlignment() const override { return 1; }
@@ -6451,7 +6456,7 @@ TEST_P(DBBasicTestWithParallelIO, MultiGetDirectIO) {
      public:
       FakeDirectIORandomAccessFile(std::unique_ptr<RandomAccessFile>&& file)
           : RandomAccessFileWrapper(file.get()), file_(std::move(file)) {}
-      ~FakeDirectIORandomAccessFile() {}
+      ~FakeDirectIORandomAccessFile() override {}
 
       bool use_direct_io() const override { return true; }
       size_t GetRequiredBufferAlignment() const override { return 1; }

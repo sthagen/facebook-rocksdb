@@ -29,7 +29,6 @@
 namespace ROCKSDB_NAMESPACE {
 
 class InternalKeyComparator;
-class Mutex;
 class VersionSet;
 
 bool MultiScanOverlapsUserKeyRange(const MultiScanArgs* scan_opts,
@@ -790,6 +789,24 @@ size_t MemTableList::ApproximateUnflushedMemTablesMemoryUsage() {
   size_t total_size = 0;
   for (auto& memtable : current_->memlist_) {
     total_size += memtable->ApproximateMemoryUsage();
+  }
+  return total_size;
+}
+
+size_t MemTableList::WBMTrackedUnflushedMemTablesMemoryUsage() const {
+  size_t total_size = 0;
+  for (const ReadOnlyMemTable* memtable : current_->memlist_) {
+    total_size += memtable->WBMTrackedMemoryUsage();
+  }
+  return total_size;
+}
+
+size_t MemTableList::WBMTrackedUnstartedMemTablesMemoryUsage() const {
+  size_t total_size = 0;
+  for (const ReadOnlyMemTable* memtable : current_->memlist_) {
+    if (!memtable->flush_in_progress_) {
+      total_size += memtable->WBMTrackedMemoryUsage();
+    }
   }
   return total_size;
 }

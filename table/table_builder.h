@@ -49,7 +49,8 @@ struct TableReaderOptions {
       const std::string& _cur_db_session_id = "", uint64_t _cur_file_num = 0,
       UniqueId64x2 _unique_id = {}, SequenceNumber _largest_seqno = 0,
       uint64_t _tail_size = 0, bool _user_defined_timestamps_persisted = true,
-      bool _avoid_shared_metadata_cache = false)
+      bool _avoid_shared_metadata_cache = false,
+      const std::string& _column_family_name = "")
       : ioptions(_ioptions),
         prefix_extractor(_prefix_extractor),
         compression_manager(_compression_manager),
@@ -68,7 +69,8 @@ struct TableReaderOptions {
         block_protection_bytes_per_key(_block_protection_bytes_per_key),
         tail_size(_tail_size),
         user_defined_timestamps_persisted(_user_defined_timestamps_persisted),
-        avoid_shared_metadata_cache(_avoid_shared_metadata_cache) {}
+        avoid_shared_metadata_cache(_avoid_shared_metadata_cache),
+        column_family_name(_column_family_name) {}
 
   const ImmutableOptions& ioptions;
   const std::shared_ptr<const SliceTransform>& prefix_extractor;
@@ -88,7 +90,8 @@ struct TableReaderOptions {
   // What level this table/file is on, -1 for "not set, don't know." Used
   // for level-specific statistics.
   int level;
-  // largest seqno in the table (or 0 means unknown???)
+  // Largest seqno in the table. kMaxSequenceNumber means unknown;
+  // kDisableGlobalSequenceNumber prevents file-wide seqno replacement.
   SequenceNumber largest_seqno;
   BlockCacheTracer* const block_cache_tracer;
   // Largest L0 file size whose meta-blocks may be pinned (can be zero when
@@ -112,6 +115,9 @@ struct TableReaderOptions {
   // Open-time metadata reads should not insert index/filter/dictionary blocks
   // into the shared block cache.
   bool avoid_shared_metadata_cache;
+
+  // Column family that owns this table. Empty outside DB-owned table opens.
+  std::string column_family_name;
 
   // Blob source for routing same-file ("embedded") blob reads through the blob
   // value cache + BLOB_DB_* statistics. Owned by the ColumnFamilyData; the

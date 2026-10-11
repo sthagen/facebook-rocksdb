@@ -94,7 +94,7 @@ class MockTableBuilder : public TableBuilder {
   }
 
   // REQUIRES: Either Finish() or Abandon() has been called.
-  ~MockTableBuilder() = default;
+  ~MockTableBuilder() override = default;
 
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.
@@ -253,14 +253,14 @@ Status MockTableFactory::GetAndWriteNextID(WritableFileWriter* file,
   *next_id = next_id_.fetch_add(1);
   char buf[4];
   EncodeFixed32(buf, *next_id);
-  return file->Append(IOOptions(), Slice(buf, 4));
+  return file->Append(Slice(buf, 4), IOOptions());
 }
 
 Status MockTableFactory::GetIDFromFile(RandomAccessFileReader* file,
                                        uint32_t* id) const {
   char buf[4];
   Slice result;
-  Status s = file->Read(IOOptions(), 0, 4, &result, buf, nullptr);
+  Status s = file->Read(0, 4, IOOptions(), &result, buf, nullptr);
   assert(result.size() == 4);
   *id = DecodeFixed32(buf);
   return s;

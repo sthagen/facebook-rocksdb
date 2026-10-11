@@ -36,6 +36,10 @@ class CompressionManager;
 using UserCollectedProperties = std::map<std::string, std::string>;
 
 // table properties' human-readable names in the property block.
+//
+// DEPRECATED: intended for internal use only and will be removed from the
+// public API in a future release. Use the corresponding TableProperties
+// fields instead.
 struct TablePropertiesNames {
   static const std::string kDbId;
   static const std::string kDbSessionId;
@@ -71,7 +75,12 @@ struct TablePropertiesNames {
   static const std::string kPropertyCollectors;
   static const std::string kCompression;
   static const std::string kCompressionOptions;
-  static const std::string kCreationTime;
+  // NOTE: set to "rocksdb.creation.time" because of unfortunate initial
+  // mis-naming of the property. See kFileCreationTime and file_creation_time.
+  static const std::string kOldestAncestorTime;
+  // DEPRECATED: old name for kOldestAncestorTime. Will be removed in a future
+  // release.
+  static const std::string& kCreationTime;
   static const std::string kOldestKeyTime;
   static const std::string kNewestKeyTime;
   static const std::string kFileCreationTime;
@@ -173,7 +182,7 @@ class TablePropertiesCollector {
 class TablePropertiesCollectorFactory : public Customizable {
  public:
   struct Context {
-    uint32_t column_family_id;
+    uint32_t column_family_id = kUnknownColumnFamily;
     // The level at creating the SST file (i.e, table), of which the
     // properties are being collected.
     int level_at_creation = kUnknownLevelAtCreation;
@@ -182,7 +191,7 @@ class TablePropertiesCollectorFactory : public Customizable {
     // cutoff sequence number will be considered by a compaction job as eligible
     // to be placed on the last level. When this is the maximum sequence number,
     // it indicates tiering is disabled.
-    SequenceNumber last_level_inclusive_max_seqno_threshold;
+    SequenceNumber last_level_inclusive_max_seqno_threshold = 0;
     static const uint32_t kUnknownColumnFamily;
     static const int kUnknownLevelAtCreation = -1;
     static const int kUnknownNumLevels = -1;
@@ -325,7 +334,7 @@ struct TableProperties {
   uint64_t column_family_id = ROCKSDB_NAMESPACE::
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily;
 
-  // Oldest ancester time. 0 means unknown.
+  // Oldest ancestor time. 0 means unknown.
   //
   // For flush output file, oldest ancestor time is the oldest key time in the
   // file.  If the oldest key time is not available, flush time is used.
@@ -335,10 +344,12 @@ struct TableProperties {
   // the compaction output from other SST files, which could in turn be outputs
   // for compact older SST files. If that's not available, creation time of this
   // compaction output file is used.
-  //
-  // TODO(sagar0): Should be changed to oldest_ancester_time ... but don't know
-  // the full implications of backward compatibility. Hence retaining for now.
-  uint64_t creation_time = 0;
+  union {
+    uint64_t oldest_ancestor_time = 0;
+    // DEPRECATED: old name for oldest_ancestor_time. Will be removed in a
+    // future release.
+    uint64_t creation_time;
+  };
 
   // Timestamp of the earliest key. 0 means unknown.
   uint64_t oldest_key_time = 0;
@@ -354,11 +365,6 @@ struct TableProperties {
   // compression algorithm (see `ColumnFamilyOptions::sample_for_compression`).
   // 0 means unknown.
   uint64_t fast_compression_estimated_data_size = 0;
-  // Offset of the value of the property "external sst file global seqno" in the
-  // file if the property exists.
-  // 0 means not exists.
-  uint64_t external_sst_file_global_seqno_offset = 0;
-
   // Offset where the "tail" part of SST file starts
   // "Tail" refers to all blocks after data blocks till the end of the SST file
   uint64_t tail_start_offset = 0;

@@ -380,15 +380,26 @@ Status DBImpl::IngestWBWIAsMemtable(
 
   // Switch memtable and add WBWIMemTables
   Status s;
+  const bool defer_wbm_accounting_refresh =
+      immutable_db_options_.atomic_flush && cfds.size() > 1;
+  bool switch_attempted = false;
   for (size_t i = 0; i < cfds.size(); ++i) {
     WriteContext write_context;
+    switch_attempted = true;
     // TODO: not switch on empty memtable, may need to update metadata
     //   like NextLogNumber(), earliest_seqno and memtable id.
     if (i < memtables.size()) {
-      s = SwitchMemtable(cfds[i], &write_context, memtables[i],
-                         last_seqno_after_ingest);
+      s = defer_wbm_accounting_refresh
+              ? SwitchMemtableImpl(cfds[i], &write_context, memtables[i],
+                                   last_seqno_after_ingest,
+                                   false /* refresh_wbm_accounting */)
+              : SwitchMemtable(cfds[i], &write_context, memtables[i],
+                               last_seqno_after_ingest);
     } else {
-      s = SwitchMemtable(cfds[i], &write_context);
+      s = defer_wbm_accounting_refresh
+              ? SwitchMemtableImpl(cfds[i], &write_context, nullptr, 0,
+                                   false /* refresh_wbm_accounting */)
+              : SwitchMemtable(cfds[i], &write_context);
     }
     if (!s.ok()) {
       // SwitchMemtable() can only fail if a new WAL is to be created, this
@@ -419,6 +430,9 @@ Status DBImpl::IngestWBWIAsMemtable(
       }
       break;
     }
+  }
+  if (defer_wbm_accounting_refresh && switch_attempted) {
+    UpdateWBMAccountingAfterMemtableSwitch(true /* refresh_now */);
   }
   for (size_t i = 0; i < cfds.size(); ++i) {
     if (cfds[i]->UnrefAndTryDelete()) {
@@ -1201,6 +1215,7 @@ Status DBImpl::WriteImpl(
   IOStatus io_s;
   Status pre_release_cb_status;
   size_t seq_inc = 0;
+  uint64_t wal_write_number = 0;
   if (status.ok()) {
     if (deferred_put_entities != nullptr) {
       my_batch->Clear();
@@ -1362,6 +1377,7 @@ Status DBImpl::WriteImpl(
     if (!two_write_queues_) {
       if (status.ok() && !write_options.disableWAL) {
         assert(wal_context.wal_file_number_size);
+        wal_write_number = wal_context.wal_file_number_size->number;
         wal_context.prev_size = wal_context.writer->file()->GetFileSize();
         PERF_TIMER_GUARD(write_wal_time);
         io_s = WriteGroupToWAL(write_group, wal_context.writer, wal_used,
@@ -1486,7 +1502,9 @@ Status DBImpl::WriteImpl(
 
   if (!io_s.ok()) {
     // Check WriteToWAL status
-    WALIOStatusCheck(io_s);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::WriteImpl:BeforeWALIOStatusCheck", &io_s);
+    WALIOStatusCheck(io_s, wal_write_number, last_sequence,
+                     last_sequence + 1 - seq_inc);
   }
   if (!w.CallbackFailed()) {
     if (!io_s.ok()) {
@@ -2069,7 +2087,10 @@ void DBImpl::WriteStatusCheck(const Status& status) {
   }
 }
 
-void DBImpl::WALIOStatusCheck(const IOStatus& io_status) {
+void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
+                              uint64_t failed_wal_number,
+                              SequenceNumber failed_wal_sequence,
+                              SequenceNumber failed_wal_sequence_start) {
   // Is setting bg_error_ enough here?  This will at least stop
   // compaction and fail any further writes.
   if ((immutable_db_options_.paranoid_checks && !io_status.ok() &&
@@ -2077,12 +2098,47 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status) {
       io_status.IsIOFenced()) {
     mutex_.Lock();
     // Maybe change the return status to void?
-    error_handler_.SetBGError(io_status, BackgroundErrorReason::kWriteCallback,
-                              /*wal_related=*/true);
+    if (io_status.IsIOError() && !io_status.IsIOFenced()) {
+      DBRecoverContext context;
+      context.failed_wal_sequence = failed_wal_sequence;
+      context.failed_wal_sequence_start = failed_wal_sequence_start;
+      const uint64_t resolved_failed_wal_number =
+          failed_wal_number != 0 ? failed_wal_number : cur_wal_number_;
+      if (io_status.GetScope() == IOStatus::IOErrorScope::kIOErrorScopeFile) {
+        context.failed_wal_number = resolved_failed_wal_number;
+        if (failed_wal_sequence_start != 0 &&
+            failed_wal_sequence_start <= failed_wal_sequence) {
+          // Successful live resumption deliberately omits this write from the
+          // database even if the physical WAL record is complete. Keep a
+          // DB-lifetime fence so TransactionLogIterator does not expose it.
+          wal_manager_.RecordIndeterminateWriteSequence(
+              resolved_failed_wal_number, failed_wal_sequence_start,
+              failed_wal_sequence);
+        }
+        ExtendWALRecoveryCutoff(context.failed_wal_number);
+      }
+      error_handler_.SetBGError(io_status,
+                                BackgroundErrorReason::kWriteCallback,
+                                /*wal_related=*/true, context);
+    } else {
+      error_handler_.SetBGError(io_status,
+                                BackgroundErrorReason::kWriteCallback,
+                                /*wal_related=*/true);
+    }
     mutex_.Unlock();
   } else {
     // Force writable file to be continue writable.
     logs_.back().writer->file()->reset_seen_error();
+  }
+}
+
+void DBImpl::ExtendWALRecoveryCutoff(uint64_t failed_wal_number) {
+  assert(failed_wal_number != 0);
+  uint64_t current = wal_recovery_cutoff_.load(std::memory_order_relaxed);
+  while (current < failed_wal_number &&
+         !wal_recovery_cutoff_.compare_exchange_weak(
+             current, failed_wal_number, std::memory_order_release,
+             std::memory_order_relaxed)) {
   }
 }
 
@@ -2127,14 +2183,11 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
   }
 
   if (UNLIKELY(status.ok() && write_buffer_manager_->ShouldFlush())) {
-    // Before a new memtable is added in SwitchMemtable(),
-    // write_buffer_manager_->ShouldFlush() will keep returning true. If another
-    // thread is writing to another DB with the same write buffer, they may also
-    // be flushed. We may end up with flushing much more DBs than needed. It's
-    // suboptimal but still correct.
-    InstrumentedMutexLock l(&mutex_);
-    WaitForPendingWrites();
-    status = HandleWriteBufferManagerFlush(write_context);
+    if (write_buffer_manager_->TryAcquireLocalFlush()) {
+      InstrumentedMutexLock l(&mutex_);
+      WaitForPendingWrites();
+      status = HandleWriteBufferManagerFlush(write_context);
+    }
   }
 
   if (UNLIKELY(status.ok() && !trim_history_scheduler_.Empty())) {
@@ -2178,7 +2231,7 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
       status = Status::Incomplete("Write stall");
     } else {
       InstrumentedMutexLock l(&mutex_);
-      WriteBufferManagerStallWrites();
+      status = WriteBufferManagerStallWrites(write_context);
     }
   }
   InstrumentedMutexLock l(&wal_write_mutex_);
@@ -2287,10 +2340,13 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   }
   IOStatus io_s = log_writer->MaybeAddUserDefinedTimestampSizeRecord(
       write_options, versions_->GetColumnFamiliesTimestampSizeForRecord());
+  TEST_SYNC_POINT_CALLBACK(
+      "DBImpl::WriteToWAL:AfterMaybeAddUserDefinedTimestampSizeRecord", &io_s);
   if (!io_s.ok()) {
     return io_s;
   }
   io_s = log_writer->AddRecord(write_options, log_entry, sequence);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AfterAddRecord", &io_s);
 
   if (UNLIKELY(needs_locking)) {
     wal_write_mutex_.Unlock();
@@ -2379,7 +2435,8 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
         // and closed WAL that just needs to be recorded as synced in the
         // manifest.
         if (auto* f = log.writer->file()) {
-          io_s = f->Sync(opts, immutable_db_options_.use_fsync);
+          io_s =
+              immutable_db_options_.use_fsync ? f->Fsync(opts) : f->Sync(opts);
           if (!io_s.ok()) {
             break;
           }
@@ -2671,13 +2728,23 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
   }
 
+  const bool defer_wbm_accounting_refresh =
+      immutable_db_options_.atomic_flush && cfds.size() > 1;
+  bool switch_attempted = false;
   for (const auto cfd : cfds) {
     cfd->Ref();
-    status = SwitchMemtable(cfd, write_context);
+    switch_attempted = true;
+    status = defer_wbm_accounting_refresh
+                 ? SwitchMemtableImpl(cfd, write_context, nullptr, 0,
+                                      false /* refresh_wbm_accounting */)
+                 : SwitchMemtable(cfd, write_context);
     cfd->UnrefAndTryDelete();
     if (!status.ok()) {
       break;
     }
+  }
+  if (defer_wbm_accounting_refresh && switch_attempted) {
+    UpdateWBMAccountingAfterMemtableSwitch(true /* refresh_now */);
   }
   if (two_write_queues_) {
     nonmem_write_thread_.ExitUnbatched(&nonmem_w);
@@ -2722,25 +2789,17 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
   if (immutable_db_options_.atomic_flush) {
     SelectColumnFamiliesForAtomicFlush(&cfds);
   } else {
-    ColumnFamilyData* cfd_picked = nullptr;
-    SequenceNumber seq_num_for_cf_picked = kMaxSequenceNumber;
-
-    for (auto cfd : *versions_->GetColumnFamilySet()) {
-      if (cfd->IsDropped()) {
-        continue;
-      }
-      if (!cfd->mem()->IsEmpty() && !cfd->imm()->IsFlushPendingOrRunning()) {
-        // We only consider flush on CFs with bytes in the mutable memtable,
-        // and no immutable memtables for which flush has yet to finish. If
-        // we triggered flush on CFs already trying to flush, we would risk
-        // creating too many immutable memtables leading to write stalls.
-        uint64_t seq = cfd->mem()->GetCreationSeq();
-        if (cfd_picked == nullptr || seq < seq_num_for_cf_picked) {
-          cfd_picked = cfd;
-          seq_num_for_cf_picked = seq;
-        }
-      }
-    }
+    const WriteBufferFlushPolicy policy = write_buffer_manager_->flush_policy();
+    // Cross-DB selection still flushes the largest CF within the chosen DB.
+    const bool flush_largest =
+        policy == WriteBufferFlushPolicy::kFlushLargest ||
+        policy == WriteBufferFlushPolicy::kFlushLargestAcrossDBs;
+    const bool include_waiting_immutable =
+        policy == WriteBufferFlushPolicy::kFlushLargestAcrossDBs;
+    const FlushableCFs flushable =
+        CollectFlushableCFs(include_waiting_immutable);
+    ColumnFamilyData* cfd_picked =
+        flush_largest ? flushable.largest : flushable.oldest;
     if (cfd_picked != nullptr) {
       cfds.push_back(cfd_picked);
     }
@@ -2760,12 +2819,17 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
   if (two_write_queues_) {
     nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
   }
+  const bool defer_wbm_accounting_refresh =
+      immutable_db_options_.atomic_flush && cfds.size() > 1;
   for (const auto cfd : cfds) {
     if (cfd->mem()->IsEmpty()) {
       continue;
     }
     cfd->Ref();
-    status = SwitchMemtable(cfd, write_context);
+    status = defer_wbm_accounting_refresh
+                 ? SwitchMemtableImpl(cfd, write_context, nullptr, 0,
+                                      false /* refresh_wbm_accounting */)
+                 : SwitchMemtable(cfd, write_context);
     cfd->UnrefAndTryDelete();
     if (!status.ok()) {
       break;
@@ -2794,6 +2858,11 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
       GenerateFlushRequest(cfds, FlushReason::kWriteBufferManager, &flush_req);
       EnqueuePendingFlush(flush_req);
     }
+  }
+  if (write_buffer_manager_->ShouldTrackFlushInitiator()) {
+    RefreshFlushableMemAccounting();
+  }
+  if (status.ok()) {
     MaybeScheduleFlushOrCompaction();
   }
   return status;
@@ -2914,25 +2983,63 @@ Status DBImpl::DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
 
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
-void DBImpl::WriteBufferManagerStallWrites() {
+Status DBImpl::WriteBufferManagerStallWrites(WriteContext* write_context) {
   mutex_.AssertHeld();
-  // First block future writer threads who want to add themselves to the queue
-  // of WriteThread.
-  write_thread_.BeginWriteStall();
-  mutex_.Unlock();
+  for (;;) {
+    // First block future writer threads who want to add themselves to the
+    // queue of WriteThread.
+    write_thread_.BeginWriteStall();
+    const bool hid_flush_initiator =
+        wbm_flush_initiator_ != nullptr &&
+        write_buffer_manager_->ShouldTrackFlushInitiator();
+    if (hid_flush_initiator) {
+      wbm_flush_initiator_->SetFlushable(false);
+    }
+    mutex_.Unlock();
 
-  // Change the state to State::Blocked.
-  static_cast<WBMStallInterface*>(wbm_stall_.get())
-      ->SetState(WBMStallInterface::State::BLOCKED);
-  // Then WriteBufferManager will add DB instance to its queue
-  // and block this thread by calling WBMStallInterface::Block().
-  write_buffer_manager_->BeginWriteStall(wbm_stall_.get());
-  wbm_stall_->Block();
+    WBMStallInterface* const stall =
+        static_cast<WBMStallInterface*>(wbm_stall_.get());
+    stall->SetState(WBMStallInterface::State::BLOCKED);
+    write_buffer_manager_->BeginWriteStall(wbm_stall_.get());
+    bool retry_local_flush = false;
+    if (write_buffer_manager_->ShouldTrackFlushInitiator()) {
+      for (;;) {
+        if (stall->BlockFor(
+                write_buffer_manager_->GetLocalFlushRetryMicros())) {
+          break;
+        }
+        if (write_buffer_manager_->TryAcquireLocalFlush(wbm_stall_.get())) {
+          write_buffer_manager_->RemoveDBFromQueue(wbm_stall_.get());
+          retry_local_flush = true;
+          break;
+        }
+      }
+    } else {
+      stall->Block();
+    }
 
-  mutex_.Lock();
-  // Stall has ended. Signal writer threads so that they can add
-  // themselves to the WriteThread queue for writes.
-  write_thread_.EndWriteStall();
+    mutex_.Lock();
+    // Allow this front writer to retry the manager-wide emergency lease. It
+    // must not let its write through while the hard limit is still exceeded.
+    write_thread_.EndWriteStall();
+    // Restore the state hidden by this stall even if the runtime policy
+    // changed while the writer was blocked. Otherwise switching back to the
+    // across-DB policy can leave this DB permanently ineligible.
+    if (hid_flush_initiator) {
+      wbm_flush_initiator_->SetFlushable(true);
+      if (write_buffer_manager_->ShouldTrackFlushInitiator()) {
+        write_buffer_manager_->NotifyFlushInitiatorChanged();
+      }
+    }
+    if (!retry_local_flush || !write_buffer_manager_->ShouldStall()) {
+      return Status::OK();
+    }
+    WaitForPendingWrites();
+    Status status = HandleWriteBufferManagerFlush(write_context);
+    if (!status.ok()) {
+      return status;
+    }
+  }
 }
 
 Status DBImpl::ThrottleLowPriWritesIfNeeded(const WriteOptions& write_options,
@@ -3063,16 +3170,26 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
                            nullptr);
   autovector<FlushReason> flush_reasons;
   flush_reasons.reserve(cfds.size());
+  const bool defer_wbm_accounting_refresh =
+      immutable_db_options_.atomic_flush && cfds.size() > 1;
+  bool switch_attempted = false;
   for (auto& cfd : cfds) {
     FlushReason flush_reason = FlushReason::kWriteBufferFull;
     if (status.ok() && !cfd->mem()->IsEmpty()) {
       flush_reason = cfd->mem()->GetFlushReason();
-      status = SwitchMemtable(cfd, context);
+      switch_attempted = true;
+      status = defer_wbm_accounting_refresh
+                   ? SwitchMemtableImpl(cfd, context, nullptr, 0,
+                                        false /* refresh_wbm_accounting */)
+                   : SwitchMemtable(cfd, context);
     }
     flush_reasons.push_back(flush_reason);
     if (cfd->UnrefAndTryDelete()) {
       cfd = nullptr;
     }
+  }
+  if (defer_wbm_accounting_refresh && switch_attempted) {
+    UpdateWBMAccountingAfterMemtableSwitch(true /* refresh_now */);
   }
 
   if (two_write_queues_) {
@@ -3118,6 +3235,31 @@ void DBImpl::NotifyOnMemTableSealed(ColumnFamilyData* /*cfd*/,
 Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
                               ReadOnlyMemTable* new_imm,
                               SequenceNumber last_seqno) {
+  return SwitchMemtableImpl(cfd, context, new_imm, last_seqno,
+                            true /* refresh_wbm_accounting */);
+}
+
+void DBImpl::UpdateWBMAccountingAfterMemtableSwitch(bool refresh_now) {
+  mutex_.AssertHeld();
+  if (wbm_flush_initiator_ == nullptr ||
+      !write_buffer_manager_->ShouldTrackFlushInitiator()) {
+    return;
+  }
+  if (refresh_now) {
+    TEST_SYNC_POINT("DBImpl::UpdateWBMAccountingAfterMemtableSwitch:Refresh");
+    RefreshFlushableMemAccounting();
+  } else {
+    // Do not let the sorter consume an intermediate snapshot while a caller is
+    // switching a batch of memtables. The caller refreshes once after the
+    // complete batch, including a partial-error exit.
+    wbm_flush_initiator_->InvalidateLargestFlushableCFMem();
+  }
+}
+
+Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
+                                  ReadOnlyMemTable* new_imm,
+                                  SequenceNumber last_seqno,
+                                  bool refresh_wbm_accounting) {
   mutex_.AssertHeld();
   assert(lock_wal_owner_thread_id_counts_.empty());
 
@@ -3128,6 +3270,7 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
   UnpublishedWAL prepared_wal;
   MemTable* new_mem = nullptr;
   IOStatus io_s;
+  bool current_wal_write_buffer_failed = false;
 
   // Recoverable state is persisted in WAL. After memtable switch, WAL might
   // be deleted, so we write the state to memtable to be persisted as well.
@@ -3142,7 +3285,9 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
   if (two_write_queues_) {
     wal_write_mutex_.Lock();
   }
-  bool creating_new_log = !wal_empty_;
+  bool creating_new_log =
+      !wal_empty_ || (recovering_from_wal_write_error_ &&
+                      cur_wal_number_ <= recover_wal_through_number_);
   if (two_write_queues_) {
     wal_write_mutex_.Unlock();
   }
@@ -3273,13 +3418,28 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
     InstrumentedMutexLock l(&wal_write_mutex_);
     assert(new_log != nullptr);
     if (!logs_.empty()) {
-      // Alway flush the buffer of the last log before switching to a new one
+      // Always flush the buffer of the last log before switching to a new one,
+      // except when recovery is replacing a file-scoped failed WAL. Its
+      // accepted contents are persisted by the atomic recovery flush.
       log::Writer* cur_log_writer = logs_.back().writer;
-      if (error_handler_.IsRecoveryInProgress()) {
+      const bool abandon_current_wal =
+          recovering_from_wal_write_error_ &&
+          cur_log_writer->get_log_number() <= recover_wal_through_number_;
+      if (abandon_current_wal) {
+        TEST_SYNC_POINT("DBImpl::SwitchMemtable:AbandonWAL");
+        ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                       "[WAL recovery] [%s] Replacing failed WAL #%" PRIu64
+                       " with WAL #%" PRIu64,
+                       cfd->GetName().c_str(), cur_log_writer->get_log_number(),
+                       new_log_number);
+      } else if (error_handler_.IsRecoveryInProgress()) {
         // In recovery path, we force another try of writing WAL buffer.
         cur_log_writer->file()->reset_seen_error();
       }
-      io_s = cur_log_writer->WriteBuffer(write_options);
+      if (!abandon_current_wal) {
+        io_s = cur_log_writer->WriteBuffer(write_options);
+        current_wal_write_buffer_failed = !io_s.ok();
+      }
       if (s.ok()) {
         s = io_s;
       }
@@ -3306,16 +3466,35 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
     delete new_mem;
     delete new_log;
     context->superversion_context.new_superversion.reset();
-    // We may have lost data from the WritableFileBuffer in-memory buffer for
-    // the current log, so treat it as a fatal error and set bg_error
+    // Only a WriteBuffer() failure belongs to the current WAL. CreateWAL() and
+    // StartWALFile() operate on an unpublished replacement, so a failure there
+    // must not quarantine an otherwise healthy current WAL.
     if (!io_s.ok()) {
-      error_handler_.SetBGError(io_s, BackgroundErrorReason::kMemTable,
-                                /*wal_related=*/true);
+      if (!current_wal_write_buffer_failed) {
+        ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                       "Failed to create or start replacement WAL #%" PRIu64
+                       "; current WAL #%" PRIu64 " remains active: %s",
+                       new_log_number, cur_wal_number_,
+                       io_s.ToString().c_str());
+      }
+      if (current_wal_write_buffer_failed && io_s.IsIOError() &&
+          !io_s.IsIOFenced() &&
+          io_s.GetScope() == IOStatus::IOErrorScope::kIOErrorScopeFile) {
+        DBRecoverContext recovery_context;
+        recovery_context.failed_wal_number = cur_wal_number_;
+        ExtendWALRecoveryCutoff(recovery_context.failed_wal_number);
+        error_handler_.SetBGError(io_s, BackgroundErrorReason::kMemTable,
+                                  /*wal_related=*/true, recovery_context);
+      } else {
+        error_handler_.SetBGError(io_s, BackgroundErrorReason::kMemTable,
+                                  /*wal_related=*/true);
+      }
     } else {
       error_handler_.SetBGError(s, BackgroundErrorReason::kMemTable);
     }
     // Read back bg_error in order to get the right severity
     s = error_handler_.GetBGError();
+    UpdateWBMAccountingAfterMemtableSwitch(refresh_wbm_accounting);
     return s;
   }
 
@@ -3357,6 +3536,7 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
                                   BackgroundErrorReason::kManifestWrite);
       }
       if (!s.ok()) {
+        UpdateWBMAccountingAfterMemtableSwitch(refresh_wbm_accounting);
         return s;
       }
 
@@ -3409,6 +3589,7 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
   }
   new_mem->Ref();
   cfd->SetMemtable(new_mem);
+  UpdateWBMAccountingAfterMemtableSwitch(refresh_wbm_accounting);
   InstallSuperVersionAndScheduleWork(cfd, &context->superversion_context);
   MaybeScheduleAsyncWALPrecreate(preallocate_block_size);
 

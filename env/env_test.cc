@@ -268,7 +268,7 @@ class EnvPosixTest : public testing::Test {
   Env* env_;
   bool direct_io_;
   EnvPosixTest() : env_(Env::Default()), direct_io_(false) {}
-  ~EnvPosixTest() {
+  ~EnvPosixTest() override {
     SyncPoint::GetInstance()->DisableProcessing();
     SyncPoint::GetInstance()->LoadDependency({});
     SyncPoint::GetInstance()->ClearAllCallBacks();
@@ -2894,7 +2894,7 @@ class EnvFSTestWithParam
     dbname2_ = test::PerThreadDBPath("env_fs_test2");
   }
 
-  ~EnvFSTestWithParam() = default;
+  ~EnvFSTestWithParam() override = default;
 
   Env* env_;
   std::unique_ptr<Env> env_ptr_;
@@ -2986,7 +2986,7 @@ TEST_F(EnvTest, IsDirectory) {
                                          FileOptions(),
                                          SystemClock::Default().get()));
     constexpr char buf[] = "test";
-    s = fwriter->Append(IOOptions(), buf);
+    s = fwriter->Append(buf, IOOptions());
     ASSERT_OK(s);
   }
   ASSERT_OK(Env::Default()->IsDirectory(test_file_path, &is_dir));

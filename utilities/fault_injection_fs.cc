@@ -26,6 +26,7 @@
 #include "env/io_posix.h"
 #include "monitoring/thread_status_util.h"
 #include "port/lang.h"
+#include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
@@ -79,7 +80,9 @@ uint8_t DetailPayloadSize(const InjectedErrorLog::TaggedEntryDetail& detail) {
 
 int OpenInjectedErrorLogFile(const std::string& path) {
 #ifndef OS_WIN
-  if (path.empty()) {
+  // Entry is written in native layout, while the decoder expects little-endian
+  // fields. Keep the optional log disabled on unsupported architectures.
+  if (!port::kLittleEndian || path.empty()) {
     return -1;
   }
   int flags = O_WRONLY | O_CREAT | O_TRUNC;
@@ -604,7 +607,7 @@ TestFSRandomRWFile::TestFSRandomRWFile(const std::string& fname,
 
 TestFSRandomRWFile::~TestFSRandomRWFile() {
   if (file_opened_) {
-    Close(IOOptions(), nullptr).PermitUncheckedError();
+    TestFSRandomRWFile::Close(IOOptions(), nullptr).PermitUncheckedError();
   }
 }
 
@@ -1841,6 +1844,15 @@ IOStatus FaultInjectionTestFS::MaybeInjectThreadLocalError(
     ret = IOStatus::IOError(ctx->message);
     ret.SetRetryable(ctx->retryable);
     ret.SetDataLoss(ctx->has_data_loss);
+    if (type == FaultInjectionIOType::kWrite &&
+        inject_file_scope_on_wal_write_error_.load(std::memory_order_relaxed)) {
+      FileType file_type = kTempFile;
+      uint64_t file_number = 0;
+      if (TryParseFileName(file_name, &file_number, &file_type) &&
+          file_type == FileType::kWalFile) {
+        ret.SetScope(IOStatus::IOErrorScope::kIOErrorScopeFile);
+      }
+    }
     injected_error_log_.Record(op_name, file_name, detail, ret);
     if (type == FaultInjectionIOType::kWrite) {
       TEST_SYNC_POINT(

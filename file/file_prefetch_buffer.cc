@@ -102,8 +102,8 @@ Status FilePrefetchBuffer::Read(BufferInfo* buf, const IOOptions& opts,
                            read_len, result);
   } else {
     to_buf = buf->buffer_.BufferStart() + aligned_useful_len;
-    s = reader->Read(opts, start_offset + aligned_useful_len, read_len, &result,
-                     to_buf);
+    s = reader->Read(start_offset + aligned_useful_len, read_len, opts, &result,
+                     to_buf, /*dbg=*/nullptr);
   }
 
 #ifndef NDEBUG
@@ -153,7 +153,8 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
   buf->async_req_len_ = req.len;
 
   Status s = reader->ReadAsync(req, opts, fp, buf, &(buf->io_handle_),
-                               &(buf->del_fn_), /*aligned_buf =*/nullptr);
+                               &(buf->del_fn_), /*aligned_buf=*/nullptr,
+                               /*dbg=*/nullptr);
   req.status.PermitUncheckedError();
   if (s.ok()) {
     if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
@@ -164,8 +165,8 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
     // Async IO is not available (e.g., io_uring failed to initialize).
     // Fall back to synchronous read so the buffer is populated inline
     // and callers proceed transparently.
-    s = reader->Read(opts, start_offset, read_len, &result,
-                     buf->buffer_.BufferStart());
+    s = reader->Read(start_offset, read_len, opts, &result,
+                     buf->buffer_.BufferStart(), /*dbg=*/nullptr);
     if (s.ok()) {
       buf->buffer_.Size(buf->CurrentSize() + result.size());
       if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {

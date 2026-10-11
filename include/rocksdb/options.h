@@ -803,20 +803,27 @@ struct DBOptions {
   int read_io_executor_threads = 1;
 
   // If true, SST files are opened and validated asynchronously in the
-  // background after DB::Open returns. This reduces DB open time for
-  // databases with many SST files and high latency file systems. Mostly useful
-  // when max_open_files = -1, as max_open_files != -1 usually has fast open
-  // times. See also `max_file_opening_threads` and
+  // background after DB::Open or DB::OpenAsSecondary returns. This reduces DB
+  // open time for databases with many SST files and high latency file systems.
+  // Mostly useful when max_open_files = -1, as max_open_files != -1 usually has
+  // fast open times. See also `max_file_opening_threads` and
   // `skip_stats_update_on_db_open` to improve file open latency.
+  //
+  // A secondary with this option can no longer rely on max_open_files = -1 to
+  // pin every current SST before OpenAsSecondary returns. If the primary
+  // deletes a file before the background job opens it, the background job or
+  // later reads can return an I/O error. TryCatchUpWithPrimary() does not clear
+  // a latched asynchronous-open background error; fix the underlying problem
+  // and reopen the secondary instead.
   //
   // Note: This option is currently not compatible with FIFO compaction and
   // requires skip_stats_update_on_db_open=true.
   //
-  // Errors will no longer show up in DB::Open, but instead can show up as
-  // either background errors and/or operations that access the file (e.g.
+  // Errors will no longer show up in the DB open call, but instead can show up
+  // as either background errors and/or operations that access the file (e.g.
   // reads, compactions).
   //
-  // When false (default), SST files are opened and validated during DB::Open.
+  // When false (default), SST files are opened and validated during DB open.
   //
   // Default: false
   bool open_files_async = false;
@@ -3020,14 +3027,6 @@ struct IngestExternalFileOptions {
   // with cf_allow_ingest_behind=true since CF creation (or before any write).
   // All files will be ingested at the bottommost level with seqno=0.
   bool ingest_behind = false;
-  // DEPRECATED - Set to true if you would like to write global_seqno to
-  // the external SST file on ingestion for backward compatibility before
-  // RocksDB 5.16.0. Such old versions of RocksDB expect any global_seqno to
-  // be written to the SST file rather than recorded in the DB manifest.
-  // This functionality was deprecated because (a) random writes might be
-  // costly or unsupported on some FileSystems, and (b) the file checksum
-  // changes with such a write.
-  bool write_global_seqno = false;
   // Set to true if you would like to verify the checksums of each block of the
   // external SST file before ingestion.
   // Warning: setting this to true causes slowdown in file ingestion because
@@ -3115,8 +3114,6 @@ struct IngestExternalFileOptions {
   //   with each other, you can set `fail_if_not_bottommost_level` to true.
   //   If ingested files overlap with each other, some file will be placed
   //   above Lmax, failing the ingestion if the option is set.
-  // - `write_global_seqno` must be false (sequence numbers cannot be
-  //    reassigned).
   bool allow_db_generated_files = false;
 
   // Controls whether data and metadata blocks (e.g. index, filter) read during
@@ -3147,7 +3144,8 @@ struct IngestExternalFileOptions {
 // prepare ingestion without re-opening and scanning the SST to recompute file
 // metadata. It is produced by SstFileWriter::Finish() for writer-created files
 // or by DB::GetPreparedFileInfoForExternalSstIngestion() for live DB-generated
-// files.
+// files. SerializePreparedFileInfo() and DeserializePreparedFileInfo() in
+// rocksdb/db.h can be used to persist it without exposing its contents.
 struct PreparedFileInfo;
 
 // It is valid that files_checksums and files_checksum_func_names are both
@@ -3190,10 +3188,8 @@ struct IngestExternalFileArg {
 
   // Optimizes for prepare performance, see `PreparedFileInfo` for details.
   // The owning handle must stay alive until ingestion completes.
-  // Not compatible with options.write_global_seqno (the file is not opened, so
-  // a global seqno cannot be written back into it). Because the file is not
-  // opened, ingestion does not read its storage temperature and trusts the
-  // caller-supplied `file_temperature` hint as-is.
+  // Because the file is not opened, ingestion does not read its storage
+  // temperature and trusts the caller-supplied `file_temperature` hint as-is.
   std::vector<const PreparedFileInfo*> file_infos;
 };
 

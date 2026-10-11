@@ -135,7 +135,7 @@ class WritePreparedTxn : public PessimisticTransaction {
   WritePreparedTxn(const WritePreparedTxn&) = delete;
   void operator=(const WritePreparedTxn&) = delete;
 
-  virtual ~WritePreparedTxn() {}
+  ~WritePreparedTxn() override {}
 
   // To make WAL commit markers visible, the snapshot will be based on the last
   // seq in the WAL that is also published, LastPublishedSequence, as opposed to
@@ -186,6 +186,15 @@ class WritePreparedTxn : public PessimisticTransaction {
   using Transaction::GetImpl;
   Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
                  const Slice& key, PinnableSlice* value) override;
+
+  Status GetEntityImpl(const ReadOptions& options,
+                       ColumnFamilyHandle* column_family, const Slice& key,
+                       PinnableWideColumns* columns) override;
+
+  void MultiGetEntityImpl(const ReadOptions& options,
+                          ColumnFamilyHandle* column_family, size_t num_keys,
+                          const Slice* keys, PinnableWideColumns* results,
+                          Status* statuses, bool sorted_input) override;
 
   Status PrepareInternal() override;
 

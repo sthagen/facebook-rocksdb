@@ -244,6 +244,11 @@ from an implementation detail instead of an explicit option.
 
 ## Important tips
 
+### Pull request and diff summaries
+* Before writing or updating an external RocksDB pull request summary or its
+  corresponding internal Phabricator diff summary, read and follow
+  `claude_md/pull_request_summary_guideline.md`.
+
 ### Build system
 * There are 3 build system. Make for git clones, BUCK (meta internal) for hg
   clones, and CMake for some special cases.
@@ -310,6 +315,7 @@ build (and where noted, run tests) across:
 | Axis | Must support |
 |------|--------------|
 | OS | Linux (x86_64 + ARM), macOS, Windows |
+| Architecture | Little-endian and big-endian targets, including Linux on s390x |
 | Compiler | GCC, Clang (libstdc++ **and** libc++), AppleClang, **MSVC (VS2022)**, MinGW (Linux cross-compile, build-only, no gflags) |
 | Build system | Make, CMake, and BUCK (internal) -- keep all in sync (see "Build system" above) |
 | Config | release (`-fno-rtti`), `ASSERT_STATUS_CHECKED`, ASAN/UBSAN/TSAN, folly, unity build, JNI/Java |
@@ -323,6 +329,12 @@ common trap: anything that compiles under GCC/Clang on Linux but not under
 abstractions; otherwise guard with `#ifdef OS_WIN` (POSIX `<unistd.h>` ->
 Windows `<process.h>`). Because libc++ is also tested, include what you use
 rather than relying on libstdc++ transitive includes.
+
+Do not use `static_assert` to reject a supported architecture for an optional
+feature. Check an existing `port::` capability such as `port::kLittleEndian`
+and disable only the unsupported feature so the rest of RocksDB still builds.
+Use a portable representation when the feature itself must work across
+architectures.
 
 ### Unit Test
 * After all of the unit tests are added, review them and try to extract common

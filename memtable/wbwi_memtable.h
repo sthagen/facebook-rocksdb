@@ -85,6 +85,8 @@ class WBWIMemTable final : public ReadOnlyMemTable {
     return 0;
   }
 
+  size_t WBMTrackedMemoryUsage() const override { return 0; }
+
   void UniqueRandomSample(
       const uint64_t& /* target_sample_size */,
       std::unordered_set<const char*>* /* entries */) override {
@@ -193,7 +195,7 @@ class WBWIMemTable final : public ReadOnlyMemTable {
 
   uint64_t ApproximateOldestKeyTime() const override {
     // FIXME: can use the time when this is added to the DB.
-    return kUnknownOldestAncesterTime;
+    return kUnknownOldestAncestorTime;
   }
 
   bool IsFragmentedRangeTombstonesConstructed() const override {

@@ -142,6 +142,11 @@ uint64_t rocksdb_table_properties_column_family_id(
   return props->rep.column_family_id;
 }
 
+uint64_t rocksdb_table_properties_oldest_ancestor_time(
+    const rocksdb_table_properties_t* props) {
+  return props->rep.oldest_ancestor_time;
+}
+
 uint64_t rocksdb_table_properties_creation_time(
     const rocksdb_table_properties_t* props) {
   return props->rep.creation_time;
@@ -170,11 +175,6 @@ uint64_t rocksdb_table_properties_slow_compression_estimated_data_size(
 uint64_t rocksdb_table_properties_fast_compression_estimated_data_size(
     const rocksdb_table_properties_t* props) {
   return props->rep.fast_compression_estimated_data_size;
-}
-
-uint64_t rocksdb_table_properties_external_sst_file_global_seqno_offset(
-    const rocksdb_table_properties_t* props) {
-  return props->rep.external_sst_file_global_seqno_offset;
 }
 
 uint64_t rocksdb_table_properties_tail_start_offset(

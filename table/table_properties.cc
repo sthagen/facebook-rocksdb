@@ -262,7 +262,8 @@ std::string TableProperties::ToString(const std::string& prop_delim,
       compression_options.empty() ? std::string("N/A") : compression_options,
       prop_delim, kv_delim);
 
-  AppendProperty(result, "creation time", creation_time, prop_delim, kv_delim);
+  AppendProperty(result, "creation time", oldest_ancestor_time, prop_delim,
+                 kv_delim);
 
   AppendProperty(result, "time stamp of earliest key", oldest_key_time,
                  prop_delim, kv_delim);
@@ -475,7 +476,10 @@ const std::string TablePropertiesNames::kPropertyCollectors =
 const std::string TablePropertiesNames::kCompression = "rocksdb.compression";
 const std::string TablePropertiesNames::kCompressionOptions =
     "rocksdb.compression_options";
-const std::string TablePropertiesNames::kCreationTime = "rocksdb.creation.time";
+const std::string TablePropertiesNames::kOldestAncestorTime =
+    "rocksdb.creation.time";
+const std::string& TablePropertiesNames::kCreationTime =
+    TablePropertiesNames::kOldestAncestorTime;
 const std::string TablePropertiesNames::kOldestKeyTime =
     "rocksdb.oldest.key.time";
 const std::string TablePropertiesNames::kNewestKeyTime =
@@ -600,9 +604,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct TableProperties, column_family_id),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        // Key retains the old field name for serialization compatibility
         {"creation_time",
-         {offsetof(struct TableProperties, creation_time), OptionType::kUInt64T,
-          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+         {offsetof(struct TableProperties, oldest_ancestor_time),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"oldest_key_time",
          {offsetof(struct TableProperties, oldest_key_time),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -623,11 +629,6 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"fast_compression_estimated_data_size",
          {offsetof(struct TableProperties,
                    fast_compression_estimated_data_size),
-          OptionType::kUInt64T, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone}},
-        {"external_sst_file_global_seqno_offset",
-         {offsetof(struct TableProperties,
-                   external_sst_file_global_seqno_offset),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"tail_start_offset",

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "file/random_access_file_reader.h"
+#include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
 #include "port/port.h"
 #include "rocksdb/file_system.h"
@@ -95,10 +96,39 @@ static Status CreateAndPinBlockFromBuffer(
   }
 
   // Create block from buffer data
-  const auto block_size_with_trailer =
+  const size_t block_size_with_trailer =
       BlockBasedTable::BlockSizeWithTrailer(block);
-  const auto block_offset_in_buffer = block.offset() - buffer_start_offset;
+  if (block.offset() < buffer_start_offset) {
+    return Status::Corruption("block offset precedes read buffer for " +
+                              rep->file->file_name() + " offset " +
+                              std::to_string(block.offset()));
+  }
+  const uint64_t block_offset_in_buffer = block.offset() - buffer_start_offset;
+  if (block_offset_in_buffer > buffer_data.size() ||
+      block_size_with_trailer >
+          buffer_data.size() - static_cast<size_t>(block_offset_in_buffer)) {
+    return Status::Corruption(
+        "truncated block read from " + rep->file->file_name() + " offset " +
+        std::to_string(block.offset()) + ", expected " +
+        std::to_string(block_size_with_trailer) + " bytes in read buffer");
+  }
   const char* block_data = buffer_data.data() + block_offset_in_buffer;
+
+  // Prefetched blocks are built straight from the read buffer, bypassing
+  // BlockFetcher, so the verification the non-prefetch path performs has to be
+  // repeated here. Without it bit rot reaches the caller as valid keys, and on
+  // the cache branch below it also enters the shared block cache, where
+  // readers that never used MultiScan pick it up on a hit and never re-verify.
+  if (job->job_options.read_options.verify_checksums) {
+    Status checksum_status = VerifyBlockChecksum(
+        rep->footer, block_data, block.size(), rep->file->file_name(),
+        block.offset(), BlockType::kData);
+    RecordTick(rep->ioptions.stats, BLOCK_CHECKSUM_COMPUTE_COUNT);
+    if (!checksum_status.ok()) {
+      RecordTick(rep->ioptions.stats, BLOCK_CHECKSUM_MISMATCH_COUNT);
+      return checksum_status;
+    }
+  }
 
   if (use_data_block_cache) {
     CacheAllocationPtr data = AllocateBlock(
@@ -249,6 +279,13 @@ static void RecordIODispatcherTime(Statistics* statistics,
   }
 }
 
+static void RecordIODispatcherBlockReads(size_t block_count,
+                                         uint64_t block_read_bytes) {
+  PERF_COUNTER_ADD(block_read_count, block_count);
+  PERF_COUNTER_ADD(block_read_byte, block_read_bytes);
+  PERF_COUNTER_ADD(data_block_read_byte, block_read_bytes);
+}
+
 // ReadSet destructor - clean up IO handles
 // Must call AbortIO before deleting handles to avoid use-after-free when
 // io_uring completions arrive for deleted handles.
@@ -334,17 +371,16 @@ Status ReadSet::ReadIndex(size_t block_index, CachableEntry<Block>* out) {
         ReleasePrefetchMemory(block_index);
         return Status::OK();
       }
-
-      return Status::IOError("Failed to process async IO result");
+      // A block-construction error is a prefetch miss. Fall through to the
+      // ordinary read path so checksum corruption gets the same reconstruction
+      // retry as a non-prefetched read.
     }
   }
 
-  // Case 3: Block needs synchronous read (pending or never-dispatched blocks).
-  // No ReleaseMemory() needed here because blocks reaching this path never had
-  // TryAcquireMemory() called -- they were either pending prefetch or skipped
-  // during SubmitJob. block_sizes_[block_index] may be > 0 (set during
-  // SubmitJob for all uncached blocks) but that does not imply memory was
-  // acquired.
+  // Case 3: Block needs a synchronous read. Pending and skipped blocks were
+  // never charged, while a failed prefetch releases its charge before reaching
+  // this fallback. A nonzero block_sizes_ entry alone does not mean memory is
+  // currently reserved.
   RemoveFromPending(block_index);
 
   Status s = SyncRead(block_index);
@@ -504,7 +540,10 @@ Status ReadSet::PollAndProcessAsyncIO(
     read_buffer_cleanup = std::move(async_state->read_scoped_buf_lease.cleanup);
   }
 
-  // Process all blocks in this async request
+  // Process all blocks in this async request. A block-construction error is
+  // local to that block: siblings can still be served, while the failed block
+  // is retried through ReadIndex's ordinary read path.
+  std::vector<size_t> failed_block_indices;
   for (size_t i = 0; i < async_state->block_indices.size(); ++i) {
     const size_t idx = async_state->block_indices[i];
     const auto& block_handle = async_state->blocks[i];
@@ -514,7 +553,8 @@ Status ReadSet::PollAndProcessAsyncIO(
         read_buffer_cleanup, async_state->read_buffer_requires_cleanup,
         pinned_blocks_[idx]);
     if (!s.ok()) {
-      return s;
+      pinned_blocks_[idx].Reset();
+      failed_block_indices.push_back(idx);
     }
   }
 
@@ -524,6 +564,10 @@ Status ReadSet::PollAndProcessAsyncIO(
   // Remove from map - all blocks in this request have been processed
   for (const auto idx : async_state->block_indices) {
     async_io_map_.erase(idx);
+  }
+
+  for (const size_t idx : failed_block_indices) {
+    ReleasePrefetchMemory(idx);
   }
 
   return Status::OK();
@@ -630,6 +674,10 @@ struct IODispatcherImpl::Impl : public IODispatcherImplData,
   Statistics* statistics_ = nullptr;
 
  private:
+  void ReleaseFailedSyncPrefetchMemory(
+      const std::shared_ptr<ReadSet>& read_set,
+      const std::vector<size_t>& block_indices);
+
   void PrepareIORequests(
       const std::shared_ptr<IOJob>& job,
       const std::vector<size_t>& block_indices_to_read,
@@ -718,6 +766,22 @@ void IODispatcherImpl::Impl::ReleaseMemory(size_t bytes) {
 
   // Try to dispatch pending prefetches now that memory is available
   TryDispatchPendingPrefetches();
+}
+
+void IODispatcherImpl::Impl::ReleaseFailedSyncPrefetchMemory(
+    const std::shared_ptr<ReadSet>& read_set,
+    const std::vector<size_t>& block_indices) {
+  size_t bytes_to_release = 0;
+  for (const size_t idx : block_indices) {
+    if (read_set->pinned_blocks_[idx].GetValue() == nullptr &&
+        read_set->block_sizes_[idx] != 0) {
+      bytes_to_release += read_set->block_sizes_[idx];
+      read_set->block_sizes_[idx] = 0;
+    }
+  }
+  if (bytes_to_release != 0) {
+    ReleaseMemory(bytes_to_release);
+  }
 }
 
 void IODispatcherImpl::Impl::TryDispatchPendingPrefetches() {
@@ -837,6 +901,11 @@ void IODispatcherImpl::Impl::DispatchPrefetch(
   PrepareIORequests(job, block_indices, job->block_handles, &read_reqs,
                     &coalesced_block_indices, &dispatched_bytes, &nonadjacent);
 
+  // Match RocksDB's existing MultiRead accounting by recording before IO.
+  // Charge the full request spans so bytes in coalesced gaps are included.
+  // Recording once before the async/sync split avoids double-charging fallback.
+  RecordIODispatcherBlockReads(block_indices.size(), dispatched_bytes);
+
   // Account for the prefetch IO issued by this dispatch. Counted here (once per
   // dispatched block, before the async/sync split) rather than at completion so
   // async and memory-deferred prefetches are all captured, and so blocks that
@@ -860,6 +929,9 @@ void IODispatcherImpl::Impl::DispatchPrefetch(
       // Prefetch errors are ignored - user will get the error when reading
       Status s =
           ExecuteSyncIO(job, read_set, sync_read_reqs, sync_coalesced_indices);
+      if (!s.ok()) {
+        ReleaseFailedSyncPrefetchMemory(read_set, fallback_indices);
+      }
       s.PermitUncheckedError();
       read_set->num_sync_reads_ += fallback_indices.size();
     }
@@ -868,6 +940,9 @@ void IODispatcherImpl::Impl::DispatchPrefetch(
   } else {
     // Prefetch errors are ignored - user will get the error when reading
     Status s = ExecuteSyncIO(job, read_set, read_reqs, coalesced_block_indices);
+    if (!s.ok()) {
+      ReleaseFailedSyncPrefetchMemory(read_set, block_indices);
+    }
     s.PermitUncheckedError();
     read_set->num_sync_reads_ += block_indices.size();
   }

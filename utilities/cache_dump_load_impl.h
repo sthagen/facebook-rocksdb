@@ -99,7 +99,7 @@ class CacheDumperImpl : public CacheDumper {
       : options_(dump_options), cache_(cache), writer_(std::move(writer)) {
     dumped_size_bytes_ = 0;
   }
-  ~CacheDumperImpl() { writer_.reset(); }
+  ~CacheDumperImpl() override { writer_.reset(); }
   Status SetDumpFilter(const std::vector<DB*>& db_list) override;
   IOStatus DumpCacheEntriesToWriter() override;
 
@@ -140,7 +140,7 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
       : options_(dump_options),
         secondary_cache_(secondary_cache),
         reader_(std::move(reader)) {}
-  ~CacheDumpedLoaderImpl() {}
+  ~CacheDumpedLoaderImpl() override {}
   IOStatus RestoreCacheEntriesToSecondaryCache() override;
 
  private:
@@ -162,7 +162,9 @@ class ToFileCacheDumpWriter : public CacheDumpWriter {
       std::unique_ptr<WritableFileWriter>&& file_writer)
       : file_writer_(std::move(file_writer)) {}
 
-  ~ToFileCacheDumpWriter() { Close().PermitUncheckedError(); }
+  ~ToFileCacheDumpWriter() override {
+    ToFileCacheDumpWriter::Close().PermitUncheckedError();
+  }
 
   // Write the serialized metadata to the file
   IOStatus WriteMetadata(const Slice& metadata) override {
@@ -170,11 +172,11 @@ class ToFileCacheDumpWriter : public CacheDumpWriter {
     std::string prefix;
     PutFixed32(&prefix, static_cast<uint32_t>(metadata.size()));
     const IOOptions opts;
-    IOStatus io_s = file_writer_->Append(opts, Slice(prefix));
+    IOStatus io_s = file_writer_->Append(Slice(prefix), opts);
     if (!io_s.ok()) {
       return io_s;
     }
-    io_s = file_writer_->Append(opts, metadata);
+    io_s = file_writer_->Append(metadata, opts);
     return io_s;
   }
 
@@ -184,11 +186,11 @@ class ToFileCacheDumpWriter : public CacheDumpWriter {
     std::string prefix;
     PutFixed32(&prefix, static_cast<uint32_t>(data.size()));
     const IOOptions opts;
-    IOStatus io_s = file_writer_->Append(opts, Slice(prefix));
+    IOStatus io_s = file_writer_->Append(Slice(prefix), opts);
     if (!io_s.ok()) {
       return io_s;
     }
-    io_s = file_writer_->Append(opts, data);
+    io_s = file_writer_->Append(data, opts);
     return io_s;
   }
 
@@ -196,7 +198,7 @@ class ToFileCacheDumpWriter : public CacheDumpWriter {
   IOStatus Close() override {
     IOStatus io_s;
     if (file_writer_ != nullptr && !file_writer_->seen_error()) {
-      io_s = file_writer_->Sync(IOOptions(), false /* use_fsync */);
+      io_s = file_writer_->Sync(IOOptions());
     }
     file_writer_.reset();
     return io_s;
@@ -217,7 +219,7 @@ class FromFileCacheDumpReader : public CacheDumpReader {
         offset_(0),
         buffer_(new char[kDumpReaderBufferSize]) {}
 
-  ~FromFileCacheDumpReader() { delete[] buffer_; }
+  ~FromFileCacheDumpReader() override { delete[] buffer_; }
 
   IOStatus ReadMetadata(std::string* metadata) override {
     uint32_t metadata_len = 0;
@@ -261,7 +263,7 @@ class FromFileCacheDumpReader : public CacheDumpReader {
                                : bytes_to_read;
 
     while (to_read > 0) {
-      io_s = file_reader_->Read(IOOptions(), offset_, to_read, &result_,
+      io_s = file_reader_->Read(offset_, to_read, IOOptions(), &result_,
                                 buffer_, nullptr);
       if (!io_s.ok()) {
         return io_s;

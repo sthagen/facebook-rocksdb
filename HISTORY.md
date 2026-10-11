@@ -1,6 +1,73 @@
 # Rocksdb Change Log
 > NOTE: Entries for next release do not go here. Follow instructions in `unreleased_history/README.txt`
 
+## 11.12.0 (10/07/2026)
+### New Features
+* Added `FullExternalTableFactory` and related full-mode external table APIs that preserve RocksDB internal keys, enabling external tables to support nonzero sequence numbers, point and single deletions, merge operands, blob indexes, wide-column entities, snapshots, live DB writes, and multi-level compactions.
+
+### Public API Changes
+* Added experimental coroutine capability interfaces for basic and full `ExternalTableReader` implementations. Coroutine-capable external readers can initiate file reads through `FSRandomAccessFile::SubmitReadAsync()`.
+* `ExternalTableFactory::NewTableReader()` now receives an already-opened `FSRandomAccessFile` and its file size instead of requiring implementations to reopen `file_path`. The supplied file preserves RocksDB's direct-I/O alignment handling, rate limiting, read statistics and listener notifications, prefetching, and synchronous, asynchronous, and batched reads.
+* Added `PutRangeDeletionBlock()`, `GetRangeDeletionBlock()`, and `IsDeleteRangeSupported()` to the external table interfaces so formats can opt in to range deletions using RocksDB's raw range-deletion metadata block.
+* Opaque `PreparedFileInfo` metadata can now be serialized to a checksummed representation with `SerializePreparedFileInfo()` and restored with `DeserializePreparedFileInfo()` for reuse across processes.
+* Removed the deprecated `IngestExternalFileOptions::write_global_seqno` option and its C, Java, and `ldb` APIs, `TableProperties::external_sst_file_global_seqno_offset`, and the `file_offset` output from `ExternalTableReader::GetPropertiesBlock()`. Existing external SST files whose global sequence number was rewritten without updating the properties-block checksum remain readable.
+* `TablePropertiesNames` has no apparent use in the public API so has been deprecated there.
+* `TableProperties::creation_time` is renamed to `oldest_ancestor_time`, which better describes its meaning, along with `TablePropertiesNames::kCreationTime` to `kOldestAncestorTime`. The misspelled `SstFileMetaData::oldest_ancester_time` is renamed to `oldest_ancestor_time`. The old names remain available as deprecated aliases and will be removed in a future release.
+* Added `WriteBufferFlushPolicy` and `WriteBufferManager` policy selection for flushing the oldest or largest column family, including configurable batched flushing of the largest column families across DBs sharing a manager, with C and Java bindings.
+
+### Behavior Changes
+* When `ExternalTableBuilderBase::PutPropertiesBlock()` returns `NotSupported`, RocksDB now overrides `num_entries`, `raw_key_size`, and `raw_value_size` from `ExternalTableBuilderBase::GetTableProperties()` with the logical totals tracked by the external-table adapter. Format-specific properties such as `data_size` remain unchanged.
+* The `FSWritableFile` passed to `ExternalTableFactory::NewTableBuilder()` now reports logical file size including RocksDB-buffered data and exposes the underlying file's direct-I/O mode and required buffer alignment.
+* `Iterator::Refresh()` now returns `NotSupported` on iterators from a secondary DB's `DB::NewIterators()` only, because those iterators are pinned to one cross-column-family read view. Iterators from `DB::NewIterator()` are unaffected; to advance a batch, call `DB::NewIterators()` again after `TryCatchUpWithPrimary()`.
+* `SstFileReader` now reports standard SST read statistics and file I/O listener notifications, and honors the configured read rate limiter.
+
+### Bug Fixes
+* Fixed full recovery from retryable background errors to atomically advance WAL replay boundaries for all column families, preventing partial recovery of multi-column-family write batches after a failed recovery flush.
+* Fixed RocksDB builds on big-endian architectures such as s390x by disabling the optional persistent fault-injection log, whose binary format is little-endian-only.
+* Fixed `DB::ClipColumnFamily()` deleting a non-L0 SST file whose largest key equals `begin_key`, which lost keys at the start of the kept range.
+* Fixed swapped `oldest_key_time` and `newest_key_time` values in the `table_file_creation` event log entry.
+* Fixed `ExternalTableReader::VerifyChecksum()` results not being honored by the external table adapter.
+* Fixed a bug in manifest handling that could lead to a hang or memory corruption in the case of LSM sanity checks being fatally violated (exceptional; see `force_consistency_checks`).
+* Fixed `MultiGet()` with `ReadOptions::read_tier == kBlockCacheTier` reading data blocks from disk when `allow_mmap_reads` is false. Keys whose data block is not in the block cache now return `Status::Incomplete()`, the same as `Get()`.
+* Fixed trace replay (`DB::NewDefaultReplayer()`, db_bench `replay`) failing every read record (Get, MultiGet, iterator seek) on the default column family with `Corruption: Invalid Column Family ID` when the default column family handle was not passed, which is always the case in db_bench with `--num_column_families=1`.
+* Fixed multi-threaded `Replayer::Replay()` ignoring errors from executing trace records and returning OK. It now stops and returns the error, including `Status::NotSupported()` from executing a record, as single-threaded replay does.
+* Fixed secondary DB `NewIterators()` returning iterators from different database states or blocking for `TryCatchUpWithPrimary()` by serving the last completed catch-up view.
+
+### Performance Improvements
+* Single Get coroutine reads using non-mmap, non-direct I/O on a `kFSBuffer`-capable `FileSystem` now use `FSRandomAccessFile::SubmitReadAsync()` instead of falling back to synchronous `Read()`. When rate-limited, these reads acquire their full token budget before submission to preserve a single filesystem-owned buffer, which can make physical I/O burstier than reads using caller-provided buffers.
+
+
+## 11.11.0 (09/21/2026)
+### New Features
+* External tables now support DB-assigned global sequence numbers when `IngestExternalFileOptions::allow_global_seqno` is enabled, allowing overlapping external tables to be ingested across multiple levels when compactions are disabled. This includes the deprecated `write_global_seqno` path when the reader supplies the properties block's file offset.
+* Added checksum handoff support for SST file writes when `BlockBasedTableOptions::checksum` is `kCRC32c`, allowing block and trailer CRC32C checksums to be passed from the table builder to the file writer for buffered-data validation and filesystem in-flight write protection.
+* Enhanced `sst_dump --command=recompress` to be more powerful for benchmarking, including through automation with a new `--json` option for machine-readable output.
+
+### Public API Changes
+* Changed the experimental async read statistics API by removing `DB::AsyncCallback::EnableStats()` and changing `OnComplete(const PerfContext*, const IOStatsContext*)` to `OnComplete()`. Callers must configure TLS statistics before each async or coroutine read. `DB::GetAsync()` and `DB::MultiGetAsync()` callbacks must copy per-operation statistics from TLS during `OnComplete()`; coroutine users must copy them from inside a `CoroStackableDB` hook before suspending again. Each operation leaves TLS statistics collection disabled.
+* Added `Compressor::MaybeOverrideCompressionOptions()` (EXPERIMENTAL), an omnibus hook letting a custom compressor adjust the subset of `CompressionOptions` that the SST builder applies rather than the compressor itself: `parallel_threads`, `max_compressed_bytes_per_kb`, `auto_skip`, and `auto_skip_min_sample_every` (and potentially more in the future). This deprecates `Compressor::GetRecommendedParallelThreads()`, which it subsumes; the default implementation still honors an overridden `GetRecommendedParallelThreads()` for compatibility.
+* Added experimental `CoroDB::CoGet()` and `CoroDB::CoMultiGet()` overloads for point reads from an `SstFileReader`.
+* Added experimental `DB::GetWithMetadata()` and `DB::MultiGetWithMetadata()` APIs with opt-in output metadata for key timestamps and explicit-snapshot newer-version detection.
+* Added a `DB::NewIterators()` overload that accepts parallel vectors of `ReadOptions` and column family handles, allowing each returned iterator to use independent read settings while sharing a consistent database state. The vectors must have the same size, all snapshots must be null or identical, and all `tailing` settings must match.
+* Added `ReadOptions::custom_context`, an opaque, non-owning pointer passed through table reads so external table implementations can consume application-defined read options.
+
+### Behavior Changes
+* `ExternalTableReader::MultiGet()` is now used by RocksDB's `DB::MultiGet()` path. Previously, the external table adapter used `TableReader`'s fallback, which called `ExternalTableReader::Get()` separately for each key.
+* `DB::OpenAndCompact()` now requires `output_directory` to be a simple name for a new subdirectory when the new `use_session_tmp_dir_for_remote_compaction` DB option is enabled. The option places that subdirectory under the canonical `<dbname>/session_tmp/` root, and `DB::Open()` deletes stale contents under the root after recovery. The disabled default preserves the existing `<dbname>/<output_directory>` layout without automatic cleanup. Previously, remote-compaction output directories were created directly under `<dbname>`, which made it challenging to safely identify and delete obsolete files.
+* Several block-based SST table properties now better support compression benchmarking and optimization: `uncompressed_data_size` is now persisted in the file (previously it was computed only at write time and read back as 0); a new `lsm_info_at_creation` property records the LSM level and "bottommost" status at the file's creation, distinguishing "not applicable" (e.g. SstFileWriter files) from "unknown" (older files); and the `compression_options` property now records the full compression manager configuration instead of only its name.
+
+### Bug Fixes
+* Fixed a usually-minor performance bug where `Cache::ApplyToAllEntries()` used single-entry batches instead of the intended 256-entry default for `ApplyToAllEntriesOptions::average_entries_per_lock`. All of the Cache implementations (LRU and HCC) benefit from the fix, but the disfavored LRU cache was especially impacted by repeated mutex acquisition and release.
+* Fixed stats-disabled coroutine and asynchronous reads inheriting enabled TLS statistics state when interleaved with stats-enabled reads on the same executor. Each read now uses its captured per-call configuration, while enabled request counters remain isolated across suspensions.
+* Fixed a bug where a remote compaction (`CompactionService` / `DB::OpenAndCompact`) requested with `OpenAndCompactOptions::allow_resumption=true` but for which resumption was internally disabled (incompatible with `paranoid_file_checks` or output-iteration verification) could fail a retried attempt, because the output directory was not cleaned before starting fresh and output files left by a previously interrupted attempt collided with the reused file numbers.
+* Fixed a bug where a remote compaction (`CompactionService` / `DB::OpenAndCompact`) could fail when the primary rotated its MANIFEST while the worker was opening the primary's directory read-only. The open reads `CURRENT`, and the primary publishes a new MANIFEST by renaming a freshly written `CURRENT` over the old one; on file systems without POSIX read-after-unlink semantics (remote/object stores) the replaced object is then reported as gone (`PathNotFound`/`NotFound`, or `TryAgain` for the MANIFEST equivalent) instead of remaining readable. `DB::OpenAndCompact()` now retries the secondary open a bounded, configurable number of times for those transient statuses, so a concurrent rotation no longer fails the compaction (which, for a `CompactionService` that does not fall back to a local compaction, became a background error on the primary).
+* Fixed secondary DB `NewIterators()` returning iterators from different database states when `TryCatchUpWithPrimary()` runs concurrently.
+* Fixed a bug where a `SeekToFirst()` on an iterator previously used for a `Seek()` could end the scan early and silently omit keys with `ReadOptions::async_io`, or otherwise run with readahead effectively disabled. Affects scans using `ReadOptions::prefix_same_as_start` together with `ReadOptions::auto_readahead_size` (enabled by default); memory-mapped reads are unaffected.
+
+### Performance Improvements
+* `DB::MultiGetEntityLazy()` now reads all keys of a batch under a single shared per-column-family SuperVersion pin, and a single `LazyWideColumnsBatch::MultiResolve()` coalesces the resulting blob reads across keys: one read per blob file (and one per SST for embedded blobs), for whole-column and byte-range reads alike, instead of reading each key's blobs separately.
+
+
 ## 11.10.0 (08/28/2026)
 ### New Features
 * Added `BlockBasedTableOptions::optimize_key_common_prefix` as part of new `format_version=8`. When enabled, each data block and index block stores the common user-key prefix of its keys once instead of at every restart point, reducing block size and block-cache footprint for prefix-heavy data and speeding up Seek for bytewise-ordered keys.

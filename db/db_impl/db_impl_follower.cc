@@ -36,7 +36,7 @@ DBImplFollower::DBImplFollower(const DBOptions& db_options,
 }
 
 DBImplFollower::~DBImplFollower() {
-  Status s = Close();
+  Status s = DBImplFollower::Close();
   if (!s.ok()) {
     ROCKS_LOG_INFO(immutable_db_options_.info_log, "Error closing DB : %s",
                    s.ToString().c_str());
@@ -153,6 +153,7 @@ Status DBImplFollower::TryCatchUpWithLeader() {
         cfd->InstallSuperVersion(&sv_context, &mutex_);
         sv_context.NewSuperVersion();
       }
+      PublishSecondaryReadView();
     }
 
     for (auto& file : files_to_delete) {
@@ -164,6 +165,7 @@ Status DBImplFollower::TryCatchUpWithLeader() {
       }
     }
   }
+  CleanupRetiredSecondaryReadViews();
   job_context.Clean();
 
   // Cleanup unused, obsolete files.
@@ -296,7 +298,8 @@ Status DB::OpenAsFollower(
       dbname, &impl->immutable_db_options_, impl->mutable_db_options_,
       impl->file_options_, impl->table_cache_.get(),
       impl->write_buffer_manager_, &impl->write_controller_, impl->io_tracer_,
-      impl->db_id_, impl->db_session_id_));
+      impl->db_id_, impl->db_session_id_,
+      /*defer_sst_file_opening=*/false));
   impl->column_family_memtables_.reset(
       new ColumnFamilyMemTablesImpl(impl->versions_->GetColumnFamilySet()));
   impl->wal_in_db_path_ = impl->immutable_db_options_.IsWalDirSameAsDBPath();
@@ -322,9 +325,11 @@ Status DB::OpenAsFollower(
       sv_context.NewSuperVersion();
       cfd->InstallSuperVersion(&sv_context, &impl->mutex_);
     }
+    impl->PublishSecondaryReadView();
     impl->MarkAsyncFileOpenNotNeeded();
   }
   impl->mutex_.Unlock();
+  impl->CleanupRetiredSecondaryReadViews();
   sv_context.Clean();
   if (s.ok()) {
     dbptr->reset(impl);

@@ -110,13 +110,15 @@ bool NotifyCollectTableCollectorsOnFinish(
     UserCollectedProperties& user_collected_properties,
     UserCollectedProperties& readable_properties);
 
+// The optional offset is relative to the start of the properties block.
 Status ParsePropertiesBlock(
-    const ImmutableOptions& ioptions, uint64_t offset, Block& block,
-    std::unique_ptr<TableProperties>& new_table_properties);
+    const ImmutableOptions& ioptions, Block& block,
+    std::unique_ptr<TableProperties>& new_table_properties,
+    uint32_t* global_seqno_value_offset);
 
 // Sets global_seqno to the sequence number that should replace per-entry
-// sequence numbers while reading this file, or
-// kDisableGlobalSequenceNumber when entries retain their stored sequences.
+// sequence numbers while reading this file. When largest_seqno is
+// kDisableGlobalSequenceNumber, leaves the stored sequence numbers unchanged.
 Status GetGlobalSequenceNumber(const TableProperties& table_properties,
                                SequenceNumber largest_seqno,
                                SequenceNumber* global_seqno);

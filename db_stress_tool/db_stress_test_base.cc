@@ -38,7 +38,9 @@
 #include "file/file_util.h"
 #include "options/options_parser.h"
 #include "port/port.h"
+#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/io_dispatcher.h"
 #include "rocksdb/lazy_wide_columns.h"
@@ -49,9 +51,11 @@
 #include "rocksdb/types.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
+#include "test_util/simple_external_table_factory.h"
 #include "test_util/testutil.h"
 #include "util/aligned_buffer.h"
 #include "util/cast_util.h"
+#include "util/hash.h"
 #include "util/simple_mixed_compressor.h"
 #include "utilities/backup/backup_engine_impl.h"
 #include "utilities/fault_injection_fs.h"
@@ -161,6 +165,250 @@ void MaybeRecordOperationContext(ThreadState* thread, StressOperationType type,
                                  std::initializer_list<int64_t> keys) {
   MaybeRecordOperationContextImpl(thread, type, column_families, keys);
 }
+
+}  // namespace
+
+std::string SanitizeDiagnosticValue(const std::string& value) {
+  std::string result;
+  result.reserve(value.size());
+  for (char c : value) {
+    if (c == '\n' || c == '\r' || c == '\t') {
+      result.push_back(' ');
+    } else {
+      result.push_back(c);
+    }
+  }
+  return result;
+}
+
+namespace {
+
+constexpr size_t kMaxScanWitnessEventBytes = 4096;
+
+std::string SanitizeDiagnosticPathComponent(const std::string& value) {
+  std::string result;
+  result.reserve(value.size());
+  for (char c : value) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+      result.push_back(c);
+    } else {
+      result.push_back('_');
+    }
+  }
+  return result;
+}
+
+}  // namespace
+
+std::string FormatDiagnosticSlice(const Slice& value) {
+  constexpr size_t kMaxFullHexBytes = 80;
+  constexpr size_t kPrefixBytes = 64;
+  constexpr size_t kSuffixBytes = 16;
+
+  std::ostringstream oss;
+  oss << "size=" << value.size();
+  if (value.size() <= kMaxFullHexBytes) {
+    oss << " hex=" << value.ToString(/*hex=*/true);
+  } else {
+    oss << " hex_prefix="
+        << Slice(value.data(), kPrefixBytes).ToString(/*hex=*/true)
+        << " hex_suffix="
+        << Slice(value.data() + value.size() - kSuffixBytes, kSuffixBytes)
+               .ToString(/*hex=*/true)
+        << " hash64=" << GetSliceHash64(value);
+  }
+  return oss.str();
+}
+
+namespace {
+
+std::string FormatOptionalDiagnosticSlice(const Slice* value) {
+  if (value == nullptr) {
+    return "nullptr";
+  }
+  return FormatDiagnosticSlice(*value);
+}
+
+}  // namespace
+
+std::string FormatReadOptionsForDiagnostics(const ReadOptions& ro) {
+  std::ostringstream oss;
+  oss << "verify_checksums=" << ro.verify_checksums
+      << " fill_cache=" << ro.fill_cache << " async_io=" << ro.async_io
+      << " total_order_seek=" << ro.total_order_seek
+      << " auto_prefix_mode=" << ro.auto_prefix_mode
+      << " prefix_same_as_start=" << ro.prefix_same_as_start
+      << " iterate_lower_bound={"
+      << FormatOptionalDiagnosticSlice(ro.iterate_lower_bound) << "}"
+      << " iterate_upper_bound={"
+      << FormatOptionalDiagnosticSlice(ro.iterate_upper_bound) << "}"
+      << " allow_unprepared_value=" << ro.allow_unprepared_value
+      << " auto_refresh_iterator_with_snapshot="
+      << ro.auto_refresh_iterator_with_snapshot << " snapshot_seq=";
+  if (ro.snapshot != nullptr) {
+    oss << ro.snapshot->GetSequenceNumber();
+  } else {
+    oss << "none";
+  }
+  oss << " timestamp={" << FormatOptionalDiagnosticSlice(ro.timestamp) << "}"
+      << " iter_start_ts={" << FormatOptionalDiagnosticSlice(ro.iter_start_ts)
+      << "}";
+  return oss.str();
+}
+
+ScanWitnessLog::ScanWitnessLog(ThreadState* thread, const char* scan_type)
+    : thread_(thread), scan_type_(scan_type), next_entry_(0), wrapped_(false) {
+  if (Enabled()) {
+    entries_.resize(
+        static_cast<size_t>(FLAGS_stress_diagnostics_scan_witness_entries));
+  }
+}
+
+bool ScanWitnessLog::Enabled() const {
+  return thread_ != nullptr && FLAGS_stress_diagnostics_scan_witness &&
+         FLAGS_stress_diagnostics_scan_witness_entries > 0 &&
+         !FLAGS_stress_diagnostics_dir.empty() &&
+         !thread_->diagnostic_io_disabled;
+}
+
+void ScanWitnessLog::Add(const std::string& event) {
+  if (entries_.empty()) {
+    return;
+  }
+
+  std::ostringstream line;
+  line << "time_micros=" << thread_->shared->GetEnv()->NowMicros()
+       << " tid=" << thread_->tid
+       << " ordinal=" << thread_->current_operation_ordinal
+       << " scan_type=" << scan_type_ << " ";
+  if (event.size() <= kMaxScanWitnessEventBytes) {
+    line << SanitizeDiagnosticValue(event);
+  } else {
+    line << "truncated_event={" << FormatDiagnosticSlice(Slice(event)) << "}";
+  }
+  entries_[next_entry_] = line.str();
+  next_entry_ = (next_entry_ + 1) % entries_.size();
+  if (next_entry_ == 0) {
+    wrapped_ = true;
+  }
+}
+
+void ScanWitnessLog::AddIteratorState(const char* action, const char* label,
+                                      const Iterator& iter,
+                                      bool include_value) {
+  if (entries_.empty()) {
+    return;
+  }
+
+  std::ostringstream event;
+  event << "action=" << action << " iterator=" << label
+        << " valid=" << iter.Valid()
+        << " status=" << SanitizeDiagnosticValue(iter.status().ToString());
+  if (iter.Valid()) {
+    event << " key={" << FormatDiagnosticSlice(iter.key()) << "}";
+    if (include_value) {
+      const Slice value = iter.value();
+      event << " value_size=" << value.size()
+            << " value_hash64=" << GetSliceHash64(value)
+            << " wide_columns=" << iter.columns().size();
+    } else {
+      event << " value_unprepared=1";
+    }
+  }
+  Add(event.str());
+}
+
+void ScanWitnessLog::AddIteratorState(const char* action, size_t label,
+                                      const Iterator& iter,
+                                      bool include_value) {
+  if (entries_.empty()) {
+    return;
+  }
+  const std::string label_string = std::to_string(label);
+  AddIteratorState(action, label_string.c_str(), iter, include_value);
+}
+
+void ScanWitnessLog::Flush(const char* reason) const {
+  if (entries_.empty() || thread_->diagnostic_io_disabled) {
+    return;
+  }
+
+  Env* const env = Env::Default();
+  Status s = env->CreateDirIfMissing(FLAGS_stress_diagnostics_dir);
+  if (!s.ok()) {
+    fprintf(stderr, "Failed to create stress diagnostics directory %s: %s\n",
+            FLAGS_stress_diagnostics_dir.c_str(), s.ToString().c_str());
+    thread_->diagnostic_io_disabled = true;
+    return;
+  }
+
+  std::string path = FLAGS_stress_diagnostics_dir;
+  if (!path.empty() && path.back() != '/') {
+    path.push_back('/');
+  }
+  const StressTest* const stress_test = thread_->shared->GetStressTest();
+  const std::string db_label =
+      stress_test != nullptr ? stress_test->GetDbLabel() : "unknown_db";
+  path.append(SanitizeDiagnosticPathComponent(db_label));
+  path.append(".pid_");
+  path.append(std::to_string(port::GetProcessID()));
+  path.append(".thread_");
+  path.append(std::to_string(thread_->tid));
+  path.push_back('.');
+  path.append(SanitizeDiagnosticPathComponent(scan_type_));
+  path.append(".witness.txt");
+  const std::string temp_path = path + ".tmp";
+
+  std::unique_ptr<WritableFile> file;
+  s = env->NewWritableFile(temp_path, &file, EnvOptions());
+  if (!s.ok()) {
+    fprintf(stderr, "Failed to create scan witness file %s: %s\n",
+            temp_path.c_str(), s.ToString().c_str());
+    thread_->diagnostic_io_disabled = true;
+    return;
+  }
+
+  std::string output;
+  output.append("# reason=");
+  output.append(reason != nullptr ? reason : "unknown");
+  output.append(" pid=");
+  output.append(std::to_string(port::GetProcessID()));
+  output.append(" tid=");
+  output.append(std::to_string(thread_->tid));
+  output.append(" ordinal=");
+  output.append(std::to_string(thread_->current_operation_ordinal));
+  output.append(" scan_type=");
+  output.append(scan_type_);
+  output.push_back('\n');
+
+  const size_t entry_count = wrapped_ ? entries_.size() : next_entry_;
+  const size_t first_entry = wrapped_ ? next_entry_ : 0;
+  for (size_t i = 0; i < entry_count; ++i) {
+    const size_t index = (first_entry + i) % entries_.size();
+    output.append(entries_[index]);
+    output.push_back('\n');
+  }
+
+  Status write_status = file->Append(Slice(output));
+  Status close_status = file->Close();
+  file.reset();
+  if (!write_status.ok()) {
+    s = write_status;
+  } else if (!close_status.ok()) {
+    s = close_status;
+  } else {
+    s = env->RenameFile(temp_path, path);
+  }
+  if (!s.ok()) {
+    env->DeleteFile(temp_path).PermitUncheckedError();
+    fprintf(stderr, "Failed to write scan witness file %s: %s\n", path.c_str(),
+            s.ToString().c_str());
+    thread_->diagnostic_io_disabled = true;
+  }
+}
+
+namespace {
 
 class StressReadScopedBlockBufferProvider
     : public ReadScopedBlockBufferProvider {
@@ -1097,6 +1345,10 @@ StressTest::StressTest(int db_index, const std::string& db_path,
     // and keep error accounting focused on DB data and metadata.
     db_fault_injection_fs_->SetFileTypesExcludedFromFaultInjection(
         {FileType::kInfoLogFile});
+    db_fault_injection_fs_->SetInjectFileScopeOnWALWriteError(
+        FLAGS_file_scope_wal_write_faults);
+    db_fault_injection_fs_->SetInjectWriteFaultsOnlyOnWAL(
+        FLAGS_file_scope_wal_write_faults);
     // Set it to direct writable here to initially bypass any fault injection
     // during DB open. This will correspondingly be overwritten in
     // StressTest::Open() for open fault injection and in RunStressTestImpl()
@@ -2294,6 +2546,20 @@ void StressTest::OperateDb(ThreadState* thread) {
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
           FaultInjectionIOType::kMetadataWrite);
     }
+#else
+    // Most fault injection is debug-only. Keep the dedicated file-scoped WAL
+    // recovery mode available in optimized and sanitizer stress binaries so
+    // the recovery state machine gets the same matrix coverage as normal
+    // db_stress operation.
+    if (db_fault_injection_fs_ && FLAGS_file_scope_wal_write_faults) {
+      db_fault_injection_fs_->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kWrite, thread->shared->GetSeed(),
+          FLAGS_write_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      db_fault_injection_fs_->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kWrite);
+    }
 #endif  // NDEBUG
 
     for (uint64_t i = 0; i < ops_per_open; i++) {
@@ -3040,15 +3306,49 @@ Status StressTest::TestMultiScan(ThreadState* thread,
     scan_opts.insert(Slice(start_key_strs.back()), Slice(end_key_strs.back()));
   }
 
+  ScanWitnessLog witness(thread, "multi_scan");
+  if (witness.Enabled()) {
+    std::ostringstream start_oss;
+    start_oss << "action=start cf=" << rand_column_families[0]
+              << " range_count=" << num_scans
+              << " reverse=" << reverse_multiscan
+              << " multiscan_async_io=" << scan_opts.use_async_io
+              << " prefetch_memory_limit="
+              << FLAGS_multiscan_max_prefetch_memory_bytes << " read_options={"
+              << FormatReadOptionsForDiagnostics(ro) << "}";
+    witness.Add(start_oss.str());
+    for (size_t scan_idx = 0; scan_idx < scan_opts.GetScanRanges().size();
+         ++scan_idx) {
+      const ScanOptions& scan_opt = scan_opts.GetScanRanges()[scan_idx];
+      std::ostringstream range_oss;
+      range_oss << "action=range_input scan_range_index=" << scan_idx
+                << " lower={"
+                << FormatDiagnosticSlice(scan_opt.range.start.value()) << "}"
+                << " upper={"
+                << FormatDiagnosticSlice(scan_opt.range.limit.value()) << "}";
+      witness.Add(range_oss.str());
+    }
+  }
+
   std::string op_logs;
   ro.pin_data = thread->rand.OneIn(2);
   ro.background_purge_on_iterator_cleanup = thread->rand.OneIn(2);
+  if (witness.Enabled()) {
+    witness.Add("action=read_options_after_randomization read_options={" +
+                FormatReadOptionsForDiagnostics(ro) + "}");
+  }
 
+  if (options_.prefix_extractor.get() != nullptr) {
+    witness.Add("failure=multiscan_with_prefix_extractor");
+    witness.Flush("multiscan_with_prefix_extractor");
+  }
   assert(options_.prefix_extractor.get() == nullptr);
 
   std::unique_ptr<Iterator> iter;
   iter.reset(db_->NewIterator(ro, column_families_[rand_column_families[0]]));
   iter->Prepare(scan_opts);
+  witness.AddIteratorState("Prepare", "multi_scan", *iter,
+                           !ro.allow_unprepared_value);
 
   constexpr size_t kOpLogsLimit = 50000;
 
@@ -3105,6 +3405,21 @@ Status StressTest::TestMultiScan(ThreadState* thread,
     std::unique_ptr<Iterator> cmp_iter(db_->NewIterator(cmp_ro, cmp_cfh));
 
     bool diverged = false;
+    bool divergence_witness_flushed = false;
+    bool iter_value_prepared = !ro.allow_unprepared_value;
+    auto flush_divergence_witness = [&]() {
+      if (divergence_witness_flushed) {
+        return;
+      }
+      witness.Add("failure=multiscan_diverged scan_range_index=" +
+                  std::to_string(scan_idx) + " op_logs={" +
+                  FormatDiagnosticSlice(Slice(op_logs)) + "}");
+      witness.AddIteratorState("Divergence", "multi_scan", *iter,
+                               iter_value_prepared);
+      witness.AddIteratorState("Divergence", "control", *cmp_iter, true);
+      witness.Flush("multiscan_diverged");
+      divergence_witness_flushed = true;
+    };
 
     assert(scan_opt.range.start);
     assert(scan_opt.range.limit);
@@ -3129,13 +3444,31 @@ Status StressTest::TestMultiScan(ThreadState* thread,
       last_op = kLastOpSeek;
       op_logs += "S " + key.ToString(true) + " ";
     }
+    iter_value_prepared = !ro.allow_unprepared_value;
+    if (witness.Enabled()) {
+      witness.Add(
+          "action=range_seek scan_range_index=" + std::to_string(scan_idx) +
+          " lower={" + FormatDiagnosticSlice(lb) + "} upper={" +
+          FormatDiagnosticSlice(ub) + "} seek_key={" +
+          FormatDiagnosticSlice(key) + "}");
+    }
+    witness.AddIteratorState("Seek", "multi_scan", *iter,
+                             !ro.allow_unprepared_value);
+    witness.AddIteratorState("Seek", "control", *cmp_iter, true);
 
     if (iter->Valid() && ro.allow_unprepared_value) {
       op_logs += "*";
+      witness.AddIteratorState("PrepareValueBefore", "multi_scan", *iter,
+                               false);
 
       if (!iter->PrepareValue()) {
         assert(!iter->Valid());
         assert(!iter->status().ok());
+        witness.AddIteratorState("PrepareValueFailed", "multi_scan", *iter,
+                                 false);
+      } else {
+        iter_value_prepared = true;
+        witness.AddIteratorState("PrepareValue", "multi_scan", *iter, true);
       }
     }
 
@@ -3152,6 +3485,9 @@ Status StressTest::TestMultiScan(ThreadState* thread,
       }
 
       if (!iter->status().ok()) {
+        witness.Add("failure=reverse_multiscan_status status=" +
+                    SanitizeDiagnosticValue(iter->status().ToString()));
+        witness.Flush("reverse_multiscan_status");
         fprintf(stderr, "Reverse MultiScan error: %s\n",
                 iter->status().ToString().c_str());
         diverged = true;
@@ -3166,6 +3502,15 @@ Status StressTest::TestMultiScan(ThreadState* thread,
                                    /*b_has_ts=*/false) >= 0;
       if (iter->Valid() != cmp_valid ||
           (iter->Valid() && iter->key() != cmp_iter->key())) {
+        std::ostringstream failure_oss;
+        failure_oss << "failure=reverse_multiscan_divergence scan_range_index="
+                    << scan_idx << " op_logs={"
+                    << FormatDiagnosticSlice(Slice(op_logs)) << "}";
+        witness.Add(failure_oss.str());
+        witness.AddIteratorState("Divergence", "multi_scan", *iter,
+                                 iter_value_prepared);
+        witness.AddIteratorState("Divergence", "control", *cmp_iter, true);
+        witness.Flush("reverse_multiscan_divergence");
         fprintf(stderr,
                 "Reverse MultiScan diverged from control iterator %s under "
                 "range [%s, %s)\n",
@@ -3191,6 +3536,10 @@ Status StressTest::TestMultiScan(ThreadState* thread,
       }
 
       if (iter->Valid() && !verify_func(iter.get())) {
+        witness.Add("failure=reverse_multiscan_value_verification");
+        witness.AddIteratorState("ValueVerification", "multi_scan", *iter,
+                                 iter_value_prepared);
+        witness.Flush("reverse_multiscan_value_verification");
         diverged = true;
         thread->stats.AddErrors(1);
         thread->shared->SetVerificationFailure();
@@ -3200,9 +3549,11 @@ Status StressTest::TestMultiScan(ThreadState* thread,
     if (reverse_multiscan) {
       verify_reverse_multiscan();
     } else {
-      VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
-                     key, rand_column_families, op_logs, verify_func,
-                     &diverged);
+      if (VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(),
+                         last_op, key, rand_column_families, op_logs,
+                         verify_func, &diverged)) {
+        flush_divergence_witness();
+      }
     }
 
     uint64_t range_iterations = 0;
@@ -3234,13 +3585,25 @@ Status StressTest::TestMultiScan(ThreadState* thread,
       }
       ++range_iterations;
       last_op = kLastOpNextOrPrev;
+      iter_value_prepared = !ro.allow_unprepared_value;
+      witness.AddIteratorState(reverse_multiscan ? "Prev" : "Next",
+                               "multi_scan", *iter, !ro.allow_unprepared_value);
+      witness.AddIteratorState(reverse_multiscan ? "Prev" : "Next", "control",
+                               *cmp_iter, true);
 
       if (iter->Valid() && ro.allow_unprepared_value) {
         op_logs += "*";
+        witness.AddIteratorState("PrepareValueBefore", "multi_scan", *iter,
+                                 false);
 
         if (!iter->PrepareValue()) {
           assert(!iter->Valid());
           assert(!iter->status().ok());
+          witness.AddIteratorState("PrepareValueFailed", "multi_scan", *iter,
+                                   false);
+        } else {
+          iter_value_prepared = true;
+          witness.AddIteratorState("PrepareValue", "multi_scan", *iter, true);
         }
       }
 
@@ -3254,9 +3617,11 @@ Status StressTest::TestMultiScan(ThreadState* thread,
       if (reverse_multiscan) {
         verify_reverse_multiscan();
       } else {
-        VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
-                       key, rand_column_families, op_logs, verify_func,
-                       &diverged);
+        if (VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(),
+                           last_op, key, rand_column_families, op_logs,
+                           verify_func, &diverged)) {
+          flush_divergence_witness();
+        }
       }
 
       if (diverged) {
@@ -3705,9 +4070,10 @@ void StressTest::DumpIteratorDivergenceDiagnostics(
 // upper or lower bounds, or prefix extractor.
 // Will flag failure if the verification fails.
 // diverged = true if the two iterator is already diverged.
-// True if verification passed, false if not.
+// Returns true only when this call reports a verification failure. A false
+// return with diverged = true means verification was intentionally skipped.
 template <typename IterType, typename VerifyFuncType>
-void StressTest::VerifyIterator(
+bool StressTest::VerifyIterator(
     ThreadState* thread, ColumnFamilyHandle* cmp_cfh, const ReadOptions& ro,
     IterType* iter, Iterator* cmp_iter, LastIterateOp op,
     const Slice& verify_key, const std::vector<int>& rand_column_families,
@@ -3715,7 +4081,7 @@ void StressTest::VerifyIterator(
   assert(diverged);
 
   if (*diverged) {
-    return;
+    return false;
   }
 
   if (ro.iter_start_ts != nullptr) {
@@ -3723,17 +4089,17 @@ void StressTest::VerifyIterator(
     // We currently do not verify iterator when dumping history of internal
     // keys.
     *diverged = true;
-    return;
+    return false;
   }
 
   if (op == kLastOpSeekToFirst && ro.iterate_lower_bound != nullptr) {
     // SeekToFirst() with lower bound is not well-defined.
     *diverged = true;
-    return;
+    return false;
   } else if (op == kLastOpSeekToLast && ro.iterate_upper_bound != nullptr) {
     // SeekToLast() with higher bound is not well-defined.
     *diverged = true;
-    return;
+    return false;
   } else if (op == kLastOpSeek && ro.iterate_lower_bound != nullptr &&
              (options_.comparator->CompareWithoutTimestamp(
                   *ro.iterate_lower_bound, /*a_has_ts=*/false, verify_key,
@@ -3745,7 +4111,7 @@ void StressTest::VerifyIterator(
     // Lower bound behavior is not well-defined if it is larger than
     // seek key or upper bound. Disable the check for now.
     *diverged = true;
-    return;
+    return false;
   } else if (op == kLastOpSeekForPrev && ro.iterate_upper_bound != nullptr &&
              (options_.comparator->CompareWithoutTimestamp(
                   *ro.iterate_upper_bound, /*a_has_ts=*/false, verify_key,
@@ -3757,7 +4123,7 @@ void StressTest::VerifyIterator(
     // Upper bound behavior is not well-defined if it is smaller than
     // seek key or lower bound. Disable the check for now.
     *diverged = true;
-    return;
+    return false;
   }
 
   if (!ro.total_order_seek && options_.prefix_extractor != nullptr &&
@@ -3771,7 +4137,7 @@ void StressTest::VerifyIterator(
       // a prefix when prefix iteration is enabled. Skip verification for this
       // undefined configuration.
       *diverged = true;
-      return;
+      return false;
     }
   }
 
@@ -3810,14 +4176,14 @@ void StressTest::VerifyIterator(
         // Prefix seek a non-in-domain key is undefined. Skip checking for
         // this scenario.
         *diverged = true;
-        return;
+        return false;
       } else if (!pe->InDomain(iter->key())) {
         // out of range is iterator key is not in domain anymore.
         *diverged = true;
-        return;
+        return false;
       } else if (pe->Transform(iter->key()) != pe->Transform(verify_key)) {
         *diverged = true;
-        return;
+        return false;
       }
     }
     fprintf(stderr,
@@ -3838,7 +4204,7 @@ void StressTest::VerifyIterator(
         // Prefix seek a non-in-domain key is undefined. Skip checking for
         // this scenario.
         *diverged = true;
-        return;
+        return false;
       }
 
       if (!pe->InDomain(total_order_key) ||
@@ -3849,7 +4215,7 @@ void StressTest::VerifyIterator(
         *diverged = true;
         if (!iter->Valid() || !pe->InDomain(iter->key()) ||
             pe->Transform(iter->key()) != pe->Transform(verify_key)) {
-          return;
+          return false;
         }
         fprintf(stderr,
                 "Iterator stays in prefix but control doesn't"
@@ -3906,7 +4272,9 @@ void StressTest::VerifyIterator(
     thread->stats.AddErrors(1);
     // Fail fast to preserve the DB state.
     thread->shared->SetVerificationFailure();
+    return true;
   }
+  return false;
 }
 
 Status StressTest::TestBackupRestore(
@@ -4617,12 +4985,26 @@ void StressTest::TestGetProperty(ThreadState* thread) const {
   unknownPropertyNames.insert(levelPropertyNames.begin(),
                               levelPropertyNames.end());
 
+  std::unordered_set<std::string> blockCachePropertyNames = {
+      DB::Properties::kBlockCacheCapacity,
+      DB::Properties::kBlockCacheEntryStats,
+      DB::Properties::kFastBlockCacheEntryStats,
+      DB::Properties::kBlockCacheUsage,
+      DB::Properties::kBlockCachePinnedUsage,
+  };
+  const Options options = db_->GetOptions();
+  if (options.table_factory->GetOptions<Cache>(
+          TableFactory::kBlockCacheOpts()) == nullptr) {
+    unknownPropertyNames.insert(blockCachePropertyNames.begin(),
+                                blockCachePropertyNames.end());
+  }
+
   std::unordered_set<std::string> blobCachePropertyNames = {
       DB::Properties::kBlobCacheCapacity,
       DB::Properties::kBlobCacheUsage,
       DB::Properties::kBlobCachePinnedUsage,
   };
-  if (db_->GetOptions().blob_cache == nullptr) {
+  if (options.blob_cache == nullptr) {
     unknownPropertyNames.insert(blobCachePropertyNames.begin(),
                                 blobCachePropertyNames.end());
   }
@@ -5296,6 +5678,8 @@ void StressTest::PrintEnv() const {
           FLAGS_subcompactions);
   fprintf(stdout, "Use MultiGet              : %s\n",
           FLAGS_use_multiget ? "true" : "false");
+  fprintf(stdout, "Use full external table   : %s\n",
+          FLAGS_use_full_external_table ? "true" : "false");
   fprintf(stdout, "Use async DB API          : %s\n",
           FLAGS_use_async_db_api ? "true" : "false");
   fprintf(stdout, "Use GetEntity             : %s\n",
@@ -5374,6 +5758,8 @@ void StressTest::PrintEnv() const {
           FLAGS_metadata_write_fault_one_in);
   fprintf(stdout, "Read fault one in         : %d\n", FLAGS_read_fault_one_in);
   fprintf(stdout, "Write fault one in        : %d\n", FLAGS_write_fault_one_in);
+  fprintf(stdout, "File-scoped WAL write faults: %d\n",
+          static_cast<int>(FLAGS_file_scope_wal_write_faults));
   fprintf(stdout, "Open metadata read fault one in:\n");
   fprintf(stdout, "                            %d\n",
           FLAGS_open_metadata_read_fault_one_in);
@@ -5451,6 +5837,10 @@ void StressTest::Open(SharedState* shared, bool reopen) {
     fprintf(stderr, "Unknown compression manager: %s\n",
             FLAGS_compression_manager.c_str());
     exit(1);
+  }
+  if (FLAGS_use_full_external_table) {
+    options_.table_factory = NewExternalTableFactory(
+        std::make_shared<SimpleFullExternalTableFactory>());
   }
   if (FLAGS_prefix_size == 0 && FLAGS_rep_factory == kHashSkipList) {
     fprintf(stderr,
@@ -6576,7 +6966,10 @@ void InitializeOptionsFromFlags(
       FLAGS_max_write_batch_group_size_bytes;
   options.level_compaction_dynamic_level_bytes =
       FLAGS_level_compaction_dynamic_level_bytes;
-  options.track_and_verify_wals_in_manifest = true;
+  // File-scoped WAL recovery deliberately rejects either WAL-tracking mode.
+  // Disable the normally-on stress setting only for its dedicated fault mode.
+  options.track_and_verify_wals_in_manifest =
+      !FLAGS_file_scope_wal_write_faults;
   options.track_and_verify_wals = FLAGS_track_and_verify_wals;
   options.verify_sst_unique_id_in_manifest =
       FLAGS_verify_sst_unique_id_in_manifest;

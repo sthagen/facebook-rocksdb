@@ -70,6 +70,7 @@
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
 #include "env/unique_id_gen.h"
+#include "file/delete_scheduler.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
@@ -275,6 +276,11 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   SetDbSessionId();
   assert(!db_session_id_.empty());
 
+  if (write_buffer_manager_ != nullptr && !read_only_) {
+    wbm_flush_initiator_ = std::make_unique<WBMFlushInitiator>(
+        this, immutable_db_options_.atomic_flush);
+  }
+
   periodic_task_functions_.emplace(PeriodicTaskType::kDumpStats,
                                    [this]() { this->DumpStats(); });
   periodic_task_functions_.emplace(PeriodicTaskType::kPersistStats,
@@ -293,6 +299,8 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       table_cache_.get(), write_buffer_manager_, &write_controller_,
       &block_cache_tracer_, io_tracer_, db_id_, db_session_id_,
       options.daily_offpeak_time_utc, &error_handler_, read_only));
+  versions_->GetColumnFamilySet()->SetFlushInitiator(
+      wbm_flush_initiator_.get());
   column_family_memtables_.reset(
       new ColumnFamilyMemTablesImpl(versions_->GetColumnFamilySet()));
 
@@ -319,6 +327,10 @@ Status DBImpl::Resume() {
     return Status::OK();
   }
 
+  if (read_only_) {
+    return Status::NotSupported("Cannot resume a read-only DB");
+  }
+
   if (error_handler_.IsRecoveryInProgress()) {
     // Don't allow a mix of manual and automatic recovery
     return Status::Busy("Recovery in progress");
@@ -330,18 +342,23 @@ Status DBImpl::Resume() {
   return s;
 }
 
-// This function implements the guts of recovery from a background error. It
-// is eventually called for both manual as well as automatic recovery. It does
-// the following -
-// 1. Wait for currently scheduled background flush/compaction to exit, in
-//    order to inadvertently causing an error and thinking recovery failed
-// 2. Flush memtables if there's any data for all the CFs. This may result
-//    another error, which will be saved by error_handler_ and reported later
-//    as the recovery status
-// 3. Find and delete any obsolete files
-// 4. Schedule compactions if needed for all the CFs. This is needed as the
-//    flush in the prior step might have been a no-op for some CFs, which
-//    means a new super version wouldn't have been installed
+// This function implements both manual and automatic background-error
+// recovery. It discards stale queued flush requests, waits for scheduled work
+// to exit, rebuilds and runs the flush work required by the recovery context,
+// purges obsolete files, and schedules any follow-up compactions.
+//
+// A file-scoped WAL write error needs a stronger protocol because the failed
+// record might be absent, partial, or complete, and the failed file handle must
+// never be used again:
+// 1. Keep every WAL through failed_wal_number quarantined from concurrent sync.
+// 2. Fence WAL iterators at the failed sequence range and persist its end so a
+//    possibly complete record is neither exposed nor allowed to collide with a
+//    later write after recovery.
+// 3. Replace the failed WAL and atomically flush all live column families.
+// 4. Verify every column family advanced beyond the failed WAL.
+// 5. Detach the quarantined handles, then clear the cutoff only if a concurrent
+//    failure did not extend it. Any failure before completion leaves the hard
+//    background error and quarantine in place.
 Status DBImpl::ResumeImpl(DBRecoverContext context,
                           Env::IOActivity io_activity) {
   mutex_.AssertHeld();
@@ -368,6 +385,10 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   WaitForBackgroundWork();
 
   TEST_SYNC_POINT("DBImpl::ResumeImpl:Start");
+
+  if (context.IsWALWriteErrorRecovery()) {
+    ExtendWALRecoveryCutoff(context.failed_wal_number);
+  }
 
   // With two_write_queues=true, sequence numbers are allocated via
   // FetchAddLastAllocatedSequence() before writes complete, but only
@@ -397,6 +418,44 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     // Returning shutdown status to SFM during auto recovery will cause it
     // to abort the recovery and allow the shutdown to progress
     s = Status::ShutdownInProgress();
+  }
+
+  if (s.ok() && context.IsWALWriteErrorRecovery()) {
+    const bool has_blob_direct_write =
+        HasAnyBlobDirectWriteColumnFamilyWithLockHeld();
+    if (immutable_db_options_.manual_wal_flush ||
+        immutable_db_options_.allow_2pc || two_write_queues_ ||
+        immutable_db_options_.enable_pipelined_write ||
+        immutable_db_options_.unordered_write ||
+        immutable_db_options_.recycle_log_file_num != 0 ||
+        immutable_db_options_.WAL_ttl_seconds != 0 ||
+        immutable_db_options_.WAL_size_limit_MB != 0 ||
+        immutable_db_options_.track_and_verify_wals_in_manifest ||
+        immutable_db_options_.track_and_verify_wals || has_blob_direct_write) {
+      ROCKS_LOG_WARN(
+          immutable_db_options_.info_log,
+          "[WAL recovery] Unsupported configuration; DB remains write-stopped: "
+          "manual_wal_flush=%d, allow_2pc=%d, two_write_queues=%d, "
+          "pipelined_write=%d, unordered_write=%d, wal_recycling=%d, "
+          "wal_ttl=%d, wal_size_limit=%d, track_wals_in_manifest=%d, "
+          "track_wals=%d, blob_direct_write=%d",
+          static_cast<int>(immutable_db_options_.manual_wal_flush),
+          static_cast<int>(immutable_db_options_.allow_2pc),
+          static_cast<int>(two_write_queues_),
+          static_cast<int>(immutable_db_options_.enable_pipelined_write),
+          static_cast<int>(immutable_db_options_.unordered_write),
+          static_cast<int>(immutable_db_options_.recycle_log_file_num != 0),
+          static_cast<int>(immutable_db_options_.WAL_ttl_seconds != 0),
+          static_cast<int>(immutable_db_options_.WAL_size_limit_MB != 0),
+          static_cast<int>(
+              immutable_db_options_.track_and_verify_wals_in_manifest),
+          static_cast<int>(immutable_db_options_.track_and_verify_wals),
+          static_cast<int>(has_blob_direct_write));
+      s = Status::NotSupported(
+          "file-scoped WAL write error recovery is not supported with manual "
+          "WAL flush, 2PC, two write queues, pipelined or unordered writes, "
+          "WAL recycling, retention or tracking, or blob direct write");
+    }
   }
 
   if (s.ok()) {
@@ -439,7 +498,56 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     }
   }
 
+  if (s.ok() && context.IsWALWriteErrorRecovery() &&
+      context.failed_wal_sequence > 0) {
+    // A WAL error can be reported after the whole record reached storage but
+    // before its sequence range was published. Persist the reservation before
+    // admitting later writes so they cannot reuse an ambiguous sequence. This
+    // guarantee belongs to file-scoped recovery, which also atomically advances
+    // every column family past the failed WAL before retiring it. Unsupported
+    // configurations fail the check above and remain write-stopped.
+    assert(context.IsWALWriteErrorRecovery());
+    assert(context.failed_wal_sequence_start != 0);
+    assert(context.failed_wal_sequence_start <= context.failed_wal_sequence);
+    wal_manager_.RecordIndeterminateWriteSequence(
+        context.failed_wal_number, context.failed_wal_sequence_start,
+        context.failed_wal_sequence);
+    if (context.failed_wal_sequence > versions_->LastAllocatedSequence()) {
+      versions_->SetLastAllocatedSequence(context.failed_wal_sequence);
+    }
+    if (context.failed_wal_sequence > versions_->LastPublishedSequence()) {
+      versions_->SetLastPublishedSequence(context.failed_wal_sequence);
+    }
+    if (context.failed_wal_sequence > versions_->LastSequence()) {
+      versions_->SetLastSequence(context.failed_wal_sequence);
+    }
+    VersionEdit edit;
+    edit.SetLastSequence(context.failed_wal_sequence);
+    auto cfh =
+        static_cast_with_check<ColumnFamilyHandleImpl>(default_cf_handle_);
+    assert(cfh);
+    s = versions_->LogAndApply(cfh->cfd(), read_options, write_options, &edit,
+                               &mutex_, directories_.GetDbDir());
+    if (!s.ok() && versions_->io_status().IsIOError()) {
+      error_handler_.SetBGError(versions_->io_status(),
+                                BackgroundErrorReason::kManifestWrite);
+    }
+    if (s.ok()) {
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[WAL recovery] Persisted sequence reservation through "
+                     "#%" PRIu64,
+                     context.failed_wal_sequence);
+    } else {
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "[WAL recovery] Failed to persist sequence reservation "
+                     "through #%" PRIu64 ": %s",
+                     context.failed_wal_sequence, s.ToString().c_str());
+    }
+  }
+
   if (s.ok()) {
+    recovering_from_wal_write_error_ = context.IsWALWriteErrorRecovery();
+    recover_wal_through_number_ = context.failed_wal_number;
     if (context.flush_reason == FlushReason::kErrorRecoveryRetryFlush) {
       s = RetryFlushesForErrorRecovery(FlushReason::kErrorRecoveryRetryFlush,
                                        true /* wait */);
@@ -449,13 +557,96 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
       FlushOptions flush_opts;
       // We allow flush to stall write since we are trying to resume from error.
       flush_opts.allow_write_stall = true;
+      // Keep the per-column-family WAL replay boundaries in one MANIFEST
+      // commit. Otherwise a crash between sequential flushes can recover only
+      // part of a write batch spanning multiple column families.
+      flush_opts.force_atomic_flush = true;
+      if (context.IsWALWriteErrorRecovery()) {
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "[WAL recovery] Starting atomic flush of all live "
+                       "column families through WAL #%" PRIu64,
+                       context.failed_wal_number);
+      }
       s = FlushAllColumnFamilies(flush_opts, context.flush_reason);
+      if (s.ok() && context.IsWALWriteErrorRecovery()) {
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "[WAL recovery] Atomic flush completed through WAL "
+                       "#%" PRIu64,
+                       context.failed_wal_number);
+      }
     }
+    recovering_from_wal_write_error_ = false;
+    recover_wal_through_number_ = 0;
     if (!s.ok()) {
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "DB resume requested but failed due to Flush failure [%s]",
                      s.ToString().c_str());
     }
+  }
+
+  if (s.ok() && context.IsWALWriteErrorRecovery()) {
+    for (auto* cfd : *versions_->GetColumnFamilySet()) {
+      if (!cfd->IsDropped() &&
+          cfd->GetLogNumber() <= context.failed_wal_number) {
+        s = Status::Corruption(
+            "WAL write error recovery did not advance column family " +
+            cfd->GetName() + " past WAL " +
+            std::to_string(context.failed_wal_number));
+        break;
+      }
+    }
+  }
+
+  if (s.ok() && context.IsWALWriteErrorRecovery()) {
+    // The flush and MANIFEST transition above make the abandoned WALs
+    // unnecessary for recovery. Detach their writers even when physical file
+    // deletion is disabled so no later SyncWAL() can touch a poisoned handle.
+    mutex_.Unlock();
+    {
+      InstrumentedMutexLock wal_lock(&wal_write_mutex_);
+      size_t retired_wal_count = 0;
+      if (logs_.empty() || logs_.back().number <= context.failed_wal_number) {
+        s = Status::Corruption(
+            "WAL write error recovery did not install a replacement WAL "
+            "after WAL " +
+            std::to_string(context.failed_wal_number));
+      } else {
+        for (auto it = logs_.begin();
+             it != logs_.end() && it->number <= context.failed_wal_number;) {
+          if (it->IsSyncing()) {
+            wal_sync_cv_.Wait();
+            it = logs_.begin();
+            continue;
+          }
+          wals_to_free_.push_back(it->ReleaseWriter());
+          it = logs_.erase(it);
+          ++retired_wal_count;
+        }
+        uint64_t expected_cutoff = context.failed_wal_number;
+        // A failed compare-exchange means a concurrent WAL failure extended the
+        // cutoff. That failure also sets recovery_error_, so the background
+        // error remains set and a later recovery attempt owns the larger range.
+        const bool cutoff_cleared =
+            wal_recovery_cutoff_.compare_exchange_strong(
+                expected_cutoff, 0, std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        if (cutoff_cleared) {
+          ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                         "[WAL recovery] Retired %" ROCKSDB_PRIszt
+                         " WAL handle(s) through "
+                         "#%" PRIu64 " and cleared the quarantine cutoff",
+                         retired_wal_count, context.failed_wal_number);
+        } else {
+          ROCKS_LOG_WARN(
+              immutable_db_options_.info_log,
+              "[WAL recovery] Retired %" ROCKSDB_PRIszt
+              " WAL handle(s) through "
+              "#%" PRIu64 "; quarantine cutoff advanced to #%" PRIu64,
+              retired_wal_count, context.failed_wal_number, expected_cutoff);
+        }
+      }
+    }
+    mutex_.Lock();
   }
 
   JobContext job_context(0);
@@ -472,18 +663,26 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   if (s.ok()) {
     // Will notify and unblock threads waiting for error recovery to finish.
     s = error_handler_.ClearBGError();
+    if (s.ok() && AsyncWALPrecreateEnabled()) {
+      size_t max_write_buffer_size = 0;
+      for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+        if (!cfd->IsDropped()) {
+          max_write_buffer_size =
+              std::max(max_write_buffer_size,
+                       cfd->GetLatestMutableCFOptions().write_buffer_size);
+        }
+      }
+      // WAL rotation during recovery cannot schedule its successor while the
+      // hard background error is set. Refill the async slot only after
+      // ClearBGError() has made normal background work eligible again.
+      MaybeScheduleAsyncWALPrecreate(
+          GetWalPreallocateBlockSize(max_write_buffer_size));
+    }
   } else {
     // NOTE: this is needed to pass ASSERT_STATUS_CHECKED
     // in the DBSSTTest.DBWithMaxSpaceAllowedRandomized test.
     // See https://github.com/facebook/rocksdb/pull/7715#issuecomment-754947952
     error_handler_.GetRecoveryError().PermitUncheckedError();
-  }
-
-  if (s.ok()) {
-    ROCKS_LOG_INFO(immutable_db_options_.info_log, "Successfully resumed DB");
-  } else {
-    ROCKS_LOG_INFO(immutable_db_options_.info_log, "Failed to resume DB [%s]",
-                   s.ToString().c_str());
   }
 
   // Check for shutdown again before scheduling further compactions,
@@ -516,6 +715,23 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
     MaybeScheduleFlushOrCompaction();
   }
 
+  if (s.ok() && context.IsWALWriteErrorRecovery()) {
+    ROCKS_LOG_INFO(
+        immutable_db_options_.info_log,
+        "[WAL recovery] Successfully resumed DB through WAL #%" PRIu64,
+        context.failed_wal_number);
+  } else if (s.ok()) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log, "Successfully resumed DB");
+  } else if (context.IsWALWriteErrorRecovery()) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "[WAL recovery] Failed to resume DB through WAL #%" PRIu64
+                   ": %s",
+                   context.failed_wal_number, s.ToString().c_str());
+  } else {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log, "Failed to resume DB [%s]",
+                   s.ToString().c_str());
+  }
+
   // Wake up any waiters - in this case, it could be the shutdown thread
   bg_cv_.SignalAll();
 
@@ -527,7 +743,9 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
 void DBImpl::WaitForBackgroundWork() {
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_pressure_callback_in_progress_) {
+         bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
+         bg_pressure_callback_in_progress_ ||
+         bg_async_file_open_state_ == AsyncFileOpenState::kScheduled) {
     bg_cv_.Wait();
   }
 }
@@ -610,6 +828,7 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   }
   shutting_down_.store(true, std::memory_order_release);
   bg_cv_.SignalAll();
+  env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
   if (!wait) {
     return;
   }
@@ -818,6 +1037,18 @@ Status DBImpl::MaybeWriteWalMarkersToManifestOnClose() {
                                 /*new_descriptor_log=*/false);
 }
 
+void DBImpl::MaybeRegisterFlushInitiator() {
+  // Register only fully opened read-write DBs. Do not hold mutex_: the lock
+  // order is registry mutex before DB mutex.
+  if (write_buffer_manager_ == nullptr || read_only_ || !opened_successfully_) {
+    return;
+  }
+  if (wbm_flush_initiator_ == nullptr || wbm_flush_initiator_->IsRegistered()) {
+    return;
+  }
+  write_buffer_manager_->RegisterFlushInitiator(wbm_flush_initiator_.get());
+}
+
 Status DBImpl::CloseHelper() {
   // Guarantee that there is no background error recovery in progress before
   // continuing with the shutdown
@@ -828,6 +1059,13 @@ Status DBImpl::CloseHelper() {
     bg_cv_.Wait();
   }
   mutex_.Unlock();
+
+  // Deregister before teardown and without mutex_ to preserve registry-to-DB
+  // lock ordering.
+  if (write_buffer_manager_ && wbm_flush_initiator_ &&
+      wbm_flush_initiator_->IsRegistered()) {
+    write_buffer_manager_->DeregisterFlushInitiator(wbm_flush_initiator_.get());
+  }
 
   // Below check is added as recovery_error_ is not checked and it causes crash
   // in DBSSTTest.DBWithMaxSpaceAllowedWithBlobFiles when space limit is
@@ -855,8 +1093,8 @@ Status DBImpl::CloseHelper() {
 
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_purge_scheduled_ ||
-         bg_pressure_callback_in_progress_ ||
+         bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
+         bg_purge_scheduled_ || bg_pressure_callback_in_progress_ ||
          bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
          async_wal_precreate_state_ == AsyncWALPrecreateState::kScheduled ||
          pending_purge_obsolete_files_ ||
@@ -1045,6 +1283,10 @@ Status DBImpl::CloseHelper() {
 #endif  // !NDEBUG
   table_cache_->EraseUnRefEntries();
 
+  // The flush initiator was deregistered before background-work teardown.
+  // Detach it before ColumnFamilySet destroys its column families one by one;
+  // otherwise each removal rebuilds accounting by scanning all survivors.
+  versions_->GetColumnFamilySet()->SetFlushInitiator(nullptr);
   versions_.reset();
   mutex_.Unlock();
   if (db_lock_ != nullptr) {
@@ -1108,7 +1350,7 @@ DBImpl::~DBImpl() {
       s.PermitUncheckedError();
     }
 
-    closing_status_ = CloseImpl();
+    closing_status_ = DBImpl::CloseImpl();
     closing_status_.PermitUncheckedError();
   }
   ThreadStatusUtil::SetThreadOperation(cur_op_type);
@@ -1347,7 +1589,7 @@ size_t DBImpl::EstimateInMemoryStatsHistorySize() const {
   // non-empty map, stats_history_.begin() guaranteed to exist
   for (const auto& pairs : stats_history_.begin()->second) {
     size_per_slice +=
-        pairs.first.capacity() + sizeof(pairs.first) + sizeof(pairs.second);
+        pairs.first.capacity() + sizeof(std::string) + sizeof(pairs.second);
   }
   size_total = size_per_slice * stats_history_.size();
   return size_total;
@@ -2081,6 +2323,14 @@ Status DBImpl::SyncWAL() {
     s = ApplyWALToManifest(read_options, write_options, &synced_wals);
   }
 
+  if (s.ok() && wal_recovery_cutoff_.load(std::memory_order_acquire) != 0) {
+    InstrumentedMutexLock l(&mutex_);
+    Status bg_error = error_handler_.GetBGError();
+    if (!bg_error.ok()) {
+      s = bg_error;
+    }
+  }
+
   TEST_SYNC_POINT("DBImpl::SyncWAL:BeforeMarkLogsSynced:2");
   return s;
 }
@@ -2122,6 +2372,17 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
       auto& log = *it;
       // Ensure the head of logs_ is marked as getting_synced if any is.
       log.PrepareForSync();
+      if (log.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+        // The failed file handle is permanently unusable. Recovery will make
+        // this WAL obsolete only after atomically persisting all accepted
+        // memtable contents, so do not retry any operation on the handle.
+        // PrepareForSync() pins the entry until MarkLogsSynced() or
+        // MarkLogsNotSynced() calls FinishSync(), which prevents recovery from
+        // clearing the cutoff while this call still relies on it.
+        TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalImpl:SkipFailedWAL",
+                                 &log.number);
+        continue;
+      }
       // If last sync failed on a later WAL, this could be a fully synced
       // and closed WAL that just needs to be recorded as synced in the
       // manifest.
@@ -2140,8 +2401,15 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   IOOptions opts;
   IOStatus io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
   std::list<log::Writer*> wals_internally_closed;
+  uint64_t failed_wal_number = 0;
+  bool failed_with_previous_error = false;
   if (io_s.ok()) {
     for (log::Writer* log : wals_to_sync) {
+      if (log->get_log_number() <=
+          wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+        continue;
+      }
+      TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalImpl:BeforeSyncWAL", log);
       if (job_context) {
         ROCKS_LOG_INFO(immutable_db_options_.info_log,
                        "[JOB %d] Syncing log #%" PRIu64, job_context->job_id,
@@ -2152,12 +2420,17 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
       }
       if (log->get_log_number() >= maybe_active_number) {
         assert(log->get_log_number() == maybe_active_number);
-        io_s = log->file()->SyncWithoutFlush(opts,
-                                             immutable_db_options_.use_fsync);
+        io_s = log->file()->SyncWithoutFlush(
+            opts, immutable_db_options_.use_fsync, &failed_with_previous_error);
       } else {
-        io_s = log->file()->Sync(opts, immutable_db_options_.use_fsync);
+        io_s = log->file()->Sync(opts, immutable_db_options_.use_fsync,
+                                 &failed_with_previous_error);
       }
+      std::pair<log::Writer*, IOStatus*> wal_and_status(log, &io_s);
+      TEST_SYNC_POINT_CALLBACK("DBImpl::SyncWalImpl:AfterSyncWAL",
+                               &wal_and_status);
       if (!io_s.ok()) {
+        failed_wal_number = log->get_log_number();
         break;
       }
       // WALs can be closed when purging obsolete files, but if recycling is
@@ -2177,6 +2450,7 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
         io_s = log->file()->Close(opts);
         wals_internally_closed.push_back(log);
         if (!io_s.ok()) {
+          failed_wal_number = log->get_log_number();
           break;
         }
       }
@@ -2187,7 +2461,16 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
                     io_s.ToString().c_str());
     // In case there is a fs error we should set it globally to prevent the
     // future writes
-    WALIOStatusCheck(io_s);
+    // The live-WAL operation that first observed the I/O failure owns
+    // classifying its original status, either through WALIOStatusCheck() or a
+    // direct SetBGError() call. With paranoid checks enabled, a concurrent sync
+    // must not classify the synthetic "previous error" status because it has
+    // lost the original scope and could incorrectly make the error fatal. With
+    // paranoid checks disabled, WALIOStatusCheck() instead preserves the
+    // legacy behavior of resetting the writer so a later operation can retry.
+    if (!failed_with_previous_error || !immutable_db_options_.paranoid_checks) {
+      WALIOStatusCheck(io_s, failed_wal_number);
+    }
   }
   if (io_s.ok() && need_wal_dir_sync) {
     io_s = directories_.GetWalDir()->FsyncWithDirOptions(
@@ -2333,6 +2616,12 @@ void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
   for (auto it = logs_.begin(); it != logs_.end() && it->number <= up_to;) {
     auto& wal = *it;
     assert(wal.IsSyncing());
+
+    if (wal.number <= wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+      wal.FinishSync();
+      ++it;
+      continue;
+    }
 
     if (wal.number < logs_.back().number) {
       // Inactive WAL
@@ -4410,12 +4699,29 @@ Status DBImpl::DropColumnFamilies(
   InstrumentedMutexLock ol(&options_mutex_);
   Status s;
   bool success_once = false;
-  for (auto* handle : column_families) {
-    s = DropColumnFamilyImpl(handle);
-    if (!s.ok()) {
-      break;
+  ColumnFamilySet* const column_family_set = versions_->GetColumnFamilySet();
+  const bool batch_flushable_mem_accounting =
+      write_buffer_manager_ != nullptr &&
+      write_buffer_manager_->ShouldTrackFlushInitiator();
+  if (batch_flushable_mem_accounting) {
+    InstrumentedMutexLock lock(&mutex_);
+    column_family_set->BeginBulkFlushableMemAccountingUpdate();
+  }
+  {
+    Defer finish_bulk_accounting(
+        [this, column_family_set, batch_flushable_mem_accounting] {
+          if (batch_flushable_mem_accounting) {
+            InstrumentedMutexLock lock(&mutex_);
+            column_family_set->EndBulkFlushableMemAccountingUpdate();
+          }
+        });
+    for (auto* handle : column_families) {
+      s = DropColumnFamilyImpl(handle);
+      if (!s.ok()) {
+        break;
+      }
+      success_once = true;
     }
-    success_once = true;
   }
   if (success_once) {
     // TODO: plumb Env::IOActivity, Env::IOPriority
@@ -4460,6 +4766,7 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
       // we drop column family from a single write thread
       WriteThread::Writer w;
       write_thread_.EnterUnbatched(&w, &mutex_);
+      WaitForPendingWrites();
       s = versions_->LogAndApply(cfd, read_options, write_options, &edit,
                                  &mutex_, directories_.GetDbDir());
       write_thread_.ExitUnbatched(&w);
@@ -6135,21 +6442,36 @@ Status DestroyDB(const std::string& dbname, const Options& options,
   // log file and prevents cleanup and directory removal
   soptions.info_log.reset();
   IOOptions io_opts;
-  // Ignore error in case directory does not exist
-  soptions.fs
-      ->GetChildren(dbname, io_opts, &filenames,
-                    /*IODebugContext*=*/nullptr)
-      .PermitUncheckedError();
 
   std::set<std::string> paths_to_delete;
   FileLock* lock;
   const std::string lockname = LockFileName(dbname);
   Status result = env->LockFile(lockname, &lock);
   if (result.ok()) {
+    if (sfm) {
+      sfm->WaitForEmptyTrashInDirectory(dbname);
+    }
+    // Ignore error in case directory does not exist
+    soptions.fs
+        ->GetChildren(dbname, io_opts, &filenames,
+                      /*IODebugContext*=*/nullptr)
+        .PermitUncheckedError();
+
     uint64_t number;
     FileType type;
     InfoLogPrefix info_log_prefix(!soptions.db_log_dir.empty(), dbname);
     for (const auto& fname : filenames) {
+      if (DeleteScheduler::IsTrashFile(fname)) {
+        std::string trash_file_path = dbname;
+        trash_file_path.append("/").append(fname);
+        Status del = DeleteExistingTrashDBFile(&soptions, trash_file_path,
+                                               dbname, /*force_bg=*/false,
+                                               /*force_fg=*/false, bucket);
+        if (!del.ok() && result.ok()) {
+          result = del;
+        }
+        continue;
+      }
       if (ParseFileName(fname, &number, info_log_prefix.prefix, &type) &&
           type != kDBLockFile) {  // Lock file will be deleted at end
         Status del;
@@ -6189,14 +6511,26 @@ Status DestroyDB(const std::string& dbname, const Options& options,
     }
 
     for (const auto& path : paths) {
+      if (sfm) {
+        sfm->WaitForEmptyTrashInDirectory(path);
+      }
       if (soptions.fs
               ->GetChildren(path, io_opts, &filenames,
                             /*IODebugContext*=*/nullptr)
               .ok()) {
         for (const auto& fname : filenames) {
-          if (ParseFileName(fname, &number, &type) &&
-              (type == kTableFile ||
-               type == kBlobFile)) {  // Lock file will be deleted at end
+          if (DeleteScheduler::IsTrashFile(fname)) {
+            std::string trash_file_path = path;
+            trash_file_path.append("/").append(fname);
+            Status del = DeleteExistingTrashDBFile(&soptions, trash_file_path,
+                                                   path, /*force_bg=*/false,
+                                                   /*force_fg=*/false, bucket);
+            if (!del.ok() && result.ok()) {
+              result = del;
+            }
+          } else if (ParseFileName(fname, &number, &type) &&
+                     (type == kTableFile ||
+                      type == kBlobFile)) {  // Lock file will be deleted at end
             std::string file_path = path + "/" + fname;
             Status del = DeleteUnaccountedDBFile(&soptions, file_path, dbname,
                                                  /*force_bg=*/false,
@@ -6215,6 +6549,9 @@ Status DestroyDB(const std::string& dbname, const Options& options,
     std::string archivedir = ArchivalDirectory(dbname);
     bool wal_dir_exists = false;
     if (!soptions.IsWalDirSameAsDBPath(dbname)) {
+      if (sfm) {
+        sfm->WaitForEmptyTrashInDirectory(soptions.wal_dir);
+      }
       wal_dir_exists =
           soptions.fs
               ->GetChildren(soptions.wal_dir, io_opts, &walDirFiles,
@@ -6227,13 +6564,25 @@ Status DestroyDB(const std::string& dbname, const Options& options,
     // processed and removed before those otherwise we have issues
     // removing them
     std::vector<std::string> archiveFiles;
+    if (sfm) {
+      sfm->WaitForEmptyTrashInDirectory(archivedir);
+    }
     if (soptions.fs
             ->GetChildren(archivedir, io_opts, &archiveFiles,
                           /*IODebugContext*=*/nullptr)
             .ok()) {
       // Delete archival files.
       for (const auto& file : archiveFiles) {
-        if (ParseFileName(file, &number, &type) && type == kWalFile) {
+        if (DeleteScheduler::IsTrashFile(file)) {
+          std::string trash_file_path = archivedir;
+          trash_file_path.append("/").append(file);
+          Status del = DeleteExistingTrashDBFile(
+              &soptions, trash_file_path, archivedir, /*force_bg=*/false,
+              /*force_fg=*/!wal_in_db_path, bucket);
+          if (!del.ok() && result.ok()) {
+            result = del;
+          }
+        } else if (ParseFileName(file, &number, &type) && type == kWalFile) {
           Status del = DeleteUnaccountedDBFile(
               &soptions, archivedir + "/" + file, archivedir,
               /*force_bg=*/false, /*force_fg=*/!wal_in_db_path, bucket);
@@ -6248,7 +6597,16 @@ Status DestroyDB(const std::string& dbname, const Options& options,
     // Delete log files in the WAL dir
     if (wal_dir_exists) {
       for (const auto& file : walDirFiles) {
-        if (ParseFileName(file, &number, &type) && type == kWalFile) {
+        if (DeleteScheduler::IsTrashFile(file)) {
+          std::string trash_file_path = soptions.wal_dir;
+          trash_file_path.append("/").append(file);
+          Status del = DeleteExistingTrashDBFile(
+              &soptions, trash_file_path, soptions.wal_dir,
+              /*force_bg=*/false, /*force_fg=*/!wal_in_db_path, bucket);
+          if (!del.ok() && result.ok()) {
+            result = del;
+          }
+        } else if (ParseFileName(file, &number, &type) && type == kWalFile) {
           Status del = DeleteUnaccountedDBFile(
               &soptions, LogFileName(soptions.wal_dir, number),
               soptions.wal_dir, /*force_bg=*/false,
@@ -6816,10 +7174,6 @@ Status DBImpl::PrepareFileIngestion(
                                        "] size must match external_files[" +
                                        std::to_string(i) + "] size");
       }
-      if (args[i].options.write_global_seqno) {
-        return Status::InvalidArgument(
-            "write_global_seqno is not supported when file_infos is set");
-      }
     }
     if (i && args[i].options.fill_cache != args[i - 1].options.fill_cache) {
       return Status::InvalidArgument(
@@ -6866,13 +7220,6 @@ Status DBImpl::PrepareFileIngestion(
       }
     }
 
-    if (ingest_opts.allow_db_generated_files) {
-      if (ingest_opts.write_global_seqno) {
-        return Status::NotSupported(
-            "write_global_seqno is deprecated and does not work with "
-            "allow_db_generated_files.");
-      }
-    }
     if (ingest_opts.move_files && ingest_opts.link_files) {
       return Status::InvalidArgument(
           "`move_files` and `link_files` can not both be true.");
@@ -7467,19 +7814,35 @@ Status DBImpl::ClipColumnFamily(ColumnFamilyHandle* column_family,
     std::vector<RangeOpt> ranges;
     ranges.emplace_back(OptSlice{}, begin_key);
     ranges.emplace_back(end_key, OptSlice{});
-    status = DeleteFilesInRanges(column_family, ranges.data(), ranges.size());
+    // begin_key is kept, so a file whose largest key is begin_key must stay.
+    status = DeleteFilesInRanges(column_family, ranges.data(), ranges.size(),
+                                 false /* include_end */);
   }
 
   // DeleteRange the remaining overlapping keys
   bool empty_after_delete = false;
   if (status.ok()) {
-    Slice smallest_user_key, largest_user_key;
+    // GetSstFilesBoundaryKeys returns Slices into the current Version's
+    // FileMetaData. Copy them out while holding the mutex: the deletes below
+    // drop the mutex and each is a full write, during which a background
+    // compaction can install a new Version and free that metadata.
+    std::string smallest_buf;
+    std::string largest_buf;
     {
       // Lock db mutex
       InstrumentedMutexLock l(&mutex_);
-      cfd->current()->GetSstFilesBoundaryKeys(&smallest_user_key,
-                                              &largest_user_key);
+      Slice smallest_slice;
+      Slice largest_slice;
+      cfd->current()->GetSstFilesBoundaryKeys(&smallest_slice, &largest_slice);
+      smallest_buf.assign(smallest_slice.data(), smallest_slice.size());
+      largest_buf.assign(largest_slice.data(), largest_slice.size());
     }
+    Slice smallest_user_key(smallest_buf);
+    Slice largest_user_key(largest_buf);
+    // Opens the window in which the current Version (and the FileMetaData the
+    // boundary keys were read from) can be replaced and freed by a background
+    // job before the deletes below run.
+    TEST_SYNC_POINT("DBImpl::ClipColumnFamily:PostBoundaryKeys");
     // all the files has been deleted after DeleteFilesInRanges;
     if (smallest_user_key.empty() && largest_user_key.empty()) {
       empty_after_delete = true;

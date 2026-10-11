@@ -233,6 +233,15 @@ struct GetMergeOperandsOptions {
 using TablePropertiesCollection =
     std::unordered_map<std::string, std::shared_ptr<const TableProperties>>;
 
+// Serializes opaque metadata returned through PreparedFileInfo.
+Status SerializePreparedFileInfo(const PreparedFileInfo& prepared_file_info,
+                                 std::string* output);
+
+// Restores opaque metadata serialized by SerializePreparedFileInfo().
+Status DeserializePreparedFileInfo(
+    const Slice& input,
+    std::shared_ptr<const PreparedFileInfo>* prepared_file_info);
+
 // A DB is a persistent, versioned ordered map from keys to values.
 // A DB is safe for concurrent access from multiple threads without
 // any external synchronization.
@@ -316,6 +325,22 @@ class DB {
   // to Flush/Compaction will return error.
   //
   // Multiple secondary instances can co-exist at the same time.
+  //
+  // The primary can delete obsolete files that a secondary still references.
+  // To keep those files safely accessible, applications must either coordinate
+  // primary deletion with all secondaries, or provide an Env/FileSystem that
+  // delays physical deletion until every instance releases the file. As a
+  // table-files-only workaround when `open_files_async=false`, setting
+  // `max_open_files=-1` makes the secondary eagerly open its current SSTs;
+  // this does not protect other file types.
+  //
+  // With `open_files_async=true`, OpenAsSecondary returns before its current
+  // SSTs have all been opened, so `max_open_files=-1` does not provide that
+  // workaround. A missing file can surface as a background error and/or a read
+  // error. TryCatchUpWithPrimary can resolve a transient, non-latched error if
+  // a newer primary version no longer references the file. A latched
+  // asynchronous-open background error requires closing and reopening the
+  // secondary after fixing the underlying problem.
   //
 
   // Open DB as secondary instance
@@ -682,6 +707,30 @@ class DB {
   // Apply the specified updates atomically to the database.
   // If `updates` contains no update, WAL will still be synced if
   // options.sync=true.
+  //
+  // When the WAL is enabled, an IOError from the WAL write has a fundamentally
+  // indeterminate outcome: storage may have accepted the complete WAL record
+  // before the acknowledgement failed, so RocksDB cannot distinguish an
+  // absent, incomplete, or complete record from the error alone. Normal DB
+  // reads can continue, but the failed write is not made visible to them while
+  // this DB instance remains open.
+  //
+  // However, the persisted DB (what is visible on reopen) is still in an
+  // indeterminate state with respect to these updates until RocksDB reports
+  // successful live resumption (see DB::Resume()) from a supported file-scoped
+  // WAL error without closing or reopening the DB. If the DB is reopened, or
+  // for any other WAL error that does not carry this durable-abandonment
+  // guarantee, the application should rely on its own consistency-resolution
+  // mechanism within the bounds of RocksDB's documented guarantees (see
+  // WALRecoveryMode), such as idempotency, deduplication, or reconciliation.
+  // After such a successful live resumption, RocksDB has durably abandoned the
+  // failed write; retrying it is recommended to preserve one linear logical
+  // history.
+  //
+  // For the lifetime of the open DB after supported file-scoped live
+  // resumption, GetUpdatesSince() reports the reserved sequence range as a gap
+  // and does not return a physically complete but abandoned record.
+  //
   // Returns OK on success, non-OK on failure.
   // Note: consider setting options.sync = true.
   virtual Status Write(const WriteOptions& options, WriteBatch* updates) = 0;
@@ -1267,7 +1316,11 @@ class DB {
   }
   // Returns iterators from a consistent database state across multiple
   // column families. Iterators are heap allocated and need to be deleted
-  // before the db is destroyed
+  // before the db is destroyed. For a secondary DB, the iterators use one
+  // published read view without waiting for a concurrent catch-up and do not
+  // support Iterator::Refresh(). This does not strengthen secondary recovery's
+  // consistency guarantees; WAL replay can stop before all column families
+  // reach the same sequence.
   virtual Status NewIterators(
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families,
@@ -1279,7 +1332,11 @@ class DB {
   // be null or point to the same Snapshot, and all tailing settings must be
   // the same. Other ReadOptions fields may differ between column families.
   // Iterators are heap allocated and need to be deleted before the db is
-  // destroyed.
+  // destroyed. For a secondary DB, the iterators use one published read view
+  // without waiting for a concurrent catch-up and do not support
+  // Iterator::Refresh(). This does not strengthen secondary recovery's
+  // consistency guarantees; WAL replay can stop before all column families
+  // reach the same sequence.
   virtual Status NewIterators(
       const std::vector<ReadOptions>& /*read_options*/,
       const std::vector<ColumnFamilyHandle*>& /*column_families*/,
@@ -2387,11 +2444,20 @@ class DB {
   // [start_seq, end_seq] covers seq_number.
   //
   // Only writes that reached the WAL are returned. Writes made with
-  // WriteOptions::disableWAL, and sequence numbers consumed by
-  // IngestExternalFile(), are absent and leave permanent holes in the
-  // sequence numbers seen here. Set WAL_ttl_seconds and/or WAL_size_limit_MB
-  // large enough to cover how far behind a consumer may fall, or the WAL will
-  // be cleared before the consumer reads it.
+  // WriteOptions::disableWAL, sequence numbers consumed by
+  // IngestExternalFile(), or sequence ranges reserved after a file-scoped WAL
+  // write error can be absent and leave permanent holes in the sequence
+  // numbers seen here. Set WAL_ttl_seconds and/or WAL_size_limit_MB large
+  // enough to cover how far behind a consumer may fall, or the WAL will be
+  // cleared before the consumer reads it.
+  //
+  // After successful live resumption from a supported file-scoped WAL write
+  // error, and while that DB instance remains open, iteration stops with
+  // Status::NotFound before the reserved sequence range. This remains true if
+  // the error-returned record is physically complete: the recovered DB
+  // abandoned that record, so returning it would make a WAL consumer diverge
+  // from the DB. A caller can start a new iterator after the reserved range,
+  // but must treat the intervening sequence numbers as a gap.
   //
   // Returns Status::NotSupported() for TransactionDB with the WritePrepared
   // or WriteUnprepared write policies.
@@ -2771,7 +2837,13 @@ class DB {
     return Status::NotSupported("EndBlockCacheTrace() is not implemented.");
   }
 
-  // Create a default trace replayer.
+  // Create a default trace replayer. `handles` are the column families that
+  // read records (Get, MultiGet, iterator seek) may refer to. The default
+  // column family is always included, so `handles` may be empty for a trace
+  // of the default column family only. A read record on any other column
+  // family fails with Status::Corruption(). Write records do not use
+  // `handles`; they are applied to the column families named in the write
+  // batch.
   virtual Status NewDefaultReplayer(
       const std::vector<ColumnFamilyHandle*>& /*handles*/,
       std::unique_ptr<TraceReader>&& /*reader*/,

@@ -59,6 +59,7 @@
 #include "rocksdb/unique_id.h"
 #include "rocksdb/user_defined_index.h"
 #include "rocksdb/utilities/object_registry.h"
+#include "rocksdb/utilities/table_properties_collectors.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_builder.h"
@@ -76,6 +77,7 @@
 #include "table/plain/plain_table_factory.h"
 #include "table/sst_file_writer_collectors.h"
 #include "table/unique_id_impl.h"
+#include "test_util/simple_external_table_factory.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -442,8 +444,7 @@ class TableConstructor : public Constructor {
     if (largest_seqno_ != 0) {
       // Pretend that it's an external file written by SstFileWriter.
       internal_tbl_prop_coll_factories.emplace_back(
-          new SstFileWriterPropertiesCollectorFactory(2 /* version */,
-                                                      0 /* global_seqno*/));
+          new SstFileWriterPropertiesCollectorFactory(2 /* version */));
     }
 
     std::string column_family_name;
@@ -575,7 +576,8 @@ class MemTableConstructor : public Constructor {
     ImmutableOptions ioptions(options_);
     memtable_ =
         new MemTable(internal_comparator_, ioptions, MutableCFOptions(options_),
-                     wb, kMaxSequenceNumber, 0 /* column_family_id */);
+                     wb, kMaxSequenceNumber, 0 /* column_family_id */,
+                     nullptr /* flush_initiator */);
     memtable_->Ref();
   }
   ~MemTableConstructor() override { delete memtable_->Unref(); }
@@ -588,7 +590,8 @@ class MemTableConstructor : public Constructor {
     ImmutableOptions mem_ioptions(ioptions);
     memtable_ = new MemTable(internal_comparator_, mem_ioptions,
                              MutableCFOptions(options_), write_buffer_manager_,
-                             kMaxSequenceNumber, 0 /* column_family_id */);
+                             kMaxSequenceNumber, 0 /* column_family_id */,
+                             nullptr /* flush_initiator */);
     memtable_->Ref();
     int seq = 1;
     for (const auto& kv : kv_map) {
@@ -1387,7 +1390,7 @@ class FileChecksumTestHelper {
     Slice result;
     uint64_t offset = 0;
     Status s;
-    s = file_reader_->Read(IOOptions(), offset, 2048, &result, scratch.get(),
+    s = file_reader_->Read(offset, 2048, IOOptions(), &result, scratch.get(),
                            nullptr);
     if (!s.ok()) {
       return s;
@@ -1395,7 +1398,7 @@ class FileChecksumTestHelper {
     while (result.size() != 0) {
       file_checksum_generator->Update(scratch.get(), result.size());
       offset += static_cast<uint64_t>(result.size());
-      s = file_reader_->Read(IOOptions(), offset, 2048, &result, scratch.get(),
+      s = file_reader_->Read(offset, 2048, IOOptions(), &result, scratch.get(),
                              nullptr);
       if (!s.ok()) {
         return s;
@@ -1409,7 +1412,7 @@ class FileChecksumTestHelper {
 
  private:
   bool convert_to_internal_key_;
-  uint64_t cur_file_num_;
+  uint64_t cur_file_num_ = 0;
   std::unique_ptr<WritableFileWriter> file_writer_;
   std::unique_ptr<RandomAccessFileReader> file_reader_;
   std::unique_ptr<TableBuilder> table_builder_;
@@ -5565,11 +5568,12 @@ class MemTableTest : public testing::Test {
     ImmutableOptions ioptions(options_);
     wb_ = new WriteBufferManager(options_.db_write_buffer_size);
     memtable_ = new MemTable(cmp, ioptions, MutableCFOptions(options_), wb_,
-                             kMaxSequenceNumber, 0 /* column_family_id */);
+                             kMaxSequenceNumber, 0 /* column_family_id */,
+                             nullptr /* flush_initiator */);
     memtable_->Ref();
   }
 
-  ~MemTableTest() {
+  ~MemTableTest() override {
     delete memtable_->Unref();
     delete wb_;
   }
@@ -6030,14 +6034,7 @@ TEST_F(PrefixTest, PrefixAndWholeKeyTest) {
   // rocksdb still works.
 }
 
-/*
- * Disable TableWithGlobalSeqno since RocksDB does not store global_seqno in
- * the SST file any more. Instead, RocksDB deduces global_seqno from the
- * MANIFEST while reading from an SST. Therefore, it's not possible to test the
- * functionality of global_seqno in a single, isolated unit test without the
- * involvement of Version, VersionSet, etc.
- */
-TEST_P(BlockBasedTableTest, DISABLED_TableWithGlobalSeqno) {
+TEST_P(BlockBasedTableTest, LegacyGlobalSeqnoChecksumRecovery) {
   BlockBasedTableOptions bbto = GetBlockBasedTableOptions();
   test::StringSink* sink = new test::StringSink();
   std::unique_ptr<FSWritableFile> holder(sink);
@@ -6050,8 +6047,7 @@ TEST_P(BlockBasedTableTest, DISABLED_TableWithGlobalSeqno) {
   InternalKeyComparator ikc(options.comparator);
   InternalTblPropCollFactories internal_tbl_prop_coll_factories;
   internal_tbl_prop_coll_factories.emplace_back(
-      new SstFileWriterPropertiesCollectorFactory(2 /* version */,
-                                                  0 /* global_seqno*/));
+      new SstFileWriterPropertiesCollectorFactory(2 /* version */));
   std::string column_family_name;
   const ReadOptions read_options;
   const WriteOptions write_options;
@@ -6075,61 +6071,88 @@ TEST_P(BlockBasedTableTest, DISABLED_TableWithGlobalSeqno) {
   test::RandomRWStringSink ss_rw(sink);
   uint32_t version;
   uint64_t global_seqno;
-  uint64_t global_seqno_offset;
+  uint64_t global_seqno_offset = 0;
 
-  // Helper function to get version, global_seqno, global_seqno_offset
-  std::function<void()> GetVersionAndGlobalSeqno = [&]() {
-    std::unique_ptr<FSRandomAccessFile> source(
-        new test::StringSource(ss_rw.contents(), 73342, true));
-    std::unique_ptr<RandomAccessFileReader> file_reader(
-        new RandomAccessFileReader(std::move(source), ""));
+  // Locate the field without exposing its offset through TableProperties.
+  std::unique_ptr<FSRandomAccessFile> source(
+      new test::StringSource(ss_rw.contents(), 73342, true));
+  std::unique_ptr<RandomAccessFileReader> file_reader(
+      new RandomAccessFileReader(std::move(source), ""));
+  Footer footer;
+  ASSERT_OK(
+      ReadFooterFromFile(IOOptions(), file_reader.get(), *FileSystem::Default(),
+                         nullptr /* prefetch_buffer */, ss_rw.contents().size(),
+                         &footer, kBlockBasedTableMagicNumber));
+  BlockHandle properties_handle;
+  ASSERT_OK(FindMetaBlockInFile(
+      file_reader.get(), ss_rw.contents().size(), kBlockBasedTableMagicNumber,
+      ioptions, read_options, kPropertiesBlockName, &properties_handle));
+  ReadOptions no_checksum_read_options;
+  no_checksum_read_options.verify_checksums = false;
+  BlockContents properties_contents;
+  BlockFetcher block_fetcher(file_reader.get(), nullptr /* prefetch_buffer */,
+                             footer, no_checksum_read_options,
+                             properties_handle, &properties_contents, ioptions,
+                             false /* decompress */, false /*maybe_compressed*/,
+                             BlockType::kProperties, nullptr /*decompressor*/,
+                             PersistentCacheOptions::kEmpty);
+  ASSERT_OK(block_fetcher.ReadBlockContents());
+  Block properties_block(std::move(properties_contents));
+  std::unique_ptr<MetaBlockIter> properties_iter(
+      properties_block.NewMetaIterator());
+  for (properties_iter->SeekToFirst(); properties_iter->Valid();
+       properties_iter->Next()) {
+    if (properties_iter->key() == ExternalSstFilePropertyNames::kGlobalSeqno) {
+      global_seqno_offset =
+          properties_handle.offset() + properties_iter->ValueOffset();
+      break;
+    }
+  }
+  ASSERT_NE(global_seqno_offset, 0);
 
-    std::unique_ptr<TableProperties> props;
-    ASSERT_OK(ReadTableProperties(file_reader.get(), ss_rw.contents().size(),
-                                  kBlockBasedTableMagicNumber, ioptions,
-                                  read_options, &props));
+  // Helper function to get version and global_seqno.
+  std::function<Status(const ReadOptions&)> GetVersionAndGlobalSeqno =
+      [&](const ReadOptions& properties_read_options) {
+        std::unique_ptr<FSRandomAccessFile> properties_source(
+            new test::StringSource(ss_rw.contents(), 73342, true));
+        std::unique_ptr<RandomAccessFileReader> properties_file_reader(
+            new RandomAccessFileReader(std::move(properties_source), ""));
 
-    UserCollectedProperties user_props = props->user_collected_properties;
-    version = DecodeFixed32(
-        user_props[ExternalSstFilePropertyNames::kVersion].c_str());
-    global_seqno = DecodeFixed64(
-        user_props[ExternalSstFilePropertyNames::kGlobalSeqno].c_str());
-    global_seqno_offset = props->external_sst_file_global_seqno_offset;
-  };
+        std::unique_ptr<TableProperties> props;
+        Status s = ReadTableProperties(properties_file_reader.get(),
+                                       ss_rw.contents().size(),
+                                       kBlockBasedTableMagicNumber, ioptions,
+                                       properties_read_options, &props);
+        if (!s.ok()) {
+          return s;
+        }
 
-  // Helper function to update the value of the global seqno in the file
-  std::function<void(uint64_t)> SetGlobalSeqno = [&](uint64_t val) {
-    std::string new_global_seqno;
-    PutFixed64(&new_global_seqno, val);
+        UserCollectedProperties user_props = props->user_collected_properties;
+        version = DecodeFixed32(
+            user_props[ExternalSstFilePropertyNames::kVersion].c_str());
+        global_seqno = DecodeFixed64(
+            user_props[ExternalSstFilePropertyNames::kGlobalSeqno].c_str());
+        return Status::OK();
+      };
 
-    ASSERT_OK(ss_rw.Write(global_seqno_offset, new_global_seqno, IOOptions(),
-                          nullptr));
-  };
-
-  // Helper function to get the contents of the table InternalIterator
+  std::unique_ptr<FSRandomAccessFile> iterator_source(
+      new test::StringSource(ss_rw.contents(), 73342, true));
+  std::unique_ptr<RandomAccessFileReader> iterator_file_reader(
+      new RandomAccessFileReader(std::move(iterator_source), ""));
   std::unique_ptr<TableReader> table_reader;
-  std::function<InternalIterator*()> GetTableInternalIter = [&]() {
-    std::unique_ptr<FSRandomAccessFile> source(
-        new test::StringSource(ss_rw.contents(), 73342, true));
-    std::unique_ptr<RandomAccessFileReader> file_reader(
-        new RandomAccessFileReader(std::move(source), ""));
+  ASSERT_OK(options.table_factory->NewTableReader(
+      TableReaderOptions(ioptions, moptions.prefix_extractor,
+                         moptions.compression_manager.get(), EnvOptions(), ikc,
+                         0 /* block_protection_bytes_per_key */),
+      std::move(iterator_file_reader), ss_rw.contents().size(), &table_reader));
 
-    options.table_factory->NewTableReader(
-        TableReaderOptions(ioptions, moptions.prefix_extractor,
-                           moptions.compression_manager.get(), EnvOptions(),
-                           ikc, 0 /* block_protection_bytes_per_key */),
-        std::move(file_reader), ss_rw.contents().size(), &table_reader);
-
-    return table_reader->NewIterator(
-        read_options, moptions.prefix_extractor.get(), /*arena=*/nullptr,
-        /*skip_filters=*/false, TableReaderCaller::kUncategorized);
-  };
-
-  GetVersionAndGlobalSeqno();
+  ASSERT_OK(GetVersionAndGlobalSeqno(read_options));
   ASSERT_EQ(2u, version);
   ASSERT_EQ(0u, global_seqno);
 
-  InternalIterator* iter = GetTableInternalIter();
+  InternalIterator* iter = table_reader->NewIterator(
+      read_options, moptions.prefix_extractor.get(), /*arena=*/nullptr,
+      /*skip_filters=*/false, TableReaderCaller::kUncategorized);
   char current_c = 'a';
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     ParsedInternalKey pik;
@@ -6144,81 +6167,27 @@ TEST_P(BlockBasedTableTest, DISABLED_TableWithGlobalSeqno) {
   ASSERT_EQ(current_c, 'z' + 1);
   delete iter;
 
-  // Update global sequence number to 10
-  SetGlobalSeqno(10);
-  GetVersionAndGlobalSeqno();
+  std::string new_global_seqno;
+  PutFixed64(&new_global_seqno, 10);
+  ASSERT_OK(
+      ss_rw.Write(global_seqno_offset, new_global_seqno, IOOptions(), nullptr));
+
+  ASSERT_OK(GetVersionAndGlobalSeqno(read_options));
   ASSERT_EQ(2u, version);
   ASSERT_EQ(10u, global_seqno);
 
-  iter = GetTableInternalIter();
-  current_c = 'a';
-  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-    ParsedInternalKey pik;
-    ASSERT_OK(ParseInternalKey(iter->key(), &pik, true /* log_err_key */));
-
-    ASSERT_EQ(pik.type, ValueType::kTypeValue);
-    ASSERT_EQ(pik.sequence, 10);
-    ASSERT_EQ(pik.user_key, iter->value());
-    ASSERT_EQ(pik.user_key.ToString(), std::string(8, current_c));
-    current_c++;
-  }
-  ASSERT_EQ(current_c, 'z' + 1);
-
-  // Verify Seek
-  for (char c = 'a'; c <= 'z'; c++) {
-    std::string k = std::string(8, c);
-    InternalKey ik(k, 10, kValueTypeForSeek);
-    iter->Seek(ik.Encode());
-    ASSERT_TRUE(iter->Valid());
-
-    ParsedInternalKey pik;
-    ASSERT_OK(ParseInternalKey(iter->key(), &pik, true /* log_err_key */));
-
-    ASSERT_EQ(pik.type, ValueType::kTypeValue);
-    ASSERT_EQ(pik.sequence, 10);
-    ASSERT_EQ(pik.user_key.ToString(), k);
-    ASSERT_EQ(iter->value().ToString(), k);
-  }
-  delete iter;
-
-  // Update global sequence number to 3
-  SetGlobalSeqno(3);
-  GetVersionAndGlobalSeqno();
+  const uint64_t checksum_offset =
+      properties_handle.offset() + properties_handle.size() + 1;
+  std::string bad_checksum_byte(
+      1, static_cast<char>(ss_rw.contents()[checksum_offset] ^ 0xff));
+  ASSERT_OK(
+      ss_rw.Write(checksum_offset, bad_checksum_byte, IOOptions(), nullptr));
+  ASSERT_TRUE(GetVersionAndGlobalSeqno(read_options).IsCorruption());
+  ReadOptions skip_checksum_read_options;
+  skip_checksum_read_options.verify_checksums = false;
+  ASSERT_OK(GetVersionAndGlobalSeqno(skip_checksum_read_options));
   ASSERT_EQ(2u, version);
-  ASSERT_EQ(3u, global_seqno);
-
-  iter = GetTableInternalIter();
-  current_c = 'a';
-  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-    ParsedInternalKey pik;
-    ASSERT_OK(ParseInternalKey(iter->key(), &pik, true /* log_err_key */));
-
-    ASSERT_EQ(pik.type, ValueType::kTypeValue);
-    ASSERT_EQ(pik.sequence, 3);
-    ASSERT_EQ(pik.user_key, iter->value());
-    ASSERT_EQ(pik.user_key.ToString(), std::string(8, current_c));
-    current_c++;
-  }
-  ASSERT_EQ(current_c, 'z' + 1);
-
-  // Verify Seek
-  for (char c = 'a'; c <= 'z'; c++) {
-    std::string k = std::string(8, c);
-    // seqno=4 is less than 3 so we still should get our key
-    InternalKey ik(k, 4, kValueTypeForSeek);
-    iter->Seek(ik.Encode());
-    ASSERT_TRUE(iter->Valid());
-
-    ParsedInternalKey pik;
-    ASSERT_OK(ParseInternalKey(iter->key(), &pik, true /* log_err_key */));
-
-    ASSERT_EQ(pik.type, ValueType::kTypeValue);
-    ASSERT_EQ(pik.sequence, 3);
-    ASSERT_EQ(pik.user_key.ToString(), k);
-    ASSERT_EQ(iter->value().ToString(), k);
-  }
-
-  delete iter;
+  ASSERT_EQ(10u, global_seqno);
 }
 
 TEST_P(BlockBasedTableTest, BlockAlignTest) {
@@ -6263,7 +6232,7 @@ TEST_P(BlockBasedTableTest, BlockAlignTest) {
       new test::StringSource(sink->contents(), 73342, false));
   std::unique_ptr<RandomAccessFileReader> file_reader(
       new RandomAccessFileReader(std::move(source), "test"));
-  // Helper function to get version, global_seqno, global_seqno_offset
+  // Verify that data blocks are aligned.
   std::function<void()> VerifyBlockAlignment = [&]() {
     std::unique_ptr<TableProperties> props;
     ASSERT_OK(ReadTableProperties(file_reader.get(), sink->contents().size(),
@@ -6989,10 +6958,10 @@ Status ReplayChecksumHandoffTable(const ChecksumHandoffTable& table,
     }
     Status s;
     if (recorded_append.has_crc32c) {
-      s = file_writer->Append(IOOptions(), Slice(data),
+      s = file_writer->Append(Slice(data), IOOptions(),
                               Crc32cChecksum(recorded_append.crc32c));
     } else {
-      s = file_writer->Append(IOOptions(), Slice(data));
+      s = file_writer->Append(Slice(data), IOOptions());
     }
     if (!s.ok()) {
       return s;
@@ -8013,348 +7982,14 @@ class ExternalTableTest : public DBTestBase {
       : DBTestBase("external_table_test", /*env_do_fsync=*/false) {}
 
  protected:
-  class DummyExternalTableFile {
-   public:
-    explicit DummyExternalTableFile(const std::string& file_path,
-                                    FSWritableFile* file)
-        : file_path_(file_path), file_(file), file_size_(0) {
-      props_.comparator_name = BytewiseComparator()->Name();
-    }
-
-    Status Serialize(
-        const std::vector<std::pair<std::string, std::string>>& kv_vec) {
-      // First append the property block if one exists
-      uint32_t prop_block_size = static_cast<uint32_t>(prop_block_.length());
-      buf_.append(static_cast<char*>(static_cast<void*>(&prop_block_size)),
-                  sizeof(prop_block_size));
-      if (!prop_block_.empty()) {
-        buf_.append(prop_block_);
-      }
-      for (auto& kv : kv_vec) {
-        SerializeOne(kv.first, kv.second);
-        props_.raw_key_size += kv.first.length();
-        props_.raw_value_size += kv.second.length();
-      }
-      props_.num_entries = kv_vec.size();
-      file_size_ = buf_.length();
-      if (file_) {
-        return file_->Append(buf_, IOOptions(), /*dbg=*/nullptr);
-      } else {
-        return WriteStringToFile(Env::Default(), buf_, file_path_);
-      }
-    }
-
-    Status Deserialize(std::map<std::string, std::string>& kv_map) {
-      Status s = ReadFileToString(Env::Default(), file_path_, &buf_);
-      if (!s.ok()) {
-        return s;
-      }
-
-      uint32_t prop_block_size = 0;
-      buf_.copy(static_cast<char*>(static_cast<void*>(&prop_block_size)),
-                sizeof(prop_block_size));
-      buf_.erase(0, sizeof(prop_block_size));
-      prop_block_.assign(buf_.substr(0, prop_block_size));
-      buf_.erase(0, prop_block_size);
-      while (buf_.length() > 0) {
-        std::pair<std::string, std::string> kv;
-        s = DeserializeOne(kv);
-        if (!s.ok()) {
-          break;
-        }
-        size_t key_size = kv.first.length();
-        size_t value_size = kv.second.length();
-        kv_map.emplace(std::move(kv));
-        props_.raw_key_size += key_size;
-        props_.raw_value_size += value_size;
-      }
-      props_.num_entries = kv_map.size();
-      return s;
-    }
-
-    Status PutPropertiesBlock(const Slice& prop_block) {
-      prop_block_.assign(prop_block.data(), prop_block.size());
-      return Status::OK();
-    }
-
-    Status GetPropertiesBlock(std::unique_ptr<char[]>* block, uint64_t* size,
-                              uint64_t* file_offset) {
-      if (!prop_block_.empty()) {
-        *block = std::make_unique<char[]>(prop_block_.length());
-        memcpy(block->get(), prop_block_.data(), prop_block_.length());
-        *size = prop_block_.length();
-        *file_offset = sizeof(uint32_t);
-      } else {
-        *size = 0;
-        return Status::NotSupported();
-      }
-      return Status::OK();
-    }
-
-    TableProperties GetTableProperties() const { return props_; }
-
-    uint64_t FileSize() const { return file_size_; }
-
-   private:
-    struct ItemHeader {
-      uint32_t key_size;
-      uint32_t value_size;
-    };
-
-    void SerializeOne(const Slice& key, const Slice& value) {
-      ItemHeader hdr;
-      hdr.key_size = static_cast<uint32_t>(key.size());
-      hdr.value_size = static_cast<uint32_t>(value.size());
-      buf_.append(static_cast<char*>(static_cast<void*>(&hdr)), sizeof(hdr));
-      buf_.append(key.data(), key.size());
-      buf_.append(value.data(), value.size());
-    }
-
-    Status DeserializeOne(std::pair<std::string, std::string>& kv) {
-      ItemHeader hdr;
-      size_t copied =
-          buf_.copy(static_cast<char*>(static_cast<void*>(&hdr)), sizeof(hdr));
-      if (copied < sizeof(hdr)) {
-        return Status::Corruption();
-      }
-      buf_.erase(0, sizeof(hdr));
-      if (buf_.length() < hdr.key_size + hdr.value_size) {
-        return Status::Corruption();
-      }
-      kv.first.assign(std::string_view(buf_.data(), hdr.key_size));
-      buf_.erase(0, hdr.key_size);
-      kv.second.assign(std::string_view(buf_.data(), hdr.value_size));
-      buf_.erase(0, hdr.value_size);
-      return Status::OK();
-    }
-
-    std::string file_path_;
-    FSWritableFile* file_;
-    std::string buf_;
-    TableProperties props_;
-    uint64_t file_size_;
-    std::string prop_block_;
-  };
-
-  class DummyExternalTableIterator : public ExternalTableIterator {
-   public:
-    explicit DummyExternalTableIterator(
-        const ReadOptions& /*ro*/,
-        const std::map<std::string, std::string>& kv_map)
-        : scan_options_(nullptr),
-          num_opts_(0),
-          scan_idx_(0),
-          kv_map_(kv_map),
-          valid_(false) {
-      TEST_SYNC_POINT_CALLBACK("DummyExternalTableIterator::Constructor",
-                               &status_);
-    }
-
-    bool Valid() const override { return valid_; }
-
-    void SeekToFirst() override {
-      if (scan_options_) {
-        status_ = Status::InvalidArgument();
-      } else {
-        iter_ = kv_map_.begin();
-        valid_ = iter_ != kv_map_.end();
-        status_ = Status::OK();
-      }
-    }
-
-    void SeekToLast() override {
-      if (scan_options_) {
-        status_ = Status::InvalidArgument();
-      } else {
-        if (!kv_map_.empty()) {
-          iter_ = kv_map_.begin();
-          for (uint64_t i = 0; i < kv_map_.size() - 1; ++i) {
-            iter_++;
-          }
-          valid_ = true;
-        } else {
-          valid_ = false;
-        }
-        status_ = Status::OK();
-      }
-    }
-
-    void Seek(const Slice& target) override {
-      if (status_.ok()) {
-        iter_ = kv_map_.find(target.ToString());
-        valid_ = iter_ != kv_map_.end();
-        eof_ = iter_ == kv_map_.end();
-      }
-      if (scan_options_) {
-        if (scan_idx_ >= num_opts_ ||
-            target != scan_options_[scan_idx_].range.start.value().ToString()) {
-          status_ = Status::InvalidArgument();
-        } else {
-          if (valid_ && scan_options_[scan_idx_].range.limit.has_value() &&
-              iter_->first.compare(
-                  scan_options_[scan_idx_].range.limit.value().ToString()) >=
-                  0) {
-            valid_ = false;
-          }
-          scan_idx_++;
-        }
-      }
-    }
-
-    void SeekForPrev(const Slice& /*target*/) override {
-      valid_ = false;
-      status_ = Status::NotSupported();
-    }
-
-    void Next() override {
-      iter_++;
-      valid_ = iter_ != kv_map_.end();
-      eof_ = iter_ == kv_map_.end();
-      if (valid_ && scan_options_ &&
-          scan_options_[scan_idx_ - 1].range.limit.has_value() &&
-          iter_->first.compare(
-              scan_options_[scan_idx_ - 1].range.limit.value().ToString()) >=
-              0) {
-        valid_ = false;
-      }
-      // status_ is still ok. !valid_ indicates end of scan
-    }
-
-    bool NextAndGetResult(IterateResult* result) override {
-      Next();
-      if (valid_) {
-        result->key = key();
-        result->bound_check_result = IterBoundCheck::kInbound;
-        result->value_prepared = true;
-      } else {
-        result->key = Slice();
-        result->bound_check_result =
-            eof_ ? IterBoundCheck::kUnknown : IterBoundCheck::kOutOfBound;
-        result->value_prepared = false;
-      }
-      return valid_;
-    }
-
-    bool PrepareValue() override { return valid_ ? true : false; }
-
-    IterBoundCheck UpperBoundCheckResult() override {
-      return eof_ ? IterBoundCheck::kUnknown : IterBoundCheck::kOutOfBound;
-    }
-
-    void Prev() override {
-      valid_ = false;
-      status_ = Status::NotSupported();
-    }
-
-    Slice key() const override {
-      // If valid_ is false or status_ is non-ok, behavior is indeterminate
-      return Slice(iter_->first);
-    }
-
-    Status status() const override {
-      // status_ gets overwritten by next Seek
-      return status_;
-    }
-
-    Slice value() const override {
-      // If valid_ is false or status_ is non-ok, behavior is indeterminate
-      return Slice(iter_->second);
-    }
-
-    void Prepare(const ScanOptions scan_opts[], size_t num_opts) override {
-      scan_options_ = scan_opts;
-      num_opts_ = num_opts;
-    }
-
-   private:
-    const ScanOptions* scan_options_;
-    size_t num_opts_;
-    size_t scan_idx_;
-    std::map<std::string, std::string> kv_map_;
-    bool valid_ = false;
-    bool eof_ = false;
-    Status status_ = Status::OK();
-    std::map<std::string, std::string>::iterator iter_;
-  };
-
-  class DummyExternalTableReader : public ExternalTableReader {
-   public:
-    explicit DummyExternalTableReader(const std::string& file_path,
-                                      bool support_property_block)
-        : file_(file_path, /*file=*/nullptr),
-          support_property_block_(support_property_block) {
-      Status s = file_.Deserialize(kv_map_);
-      EXPECT_OK(s);
-    }
-
-    ExternalTableIterator* NewIterator(
-        const ReadOptions& read_options,
-        const SliceTransform* /*prefix_extractor*/) override {
-      TEST_SYNC_POINT_CALLBACK("DummyExternalTableReader::NewIterator",
-                               const_cast<ReadOptions*>(&read_options));
-      return new DummyExternalTableIterator(read_options, kv_map_);
-    }
-
-    Status Get(const ReadOptions& read_options, const Slice& key,
-               const SliceTransform* /*prefix_extractor*/,
-               PinnableSlice* value) override {
-      TEST_SYNC_POINT_CALLBACK("DummyExternalTableReader::Get",
-                               const_cast<ReadOptions*>(&read_options));
-      auto iter = kv_map_.find(key.ToString());
-      if (iter != kv_map_.end()) {
-        value->PinSelf(iter->second);
-        return Status::OK();
-      }
-      return Status::NotFound();
-    }
-
-    void MultiGet(const ReadOptions& read_options,
-                  const std::vector<Slice>& keys,
-                  const SliceTransform* prefix_extractor,
-                  std::vector<PinnableSlice>* values,
-                  std::vector<Status>* statuses) override {
-      values->resize(keys.size());
-      statuses->resize(keys.size());
-      for (size_t i = 0; i < keys.size(); ++i) {
-        statuses->at(i) =
-            Get(read_options, keys[i], prefix_extractor, &values->at(i));
-      }
-    }
-
-    Status GetPropertiesBlock(std::unique_ptr<char[]>* block, uint64_t* size,
-                              uint64_t* file_offset) override {
-      Status status;
-      if (support_property_block_) {
-        status = file_.GetPropertiesBlock(block, size, file_offset);
-      } else {
-        status = Status::NotSupported();
-      }
-      TEST_SYNC_POINT_CALLBACK("DummyExternalTableReader::GetPropertiesBlock",
-                               &status);
-      return status;
-    }
-
-    std::shared_ptr<const TableProperties> GetTableProperties() const override {
-      std::shared_ptr<TableProperties> props =
-          std::make_shared<TableProperties>();
-      props->comparator_name.assign(BytewiseComparator()->Name());
-      props->num_entries = 1;
-      props->raw_key_size = 3;
-      props->raw_value_size = 3;
-      return props;
-    }
-
-   private:
-    std::map<std::string, std::string> kv_map_;
-    DummyExternalTableFile file_;
-    bool support_property_block_;
-  };
-
   // A reader that pins values from its internal buffer, exercising the
   // zero-copy path in ExternalTableReaderAdapter::Get().
-  class PinnedDummyExternalTableReader : public DummyExternalTableReader {
+  class PinnedSimpleExternalTableReader
+      : public SimpleExternalTableReader<
+            ExternalTableMode::kOnlyZeroSeqnoAndPuts> {
    public:
-    using DummyExternalTableReader::DummyExternalTableReader;
+    using SimpleExternalTableReader<
+        ExternalTableMode::kOnlyZeroSeqnoAndPuts>::SimpleExternalTableReader;
 
     Status Get(const ReadOptions& /*read_options*/, const Slice& key,
                const SliceTransform* /*prefix_extractor*/,
@@ -8382,111 +8017,11 @@ class ExternalTableTest : public DBTestBase {
     int pin_cleanup_count_ = 0;
   };
 
-  class DummyExternalTableBuilder : public ExternalTableBuilder {
+  class ConfigurableSimpleExternalTableFactory
+      : public SimpleExternalTableFactory {
    public:
-    explicit DummyExternalTableBuilder(const std::string& file_path,
-                                       FSWritableFile* file,
-                                       bool support_property_block)
-        : file_(file_path, file),
-          support_property_block_(support_property_block) {}
-
-    void Add(const Slice& key, const Slice& value) override {
-      if (!kv_vec_.empty()) {
-        ASSERT_LT(BytewiseComparator()->Compare(kv_vec_.back().first, key), 0);
-      }
-      kv_vec_.emplace_back(key.ToString(), value.ToString());
-    }
-
-    Status Finish() override {
-      status_ = file_.Serialize(kv_vec_);
-      return status_;
-    }
-
-    void Abandon() override { kv_vec_.clear(); }
-
-    uint64_t FileSize() const override { return file_.FileSize(); }
-
-    Status PutPropertiesBlock(const Slice& block) override {
-      if (!support_property_block_) {
-        return Status::NotSupported();
-      }
-      return file_.PutPropertiesBlock(block);
-    }
-
-    TableProperties GetTableProperties() const override {
-      return file_.GetTableProperties();
-    }
-
-    Status status() const override { return status_; }
-
-   private:
-    std::vector<std::pair<std::string, std::string>> kv_vec_;
-    DummyExternalTableFile file_;
-    Status status_;
-    bool support_property_block_;
-  };
-
-  class DummyExternalTableFactory : public ExternalTableFactory {
-   public:
-    explicit DummyExternalTableFactory(bool support_property_block,
-                                       bool read_via_options_fs = false)
-        : support_property_block_(support_property_block),
-          read_via_options_fs_(read_via_options_fs) {}
-    const char* Name() const override { return "DummyExternalTableFactory"; }
-
-    Status NewTableReader(
-        const ReadOptions& /*read_options*/, const std::string& file_path,
-        const ExternalTableOptions& topts,
-        std::unique_ptr<ExternalTableReader>* table_reader) const override {
-      // Sanity check some options
-      EXPECT_EQ(topts.file_options.handoff_checksum_type,
-                ChecksumType::kCRC32c);
-      if (read_via_options_fs_) {
-        if (topts.fs == nullptr) {
-          return Status::InvalidArgument("Missing FileSystem");
-        }
-        std::unique_ptr<FSRandomAccessFile> file;
-        IOStatus io_s = topts.fs->NewRandomAccessFile(
-            file_path, topts.file_options, &file, nullptr);
-        if (!io_s.ok()) {
-          return io_s;
-        }
-        char scratch = '\0';
-        Slice result;
-        io_s = file->Read(0, 1, topts.file_options.io_options, &result,
-                          &scratch, nullptr);
-        if (!io_s.ok()) {
-          return io_s;
-        }
-        if (result.size() != 1) {
-          return Status::Corruption("Expected one byte from external table");
-        }
-      }
-      table_reader->reset(
-          new DummyExternalTableReader(file_path, support_property_block_));
-      return Status::OK();
-    }
-
-    ExternalTableBuilder* NewTableBuilder(
-        const ExternalTableBuilderOptions& /*opts*/,
-        const std::string& file_path, FSWritableFile* file) const override {
-      return new DummyExternalTableBuilder(file_path, file,
-                                           support_property_block_);
-    }
-
-   private:
-    bool support_property_block_;
-    bool read_via_options_fs_;
-  };
-
-  class ConfigurableDummyExternalTableFactory
-      : public DummyExternalTableFactory {
-   public:
-    ConfigurableDummyExternalTableFactory()
-        : DummyExternalTableFactory(/*support_property_block=*/false) {}
-
     static const char* kClassName() {
-      return "ConfigurableDummyExternalTableFactory";
+      return "ConfigurableSimpleExternalTableFactory";
     }
 
     static const char* kValidConfig() { return "mode=fast;limit=7"; }
@@ -8516,7 +8051,7 @@ class ExternalTableTest : public DBTestBase {
         config_ = config;
         return Status::OK();
       }
-      return Status::InvalidArgument("Invalid dummy external table config");
+      return Status::InvalidArgument("Invalid simple external table config");
     }
 
     const std::string& config() const { return config_; }
@@ -8529,14 +8064,14 @@ class ExternalTableTest : public DBTestBase {
     std::string config_;
   };
 
-  static void RegisterConfigurableDummyExternalTableFactory() {
+  static void RegisterConfigurableSimpleExternalTableFactory() {
     static FactoryFunc<TableFactory> registration =
         ObjectLibrary::Default()->AddFactory<TableFactory>(
-            ConfigurableDummyExternalTableFactory::kClassName(),
+            ConfigurableSimpleExternalTableFactory::kClassName(),
             [](const std::string& /*uri*/, std::unique_ptr<TableFactory>* guard,
                std::string* /*errmsg*/) {
               std::shared_ptr<ExternalTableFactory> inner =
-                  std::make_shared<ConfigurableDummyExternalTableFactory>();
+                  std::make_shared<ConfigurableSimpleExternalTableFactory>();
               std::unique_ptr<TableFactory> factory =
                   NewExternalTableFactory(std::move(inner));
               guard->reset(factory.release());
@@ -8565,46 +8100,62 @@ class ExternalTableTest : public DBTestBase {
     std::atomic<uint64_t> read_bytes_{0};
   };
 
-  class PinnedDummyExternalTableFactory : public ExternalTableFactory {
+  class PinnedSimpleExternalTableFactory : public ExternalTableFactory {
    public:
     const char* Name() const override {
-      return "PinnedDummyExternalTableFactory";
+      return "PinnedSimpleExternalTableFactory";
     }
 
     Status NewTableReader(
-        const ReadOptions& /*read_options*/, const std::string& file_path,
-        const ExternalTableOptions& /*topts*/,
+        const ReadOptions& read_options, const std::string& /*file_path*/,
+        const ExternalTableOptions& table_options,
+        std::unique_ptr<FSRandomAccessFile>&& file, uint64_t file_size,
         std::unique_ptr<ExternalTableReader>* table_reader) const override {
-      auto* reader =
-          new PinnedDummyExternalTableReader(file_path,
-                                             /*support_property_block=*/true);
+      auto* reader = new PinnedSimpleExternalTableReader(
+          read_options, table_options, std::move(file), file_size);
+      if (!reader->status().ok()) {
+        Status status = reader->status();
+        delete reader;
+        return status;
+      }
       last_reader_ = reader;
       table_reader->reset(reader);
       return Status::OK();
     }
 
     ExternalTableBuilder* NewTableBuilder(
-        const ExternalTableBuilderOptions& /*opts*/,
+        const ExternalTableBuilderOptions& options,
         const std::string& file_path, FSWritableFile* file) const override {
-      return new DummyExternalTableBuilder(file_path, file,
-                                           /*support_property_block=*/true);
+      return simple_factory_.NewTableBuilder(options, file_path, file);
     }
 
-    PinnedDummyExternalTableReader* last_reader() const { return last_reader_; }
+    PinnedSimpleExternalTableReader* last_reader() const {
+      return last_reader_;
+    }
 
    private:
-    mutable PinnedDummyExternalTableReader* last_reader_ = nullptr;
+    SimpleExternalTableFactory simple_factory_;
+    mutable PinnedSimpleExternalTableReader* last_reader_ = nullptr;
   };
 };
 
+class ExternalTablePointReadTest : public ExternalTableTest,
+                                   public testing::WithParamInterface<bool> {
+ public:
+  ExternalTablePointReadTest() : use_coroutine_(GetParam()) {}
+
+ protected:
+  const bool use_coroutine_;
+};
+
 TEST_F(ExternalTableTest, BootstrapConfig) {
-  RegisterConfigurableDummyExternalTableFactory();
+  RegisterConfigurableSimpleExternalTableFactory();
 
   ConfigOptions config_options;
   std::shared_ptr<TableFactory> table_factory;
   ASSERT_OK(TableFactory::CreateFromString(
       config_options,
-      ConfigurableDummyExternalTableFactory::ValidFactoryConfig(),
+      ConfigurableSimpleExternalTableFactory::ValidFactoryConfig(),
       &table_factory));
   ASSERT_NE(table_factory, nullptr);
 
@@ -8612,19 +8163,31 @@ TEST_F(ExternalTableTest, BootstrapConfig) {
   ASSERT_OK(table_factory->GetOption(config_options, "external_table_config",
                                      &serialized_config));
   ASSERT_EQ(serialized_config,
-            ConfigurableDummyExternalTableFactory::SerializedValidConfig());
+            ConfigurableSimpleExternalTableFactory::SerializedValidConfig());
 
   std::shared_ptr<TableFactory> invalid_factory;
   const std::string invalid_config =
       "{id=" +
-      std::string(ConfigurableDummyExternalTableFactory::kClassName()) +
+      std::string(ConfigurableSimpleExternalTableFactory::kClassName()) +
       ";external_table_config={mode=invalid}}";
   ASSERT_NOK(TableFactory::CreateFromString(config_options, invalid_config,
                                             &invalid_factory));
 }
 
+TEST_F(ExternalTableTest, GetWrappedExternalTableFactory) {
+  std::shared_ptr<ExternalTableFactory> inner =
+      std::make_shared<SimpleExternalTableFactory>();
+  std::unique_ptr<TableFactory> table_factory = NewExternalTableFactory(inner);
+  std::unique_ptr<TableFactory> block_based_factory(
+      NewBlockBasedTableFactory());
+
+  ASSERT_EQ(GetWrappedExternalTableFactory(table_factory.get()), inner);
+  ASSERT_EQ(GetWrappedExternalTableFactory(block_based_factory.get()), nullptr);
+  ASSERT_EQ(GetWrappedExternalTableFactory(nullptr), nullptr);
+}
+
 TEST_F(ExternalTableTest, BootstrapConfigOptionsFileRoundTrip) {
-  RegisterConfigurableDummyExternalTableFactory();
+  RegisterConfigurableSimpleExternalTableFactory();
 
   DBOptions db_options;
   db_options.env = env_;
@@ -8632,7 +8195,7 @@ TEST_F(ExternalTableTest, BootstrapConfigOptionsFileRoundTrip) {
   std::shared_ptr<TableFactory> table_factory;
   ASSERT_OK(TableFactory::CreateFromString(
       config_options,
-      ConfigurableDummyExternalTableFactory::ValidFactoryConfig(),
+      ConfigurableSimpleExternalTableFactory::ValidFactoryConfig(),
       &table_factory));
 
   ColumnFamilyOptions cf_options;
@@ -8659,19 +8222,19 @@ TEST_F(ExternalTableTest, BootstrapConfigOptionsFileRoundTrip) {
   ASSERT_OK(parser.cf_opts()->front().table_factory->GetOption(
       config_options, "external_table_config", &loaded_config));
   ASSERT_EQ(loaded_config,
-            ConfigurableDummyExternalTableFactory::SerializedValidConfig());
+            ConfigurableSimpleExternalTableFactory::SerializedValidConfig());
 
   ASSERT_OK(env_->DeleteFile(options_file));
 }
 
 TEST_F(ExternalTableTest, BootstrapConfigIsImmutable) {
-  RegisterConfigurableDummyExternalTableFactory();
+  RegisterConfigurableSimpleExternalTableFactory();
 
   Options options = GetDefaultOptions();
   ConfigOptions config_options(options);
   ASSERT_OK(TableFactory::CreateFromString(
       config_options,
-      ConfigurableDummyExternalTableFactory::ValidFactoryConfig(),
+      ConfigurableSimpleExternalTableFactory::ValidFactoryConfig(),
       &options.table_factory));
   options.create_if_missing = true;
 
@@ -8689,7 +8252,7 @@ TEST_F(ExternalTableTest, BootstrapConfigIsImmutable) {
   ASSERT_OK(current_options.table_factory->GetOption(
       config_options, "external_table_config", &current_config));
   ASSERT_EQ(current_config,
-            ConfigurableDummyExternalTableFactory::SerializedValidConfig());
+            ConfigurableSimpleExternalTableFactory::SerializedValidConfig());
 
   ASSERT_OK(db->Close());
   db.reset();
@@ -8700,16 +8263,16 @@ TEST_F(ExternalTableTest, BootstrapConfigCanChangeBetweenDBOpens) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;
 
-  std::shared_ptr<ConfigurableDummyExternalTableFactory> first_factory =
-      std::make_shared<ConfigurableDummyExternalTableFactory>();
+  std::shared_ptr<ConfigurableSimpleExternalTableFactory> first_factory =
+      std::make_shared<ConfigurableSimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(first_factory);
   ConfigOptions config_options(options);
   ASSERT_OK(options.table_factory->ConfigureFromString(
       config_options,
       "external_table_config=" +
-          ConfigurableDummyExternalTableFactory::SerializedValidConfig()));
+          ConfigurableSimpleExternalTableFactory::SerializedValidConfig()));
   ASSERT_EQ(first_factory->config(),
-            ConfigurableDummyExternalTableFactory::kValidConfig());
+            ConfigurableSimpleExternalTableFactory::kValidConfig());
 
   const std::string dbname =
       test::PerThreadDBPath("external_table_config_reopen");
@@ -8717,31 +8280,31 @@ TEST_F(ExternalTableTest, BootstrapConfigCanChangeBetweenDBOpens) {
   std::unique_ptr<DB> db;
   ASSERT_OK(DB::Open(options, dbname, &db));
   ASSERT_EQ(first_factory->config(),
-            ConfigurableDummyExternalTableFactory::kValidConfig());
+            ConfigurableSimpleExternalTableFactory::kValidConfig());
   ASSERT_OK(db->Close());
   db.reset();
 
-  std::shared_ptr<ConfigurableDummyExternalTableFactory> second_factory =
-      std::make_shared<ConfigurableDummyExternalTableFactory>();
+  std::shared_ptr<ConfigurableSimpleExternalTableFactory> second_factory =
+      std::make_shared<ConfigurableSimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(second_factory);
   ConfigOptions reopen_config_options(options);
   ASSERT_OK(options.table_factory->ConfigureFromString(
       reopen_config_options, "external_table_config=" +
-                                 ConfigurableDummyExternalTableFactory::
+                                 ConfigurableSimpleExternalTableFactory::
                                      SerializedAlternateValidConfig()));
   ASSERT_EQ(second_factory->config(),
-            ConfigurableDummyExternalTableFactory::kAlternateValidConfig());
+            ConfigurableSimpleExternalTableFactory::kAlternateValidConfig());
 
   ASSERT_OK(DB::Open(options, dbname, &db));
   ASSERT_EQ(second_factory->config(),
-            ConfigurableDummyExternalTableFactory::kAlternateValidConfig());
+            ConfigurableSimpleExternalTableFactory::kAlternateValidConfig());
 
   std::string reopened_config;
   ASSERT_OK(db->GetOptions().table_factory->GetOption(
       reopen_config_options, "external_table_config", &reopened_config));
   ASSERT_EQ(
       reopened_config,
-      ConfigurableDummyExternalTableFactory::SerializedAlternateValidConfig());
+      ConfigurableSimpleExternalTableFactory::SerializedAlternateValidConfig());
 
   ASSERT_OK(db->Close());
   db.reset();
@@ -8750,30 +8313,38 @@ TEST_F(ExternalTableTest, BootstrapConfigCanChangeBetweenDBOpens) {
 
 TEST_F(ExternalTableTest, BasicTest) {
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/false);
+      std::make_shared<SimpleExternalTableFactory>();
 
   std::string file_path = test::PerThreadDBPath("external_table");
+  const auto& fs = env_->GetFileSystem();
+  const FileOptions file_options;
+  std::unique_ptr<FSWritableFile> writable_file;
+  ASSERT_OK(
+      fs->NewWritableFile(file_path, file_options, &writable_file, nullptr));
   {
     std::unique_ptr<ExternalTableBuilder> builder;
     builder.reset(factory->NewTableBuilder(
         ExternalTableBuilderOptions(ReadOptions(), WriteOptions(),
                                     std::shared_ptr<const SliceTransform>(),
                                     BytewiseComparator(), "default",
-                                    TableFileCreationReason::kMisc,
-                                    /*fs=*/nullptr),
-        file_path, /*file=*/nullptr));
+                                    TableFileCreationReason::kMisc, fs),
+        file_path, writable_file.get()));
     builder->Add("foo", "bar");
     ASSERT_OK(builder->Finish());
   }
+  ASSERT_OK(writable_file->Close(IOOptions(), nullptr));
 
   std::unique_ptr<ExternalTableReader> reader;
+  std::unique_ptr<FSRandomAccessFile> file;
+  ASSERT_OK(fs->NewRandomAccessFile(file_path, file_options, &file, nullptr));
+  uint64_t file_size = 0;
+  ASSERT_OK(fs->GetFileSize(file_path, IOOptions(), &file_size, nullptr));
   std::shared_ptr<SliceTransform> prefix_extractor;
   ASSERT_OK(factory->NewTableReader(
       {}, file_path,
-      ExternalTableOptions(prefix_extractor, /*comparator=*/nullptr,
-                           /*fs=*/nullptr, FileOptions()),
-      &reader));
+      ExternalTableOptions(prefix_extractor, BytewiseComparator(), fs,
+                           file_options),
+      std::move(file), file_size, &reader));
 
   ReadOptions ro;
   std::unique_ptr<ExternalTableIterator> iter(reader->NewIterator(ro, nullptr));
@@ -8807,8 +8378,8 @@ TEST_F(ExternalTableTest, BasicModeGlobalSeqnoAcrossLevels) {
   Options options = GetDefaultOptions();
   options.disable_auto_compactions = true;
   options.table_factory =
-      NewExternalTableFactory(std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/true));
+      NewExternalTableFactory(std::make_shared<SimpleExternalTableFactory>());
+  ASSERT_FALSE(options.table_factory->IsDeleteRangeSupported());
   Reopen(options);
 
   const std::string old_file = dbname_ + "/external_old.immutable";
@@ -8820,7 +8391,6 @@ TEST_F(ExternalTableTest, BasicModeGlobalSeqnoAcrossLevels) {
 
   IngestExternalFileOptions ingest_options;
   ingest_options.allow_global_seqno = true;
-  ingest_options.write_global_seqno = false;
   ASSERT_OK(db_->IngestExternalFile({old_file}, ingest_options));
   ASSERT_EQ(NumTableFilesAtLevel(6), 1);
 
@@ -8911,6 +8481,44 @@ TEST_F(ExternalTableTest, BasicModeGlobalSeqnoAcrossLevels) {
   ASSERT_EQ(actual, snapshot_expected);
 
   iterator.reset();
+  const std::string range_file = dbname_ + "/external_range.immutable";
+  ASSERT_OK(writer.Open(range_file));
+  ASSERT_OK(writer.DeleteRange("a", "b"));
+  ASSERT_OK(writer.Finish());
+
+  Options unsupported_options = options;
+  unsupported_options.table_factory = NewExternalTableFactory(
+      std::make_shared<PinnedSimpleExternalTableFactory>());
+  SstFileReader unsupported_reader(unsupported_options);
+  ASSERT_TRUE(unsupported_reader.Open(range_file).IsCorruption());
+
+  ASSERT_OK(db_->IngestExternalFile({range_file}, ingest_options));
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+  ASSERT_EQ(Get("b"), "new-b");
+  ASSERT_EQ(Get("c"), "old-c");
+  ASSERT_OK(db_->Get(snapshot_read_options, "a", &value));
+  ASSERT_EQ(value, "old-a");
+
+  db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), keys.size(),
+                keys.data(), values.data(), statuses.data());
+  ASSERT_TRUE(statuses[0].IsNotFound());
+  ASSERT_OK(statuses[1]);
+  ASSERT_OK(statuses[2]);
+  ASSERT_EQ(values[1], "new-b");
+  ASSERT_EQ(values[2], "old-c");
+
+  actual.clear();
+  iterator.reset(db_->NewIterator(ReadOptions()));
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    actual.emplace_back(iterator->key().ToString(),
+                        iterator->value().ToString());
+  }
+  ASSERT_OK(iterator->status());
+  const std::vector<std::pair<std::string, std::string>> range_expected = {
+      {"b", "new-b"}, {"c", "old-c"}};
+  ASSERT_EQ(actual, range_expected);
+
+  iterator.reset();
   Status compaction_status =
       db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
   ASSERT_TRUE(compaction_status.IsNotSupported())
@@ -8918,9 +8526,339 @@ TEST_F(ExternalTableTest, BasicModeGlobalSeqnoAcrossLevels) {
   db_->ReleaseSnapshot(snapshot);
   Close();
   Reopen(options);
-  ASSERT_EQ(Get("a"), "new-a");
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
   ASSERT_EQ(Get("b"), "new-b");
   ASSERT_EQ(Get("c"), "old-c");
+}
+
+TEST_P(ExternalTablePointReadTest, FullModeLiveWritesAndCompaction) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+
+  Options options = GetDefaultOptions();
+  options.disable_auto_compactions = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  options.table_factory = NewExternalTableFactory(
+      std::make_shared<SimpleFullExternalTableFactory>());
+  Reopen(options);
+
+  ASSERT_OK(Put("deleted", "old"));
+  ASSERT_OK(Put("merged", "base"));
+  ASSERT_OK(Put("range-deleted-a", "old-a"));
+  ASSERT_OK(Put("range-deleted-b", "old-b"));
+  ASSERT_OK(Put("stable", "v1"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(2), 1);
+
+  {
+    ManagedSnapshot snapshot(db_.get());
+
+    ASSERT_OK(Merge("merged", "m1"));
+    ASSERT_OK(Delete("deleted"));
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               "range-deleted-a", "range-deleted-c"));
+    ASSERT_OK(Put("stable", "v2"));
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(1);
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+    ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+    ASSERT_EQ(NumTableFilesAtLevel(2), 1);
+
+    ASSERT_OK(Merge("merged", "m2"));
+    ASSERT_OK(Put("live", "memtable"));
+
+    ASSERT_EQ(
+        Get("merged", static_cast<const Snapshot*>(nullptr), use_coroutine_),
+        "base,m1,m2");
+    ASSERT_EQ(
+        Get("deleted", static_cast<const Snapshot*>(nullptr), use_coroutine_),
+        "NOT_FOUND");
+    ASSERT_EQ(
+        Get("stable", static_cast<const Snapshot*>(nullptr), use_coroutine_),
+        "v2");
+    ASSERT_EQ(Get("range-deleted-a", static_cast<const Snapshot*>(nullptr),
+                  use_coroutine_),
+              "NOT_FOUND");
+    ASSERT_EQ(Get("range-deleted-b", static_cast<const Snapshot*>(nullptr),
+                  use_coroutine_),
+              "NOT_FOUND");
+
+    ASSERT_EQ(Get("merged", snapshot.snapshot(), use_coroutine_), "base");
+    ASSERT_EQ(Get("deleted", snapshot.snapshot(), use_coroutine_), "old");
+    ASSERT_EQ(Get("range-deleted-a", snapshot.snapshot(), use_coroutine_),
+              "old-a");
+    ASSERT_EQ(Get("range-deleted-b", snapshot.snapshot(), use_coroutine_),
+              "old-b");
+    ASSERT_EQ(Get("stable", snapshot.snapshot(), use_coroutine_), "v1");
+
+    ASSERT_OK(Flush());
+    ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+    ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+    ASSERT_EQ(NumTableFilesAtLevel(2), 1);
+
+    MoveFilesToLevel(2);
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+    ASSERT_EQ(NumTableFilesAtLevel(1), 0);
+    ASSERT_EQ(NumTableFilesAtLevel(2), 1);
+
+    const std::vector<std::string> expected_values = {
+        "NOT_FOUND", "memtable", "base,m1,m2", "NOT_FOUND", "NOT_FOUND", "v2"};
+    ASSERT_EQ(MultiGet({"deleted", "live", "merged", "range-deleted-a",
+                        "range-deleted-b", "stable"},
+                       /*snapshot=*/nullptr, /*async=*/false,
+                       /*optimize_multiget_for_io=*/true, use_coroutine_),
+              expected_values);
+
+    std::vector<std::pair<std::string, std::string>> actual;
+    std::unique_ptr<Iterator> iterator(db_->NewIterator(ReadOptions()));
+    for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+      actual.emplace_back(iterator->key().ToString(),
+                          iterator->value().ToString());
+    }
+    ASSERT_OK(iterator->status());
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {"live", "memtable"}, {"merged", "base,m1,m2"}, {"stable", "v2"}};
+    ASSERT_EQ(actual, expected);
+
+    ASSERT_EQ(Get("merged", snapshot.snapshot(), use_coroutine_), "base");
+    ASSERT_EQ(Get("deleted", snapshot.snapshot(), use_coroutine_), "old");
+    ASSERT_EQ(Get("range-deleted-a", snapshot.snapshot(), use_coroutine_),
+              "old-a");
+    ASSERT_EQ(Get("range-deleted-b", snapshot.snapshot(), use_coroutine_),
+              "old-b");
+    ASSERT_EQ(Get("stable", snapshot.snapshot(), use_coroutine_), "v1");
+  }
+
+  Close();
+  Reopen(options);
+  ASSERT_EQ(
+      Get("merged", static_cast<const Snapshot*>(nullptr), use_coroutine_),
+      "base,m1,m2");
+  ASSERT_EQ(
+      Get("deleted", static_cast<const Snapshot*>(nullptr), use_coroutine_),
+      "NOT_FOUND");
+  ASSERT_EQ(Get("live", static_cast<const Snapshot*>(nullptr), use_coroutine_),
+            "memtable");
+  ASSERT_EQ(Get("range-deleted-a", static_cast<const Snapshot*>(nullptr),
+                use_coroutine_),
+            "NOT_FOUND");
+  ASSERT_EQ(Get("range-deleted-b", static_cast<const Snapshot*>(nullptr),
+                use_coroutine_),
+            "NOT_FOUND");
+  ASSERT_EQ(
+      Get("stable", static_cast<const Snapshot*>(nullptr), use_coroutine_),
+      "v2");
+}
+
+TEST_F(ExternalTableTest, FullModeDBMultiScanWithGlobalSeqno) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+
+  Options options = GetDefaultOptions();
+  options.disable_auto_compactions = true;
+  options.table_factory = NewExternalTableFactory(
+      std::make_shared<SimpleFullExternalTableFactory>());
+  Reopen(options);
+
+  ASSERT_OK(Put("c", "old-c"));
+  ASSERT_OK(Flush());
+
+  const std::string file_path = dbname_ + "/multiscan.sst";
+  SstFileWriter writer(EnvOptions(options), options);
+  ASSERT_OK(writer.Open(file_path));
+  for (const std::string key : {"a", "b", "c", "d", "e"}) {
+    ASSERT_OK(writer.Put(key, "new-" + key));
+  }
+  ASSERT_OK(writer.Finish());
+  ASSERT_OK(db_->IngestExternalFile({file_path}, IngestExternalFileOptions()));
+  ASSERT_EQ(Get("c"), "new-c");
+
+  const auto scan = [&](const MultiScanArgs& scan_options) {
+    std::vector<std::pair<std::string, std::string>> entries;
+    std::unique_ptr<MultiScan> iter = db_->NewMultiScan(
+        ReadOptions(), db_->DefaultColumnFamily(), scan_options);
+    for (auto range : *iter) {
+      for (auto entry : range) {
+        entries.emplace_back(entry.first.ToString(), entry.second.ToString());
+      }
+    }
+    return entries;
+  };
+
+  MultiScanArgs one_range(BytewiseComparator());
+  one_range.insert("b", "d");
+  const std::vector<std::pair<std::string, std::string>> one_range_expected = {
+      {"b", "new-b"}, {"c", "new-c"}};
+  ASSERT_EQ(scan(one_range), one_range_expected);
+
+  MultiScanArgs multiple_ranges(BytewiseComparator());
+  multiple_ranges.insert("a", "c");
+  multiple_ranges.insert("d", "f");
+  const std::vector<std::pair<std::string, std::string>>
+      multiple_ranges_expected = {
+          {"a", "new-a"}, {"b", "new-b"}, {"d", "new-d"}, {"e", "new-e"}};
+  ASSERT_EQ(scan(multiple_ranges), multiple_ranges_expected);
+}
+
+TEST_F(ExternalTableTest, FullModePropagatesCollectorCompactionMark) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+
+  Options options = GetDefaultOptions();
+  options.disable_auto_compactions = true;
+  options.table_properties_collector_factories.emplace_back(
+      NewCompactOnDeletionCollectorFactory(
+          /*sliding_window_size=*/0, /*deletion_trigger=*/0,
+          /*deletion_ratio=*/1.0));
+  options.table_factory = NewExternalTableFactory(
+      std::make_shared<SimpleFullExternalTableFactory>());
+  Reopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(Delete("key"));
+  ASSERT_OK(Flush());
+
+  std::vector<std::vector<FileMetaData>> metadata;
+  dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &metadata);
+  ASSERT_EQ(metadata[0].size(), 1);
+  ASSERT_TRUE(metadata[0][0].marked_for_compaction);
+}
+
+TEST_F(ExternalTableTest, FullModePreservesUniqueIdAcrossReopen) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+
+  Options options = GetDefaultOptions();
+  options.table_factory = NewExternalTableFactory(
+      std::make_shared<SimpleFullExternalTableFactory>());
+  Reopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  TablePropertiesCollection properties;
+  ASSERT_OK(dbfull()->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1);
+  std::string unique_id;
+  ASSERT_OK(GetExtendedUniqueIdFromTableProperties(*properties.begin()->second,
+                                                   &unique_id));
+
+  Close();
+  Reopen(options);
+  properties.clear();
+  ASSERT_OK(dbfull()->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1);
+  std::string reopened_unique_id;
+  ASSERT_OK(GetExtendedUniqueIdFromTableProperties(*properties.begin()->second,
+                                                   &reopened_unique_id));
+  ASSERT_EQ(reopened_unique_id, unique_id);
+}
+
+TEST_F(ExternalTableTest, FullModeVerifyChecksum) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+
+  Options options = GetDefaultOptions();
+  options.compression = kNoCompression;
+  options.table_factory = NewExternalTableFactory(
+      std::make_shared<SimpleFullExternalTableFactory>());
+  Reopen(options);
+
+  const std::string file_path = dbname_ + "/corrupt_ingest.sst";
+  SstFileWriter writer(EnvOptions(options), options);
+  ASSERT_OK(writer.Open(file_path));
+  ASSERT_OK(writer.Put("key", std::string(1024, 'v')));
+  ASSERT_OK(writer.Finish());
+  ASSERT_OK(test::CorruptFile(env_, file_path, /*offset=*/16,
+                              /*bytes_to_corrupt=*/3));
+
+  {
+    SstFileReader reader(options);
+    ASSERT_OK(reader.Open(file_path));
+    ASSERT_TRUE(reader.VerifyChecksum().IsCorruption());
+  }
+
+  const std::string range_file_path = dbname_ + "/corrupt_range_ingest.sst";
+  SstFileWriter range_writer(EnvOptions(options), options);
+  ASSERT_OK(range_writer.Open(range_file_path));
+  ASSERT_OK(range_writer.Put("key", std::string(1024, 'v')));
+  ASSERT_OK(range_writer.DeleteRange("a", "z"));
+  ASSERT_OK(range_writer.Finish());
+  ASSERT_OK(test::CorruptFile(env_, range_file_path, /*offset=*/16,
+                              /*bytes_to_corrupt=*/3));
+  SstFileReader range_reader(options);
+  ASSERT_TRUE(range_reader.Open(range_file_path).IsCorruption());
+
+  const std::string missing_range_file_path =
+      dbname_ + "/missing_range_ingest.sst";
+  SstFileWriter missing_range_writer(EnvOptions(options), options);
+  ASSERT_OK(missing_range_writer.Open(missing_range_file_path));
+  ASSERT_OK(missing_range_writer.Put("key", "value"));
+  ASSERT_OK(missing_range_writer.DeleteRange("a", "z"));
+  ASSERT_OK(missing_range_writer.Finish());
+
+  std::string missing_range_contents;
+  ASSERT_OK(
+      ReadFileToString(env_, missing_range_file_path, &missing_range_contents));
+  constexpr size_t kSimpleExternalTableFooterSize =
+      3 * sizeof(uint64_t) + sizeof(uint32_t);
+  ASSERT_GT(missing_range_contents.size(), kSimpleExternalTableFooterSize);
+  const size_t footer_offset =
+      missing_range_contents.size() - kSimpleExternalTableFooterSize;
+  const uint64_t range_deletion_size =
+      DecodeFixed64(missing_range_contents.data() + footer_offset);
+  const uint64_t properties_size = DecodeFixed64(
+      missing_range_contents.data() + footer_offset + sizeof(uint64_t));
+  ASSERT_GT(range_deletion_size, 0);
+  ASSERT_LE(properties_size, footer_offset);
+  ASSERT_LE(range_deletion_size, footer_offset - properties_size);
+  missing_range_contents.erase(
+      footer_offset - properties_size - range_deletion_size,
+      range_deletion_size);
+  const size_t new_footer_offset =
+      missing_range_contents.size() - kSimpleExternalTableFooterSize;
+  EncodeFixed64(&missing_range_contents[new_footer_offset], 0);
+  const size_t checksummed_size =
+      missing_range_contents.size() - sizeof(uint32_t);
+  EncodeFixed32(&missing_range_contents[checksummed_size],
+                crc32c::Value(missing_range_contents.data(), checksummed_size));
+  ASSERT_OK(
+      WriteStringToFile(env_, missing_range_contents, missing_range_file_path));
+
+  SstFileReader missing_range_reader(options);
+  Status missing_range_status =
+      missing_range_reader.Open(missing_range_file_path);
+  ASSERT_TRUE(missing_range_status.IsCorruption())
+      << missing_range_status.ToString();
+
+  IngestExternalFileOptions ingest_options;
+  ingest_options.verify_checksums_before_ingest = true;
+  ASSERT_TRUE(
+      db_->IngestExternalFile({file_path}, ingest_options).IsCorruption());
+
+  ASSERT_OK(Put("db-key", std::string(1024, 'v')));
+  ASSERT_OK(Flush());
+  std::vector<LiveFileMetaData> metadata;
+  db_->GetLiveFilesMetaData(&metadata);
+  ASSERT_EQ(metadata.size(), 1);
+  ASSERT_OK(test::CorruptFile(
+      env_, metadata.front().directory + "/" + metadata.front().name,
+      /*offset=*/0, /*bytes_to_corrupt=*/3));
+  ASSERT_TRUE(db_->VerifyChecksum().IsCorruption());
 }
 
 TEST_F(ExternalTableTest, SstReaderTest) {
@@ -8934,8 +8872,7 @@ TEST_F(ExternalTableTest, SstReaderTest) {
   dbname += "_db";
 
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/false);
+      std::make_shared<SimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
 
   std::unique_ptr<SstFileWriter> writer;
@@ -9002,8 +8939,7 @@ TEST_F(ExternalTableTest, PropertiesBlockErrorPropagates) {
   Options options = GetDefaultOptions();
   std::string file_path = test::PerThreadDBPath("external_table_error");
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/true);
+      std::make_shared<SimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
 
   SstFileWriter writer(EnvOptions(), options);
@@ -9012,7 +8948,7 @@ TEST_F(ExternalTableTest, PropertiesBlockErrorPropagates) {
   ASSERT_OK(writer.Finish());
 
   SyncPoint::GetInstance()->SetCallBack(
-      "DummyExternalTableReader::GetPropertiesBlock", [](void* arg) {
+      "SimpleExternalTableReader::GetPropertiesBlock", [](void* arg) {
         *static_cast<Status*>(arg) = Status::IOError("injected error");
       });
   SyncPoint::GetInstance()->EnableProcessing();
@@ -9040,8 +8976,7 @@ TEST_F(ExternalTableTest, ReaderFileReadsUpdateStatistics) {
   std::string ingest_file = dbname + "test.immutabledb";
 
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/true, /*read_via_options_fs=*/true);
+      std::make_shared<SimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
 
   std::unique_ptr<SstFileWriter> writer;
@@ -9060,8 +8995,24 @@ TEST_F(ExternalTableTest, ReaderFileReadsUpdateStatistics) {
   const auto listener_read_count_before = listener->read_count();
   const auto listener_read_bytes_before = listener->read_bytes();
 
+  SyncPoint::GetInstance()->SetCallBack(
+      "SimpleExternalTableFactory::NewTableReader:File", [&](void* arg) {
+        auto* file = static_cast<FSRandomAccessFile*>(arg);
+        ASSERT_NE(file, nullptr);
+        char scratch = '\0';
+        Slice result;
+        ASSERT_OK(file->Read(0, 1, IOOptions(), &result, &scratch,
+                             /*dbg=*/nullptr));
+        ASSERT_EQ(result.size(), 1);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
   std::unique_ptr<SstFileReader> reader(new SstFileReader(options));
-  ASSERT_OK(reader->Open(ingest_file));
+  Status status = reader->Open(ingest_file);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(status);
 
   EXPECT_GT(options.statistics->getTickerCount(NON_LAST_LEVEL_READ_COUNT),
             read_count_before);
@@ -9074,13 +9025,13 @@ TEST_F(ExternalTableTest, ReaderFileReadsUpdateStatistics) {
   EXPECT_GT(listener->read_bytes(), listener_read_bytes_before);
 }
 
-TEST_F(ExternalTableTest, PinnedGetTest) {
+TEST_P(ExternalTablePointReadTest, PinnedGetTest) {
   if (encrypted_env_) {
     ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
     return;
   }
   Options options = GetDefaultOptions();
-  auto factory = std::make_shared<PinnedDummyExternalTableFactory>();
+  auto factory = std::make_shared<PinnedSimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
   Reopen(options);
 
@@ -9110,14 +9061,12 @@ TEST_F(ExternalTableTest, PinnedGetTest) {
   SyncPoint::GetInstance()->EnableProcessing();
 
   PinnableSlice pinnable;
-  ASSERT_OK(
-      db_->Get(ReadOptions(), db_->DefaultColumnFamily(), "key1", &pinnable));
+  ASSERT_OK(Get("key1", &pinnable, use_coroutine_));
   ASSERT_EQ(pinnable.ToString(), "pinned_val1");
   ASSERT_TRUE(pinnable.IsPinned());
   pinnable.Reset();
 
-  ASSERT_OK(
-      db_->Get(ReadOptions(), db_->DefaultColumnFamily(), "key2", &pinnable));
+  ASSERT_OK(Get("key2", &pinnable, use_coroutine_));
   ASSERT_EQ(pinnable.ToString(), "pinned_val2");
   ASSERT_TRUE(pinnable.IsPinned());
   pinnable.Reset();
@@ -9129,39 +9078,43 @@ TEST_F(ExternalTableTest, PinnedGetTest) {
   ASSERT_EQ(factory->last_reader()->pin_cleanup_count(), 2);
 
   // Verify NotFound still works (does not invoke SaveValue)
-  Status s =
-      db_->Get(ReadOptions(), db_->DefaultColumnFamily(), "missing", &pinnable);
+  Status s = Get("missing", &pinnable, use_coroutine_);
   ASSERT_TRUE(s.IsNotFound());
   ASSERT_EQ(simple_save_value_count.load(), 2);
 
   // Test MultiGet with PinnableSlice to exercise the batched pin path
-  const size_t num_keys = 3;
-  std::array<Slice, num_keys> mg_keys = {Slice("key1"), Slice("missing"),
-                                         Slice("key2")};
-  std::array<PinnableSlice, num_keys> mg_values;
-  std::array<Status, num_keys> mg_statuses;
-  db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), num_keys,
-                mg_keys.data(), mg_values.data(), mg_statuses.data());
+  std::vector<PinnableSlice> values;
+  std::vector<Status> statuses;
+  MultiGet({"key1", "missing", "key2"}, /*snapshot=*/nullptr,
+           /*async=*/false, /*optimize_multiget_for_io=*/true, use_coroutine_,
+           values, statuses);
 
-  ASSERT_OK(mg_statuses[0]);
-  ASSERT_EQ(mg_values[0].ToString(), "pinned_val1");
-  ASSERT_TRUE(mg_values[0].IsPinned());
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "pinned_val1");
+  ASSERT_TRUE(values[0].IsPinned());
 
-  ASSERT_TRUE(mg_statuses[1].IsNotFound());
+  ASSERT_TRUE(statuses[1].IsNotFound());
 
-  ASSERT_OK(mg_statuses[2]);
-  ASSERT_EQ(mg_values[2].ToString(), "pinned_val2");
-  ASSERT_TRUE(mg_values[2].IsPinned());
+  ASSERT_OK(statuses[2]);
+  ASSERT_EQ(values[2].ToString(), "pinned_val2");
+  ASSERT_TRUE(values[2].IsPinned());
 
-  // Reset PinnableSlices to trigger cleanups
-  for (auto& v : mg_values) {
-    v.Reset();
+  for (PinnableSlice& value : values) {
+    value.Reset();
   }
   ASSERT_EQ(factory->last_reader()->pin_cleanup_count(), 4);
 
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
+
+#if USE_COROUTINES
+INSTANTIATE_TEST_CASE_P(SyncAndCoroutine, ExternalTablePointReadTest,
+                        testing::Bool());
+#else
+INSTANTIATE_TEST_CASE_P(SyncAndCoroutine, ExternalTablePointReadTest,
+                        testing::Values(false));
+#endif  // USE_COROUTINES
 
 TEST_F(ExternalTableTest, SstReaderPinnableMultiGetTest) {
   if (encrypted_env_) {
@@ -9225,8 +9178,7 @@ TEST_F(ExternalTableTest, ExternalFileChecksumTest) {
   ASSERT_OK(DestroyDB(dbname, options));
 
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/true);
+      std::make_shared<SimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
 
   // Create a file
@@ -9261,8 +9213,7 @@ TEST_F(ExternalTableTest, DBIterTest) {
   ASSERT_OK(DestroyDB(dbname, options));
 
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/true);
+      std::make_shared<SimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
 
   // Create a file
@@ -9318,8 +9269,7 @@ TEST_F(ExternalTableTest, ReadOptionsCustomContext) {
   ASSERT_OK(DestroyDB(dbname, options));
 
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/true);
+      std::make_shared<SimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
 
   std::unique_ptr<SstFileWriter> writer(
@@ -9346,13 +9296,13 @@ TEST_F(ExternalTableTest, ReadOptionsCustomContext) {
   int get_call_count = 0;
   int new_iterator_call_count = 0;
   SyncPoint::GetInstance()->SetCallBack(
-      "DummyExternalTableReader::Get", [&](void* arg) {
+      "SimpleExternalTableReader::Get", [&](void* arg) {
         ReadOptions* read_options = static_cast<ReadOptions*>(arg);
         EXPECT_EQ(read_options->custom_context, &get_context);
         ++get_call_count;
       });
   SyncPoint::GetInstance()->SetCallBack(
-      "DummyExternalTableReader::NewIterator", [&](void* arg) {
+      "SimpleExternalTableReader::NewIterator", [&](void* arg) {
         ReadOptions* read_options = static_cast<ReadOptions*>(arg);
         EXPECT_EQ(read_options->custom_context, &iterator_context);
         ++new_iterator_call_count;
@@ -9398,8 +9348,7 @@ TEST_F(ExternalTableTest, DBMultiScanTest) {
   ASSERT_OK(DestroyDB(dbname, options));
 
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/true);
+      std::make_shared<SimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
 
   // Create a file
@@ -9514,7 +9463,7 @@ TEST_F(ExternalTableTest, DBMultiScanTest) {
   iter.reset();
 
   SyncPoint::GetInstance()->SetCallBack(
-      "DummyExternalTableIterator::Constructor", [](void* arg) {
+      "SimpleExternalTableIterator::Constructor", [](void* arg) {
         Status* status = static_cast<Status*>(arg);
         *status = Status::IOError();
       });
@@ -9556,8 +9505,7 @@ TEST_F(ExternalTableTest, IngestionTest) {
   ASSERT_OK(DestroyDB(dbname, options));
 
   std::shared_ptr<ExternalTableFactory> factory =
-      std::make_shared<DummyExternalTableFactory>(
-          /*support_property_block=*/true);
+      std::make_shared<SimpleExternalTableFactory>();
   options.table_factory = NewExternalTableFactory(factory);
 
   // Create a file
@@ -9580,7 +9528,6 @@ TEST_F(ExternalTableTest, IngestionTest) {
   IngestExternalFileOptions ifo;
   ifo.allow_db_generated_files = false;
   ifo.fill_cache = false;
-  ifo.write_global_seqno = true;
   s = db->IngestExternalFile(cfh, {ingest_file}, ifo);
   ASSERT_OK(s);
 

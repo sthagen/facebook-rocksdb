@@ -30,6 +30,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/convenience.h"
 #include "table/format.h"
+#include "util/cast_util.h"
 #include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -61,6 +62,61 @@ int ValidateNumDbsFlags() {
       return ReturnValidationError(
           "--num_dbs > 1 incompatible with --test_multi_ops_txns");
     }
+  }
+  return 0;
+}
+
+int ValidateFileScopedWalWriteFaultFlags() {
+  if (!FLAGS_file_scope_wal_write_faults) {
+    return 0;
+  }
+  if (FLAGS_write_fault_one_in <= 0) {
+    return ReturnValidationError(
+        "--file_scope_wal_write_faults requires --write_fault_one_in > 0");
+  }
+  if (FLAGS_exclude_wal_from_write_fault_injection) {
+    return ReturnValidationError(
+        "--file_scope_wal_write_faults requires "
+        "--exclude_wal_from_write_fault_injection=false");
+  }
+  if (FLAGS_inject_error_severity != 1) {
+    return ReturnValidationError(
+        "--file_scope_wal_write_faults requires "
+        "--inject_error_severity=1");
+  }
+  if (FLAGS_test_batches_snapshots) {
+    return ReturnValidationError(
+        "--file_scope_wal_write_faults does not support "
+        "--test_batches_snapshots");
+  }
+  if (FLAGS_reopen > 0) {
+    return ReturnValidationError(
+        "--file_scope_wal_write_faults does not support --reopen > 0");
+  }
+  if (!FLAGS_options_file.empty()) {
+    return ReturnValidationError(
+        "--file_scope_wal_write_faults does not support --options_file");
+  }
+  if (FLAGS_sync_fault_injection || FLAGS_read_fault_one_in > 0 ||
+      FLAGS_metadata_read_fault_one_in > 0 ||
+      FLAGS_metadata_write_fault_one_in > 0 ||
+      FLAGS_open_read_fault_one_in > 0 || FLAGS_open_write_fault_one_in > 0 ||
+      FLAGS_open_metadata_read_fault_one_in > 0 ||
+      FLAGS_open_metadata_write_fault_one_in > 0 ||
+      FLAGS_secondary_cache_fault_one_in > 0) {
+    return ReturnValidationError(
+        "--file_scope_wal_write_faults requires all non-WAL fault injection "
+        "to be disabled");
+  }
+  if (FLAGS_disable_wal || FLAGS_manual_wal_flush_one_in > 0 || FLAGS_use_txn ||
+      FLAGS_two_write_queues || FLAGS_enable_pipelined_write ||
+      FLAGS_unordered_write || FLAGS_recycle_log_file_num != 0 ||
+      FLAGS_WAL_ttl_seconds != 0 || FLAGS_WAL_size_limit_MB != 0 ||
+      FLAGS_track_and_verify_wals || FLAGS_enable_blob_direct_write) {
+    return ReturnValidationError(
+        "--file_scope_wal_write_faults does not support disabled or manual "
+        "WALs, transactions, two write queues, pipelined or unordered "
+        "writes, WAL recycling, retention or tracking, or blob direct write");
   }
   return 0;
 }
@@ -121,6 +177,14 @@ int db_stress_tool(int argc, char** argv) {
   RegisterDbStressBdwFlagValidators();
   ParseCommandLineFlags(&argc, &argv, true);
 
+  if (FLAGS_wbm_flush_policy <
+          lossless_cast<int32_t>(WriteBufferFlushPolicy::kFlushOldest) ||
+      FLAGS_wbm_flush_policy >
+          lossless_cast<int32_t>(
+              WriteBufferFlushPolicy::kFlushLargestAcrossDBs)) {
+    return ReturnValidationError("--wbm_flush_policy must be 0, 1, or 2");
+  }
+
   SanitizeDoubleParam(&FLAGS_bloom_bits);
   SanitizeDoubleParam(&FLAGS_memtable_prefix_bloom_size_ratio);
   SanitizeDoubleParam(&FLAGS_max_bytes_for_level_multiplier);
@@ -178,6 +242,34 @@ int db_stress_tool(int argc, char** argv) {
     int rc = ValidateNumDbsFlags();
     if (rc != 0) {
       return rc;
+    }
+  }
+  {
+    int rc = ValidateFileScopedWalWriteFaultFlags();
+    if (rc != 0) {
+      return rc;
+    }
+  }
+
+  if (FLAGS_use_full_external_table) {
+    if (FLAGS_column_families != 1) {
+      return ReturnValidationError(
+          "use_full_external_table currently requires column_families=1");
+    }
+    if (FLAGS_user_timestamp_size > 0 || FLAGS_use_timed_put_one_in > 0) {
+      return ReturnValidationError(
+          "use_full_external_table does not support timestamped entries");
+    }
+    if (FLAGS_preclude_last_level_data_seconds != 0 ||
+        FLAGS_preserve_internal_time_seconds != 0) {
+      return ReturnValidationError(
+          "use_full_external_table does not support sequence-number time "
+          "tracking");
+    }
+    if (FLAGS_test_backward_scan ||
+        (FLAGS_use_multiscan && FLAGS_multiscan_reverse)) {
+      return ReturnValidationError(
+          "use_full_external_table does not support backward iteration");
     }
   }
 
@@ -628,8 +720,9 @@ int db_stress_tool(int argc, char** argv) {
   block_cache =
       StressTest::NewCache(FLAGS_cache_size, FLAGS_cache_numshardbits);
   if (FLAGS_use_write_buffer_manager) {
-    wbm = std::make_shared<WriteBufferManager>(FLAGS_db_write_buffer_size,
-                                               block_cache);
+    wbm = std::make_shared<WriteBufferManager>(
+        FLAGS_db_write_buffer_size, block_cache, false /* allow_stall */,
+        lossless_cast<WriteBufferFlushPolicy>(FLAGS_wbm_flush_policy));
   }
   if (FLAGS_rate_limiter_bytes_per_sec > 0) {
     rate_limiter.reset(NewGenericRateLimiter(

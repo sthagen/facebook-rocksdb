@@ -5350,10 +5350,10 @@ TEST_F(DBCompactionTest, LevelTtlCascadingCompactions) {
             *max_open_files = 2;
           });
       // In the case where all files are opened and doing DB restart
-      // forcing the oldest ancester time in manifest file to be 0 to
+      // forcing the oldest ancestor time in manifest file to be 0 to
       // simulate the case of reading from an old version.
       ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-          "VersionEdit::EncodeTo:VarintOldestAncesterTime", [&](void* arg) {
+          "VersionEdit::EncodeTo:VarintOldestAncestorTime", [&](void* arg) {
             if (if_restart && if_open_all_files) {
               std::string* encoded_field = static_cast<std::string*>(arg);
               *encoded_field = "";
@@ -5390,7 +5390,7 @@ TEST_F(DBCompactionTest, LevelTtlCascadingCompactions) {
       std::vector<std::vector<FileMetaData>> level_to_files;
       dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(),
                                       &level_to_files);
-      uint64_t oldest_time = level_to_files[0][0].oldest_ancester_time;
+      uint64_t oldest_time = level_to_files[0][0].oldest_ancestor_time;
       // Add 1 hour and do another flush.
       env_->MockSleepForSeconds(1 * 60 * 60);
       for (int i = 101; i <= 200; ++i) {
@@ -5458,7 +5458,7 @@ TEST_F(DBCompactionTest, LevelTtlCascadingCompactions) {
 
       dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(),
                                       &level_to_files);
-      ASSERT_EQ(oldest_time, level_to_files[6][0].oldest_ancester_time);
+      ASSERT_EQ(oldest_time, level_to_files[6][0].oldest_ancestor_time);
 
       env_->MockSleepForSeconds(25 * 60 * 60);
       ASSERT_OK(Put(Key(2), "1"));
@@ -5881,7 +5881,7 @@ TEST_F(DBCompactionTest, LevelPeriodicCompactionWithOldDB) {
           props->file_creation_time = 0;
         }
         if (set_creation_time_to_zero) {
-          props->creation_time = 0;
+          props->oldest_ancestor_time = 0;
         }
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
@@ -12417,7 +12417,7 @@ TEST_F(DBCompactionTest, RecordNewestKeyTimeForTtlCompaction) {
     ASSERT_EQ(newest_key_time, file_metadatas[idx]
                                    ->fd.pinned_reader.Get()
                                    ->GetTableProperties()
-                                   ->creation_time);
+                                   ->oldest_ancestor_time);
   }
   // The delta between the first and last newest_key_times is 15s
   uint64_t last_newest_key_time = prev_newest_key_time;
@@ -12436,14 +12436,14 @@ TEST_F(DBCompactionTest, RecordNewestKeyTimeForTtlCompaction) {
                 ->GetTableProperties()
                 ->newest_key_time,
             first_newest_key_time);
-  // Contrast newest_key_time with creation_time, which records the oldest
-  // ancestor time (15s older than newest_key_time)
+  // Contrast newest_key_time with oldest_ancestor_time (15s older than
+  // newest_key_time)
   ASSERT_EQ(file_metadatas[0]
                 ->fd.pinned_reader.Get()
                 ->GetTableProperties()
-                ->creation_time,
+                ->oldest_ancestor_time,
             last_newest_key_time);
-  ASSERT_EQ(file_metadatas[0]->oldest_ancester_time, last_newest_key_time);
+  ASSERT_EQ(file_metadatas[0]->oldest_ancestor_time, last_newest_key_time);
 
   // Make sure TTL of 5s causes compaction
   env_->MockSleepForSeconds(6);

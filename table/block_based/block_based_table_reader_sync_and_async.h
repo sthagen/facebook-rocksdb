@@ -752,6 +752,15 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
     CO_RETURN;
   }
 
+  if (options.read_tier == kBlockCacheTier) {
+    for (size_t i = 0; i < handles->size(); ++i) {
+      if (!(*handles)[i].IsNull()) {
+        statuses[i] = Status::Incomplete("no blocking io");
+      }
+    }
+    CO_RETURN;
+  }
+
   // In direct IO mode, blocks share the direct io buffer.
   // Otherwise, blocks share the scratch buffer.
   const bool use_shared_buffer = file->use_direct_io() || scratch != nullptr;
@@ -944,8 +953,8 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
           IODebugContext dbg;
           IOStatus io_s = file->PrepareIOOptions(options, opts, &dbg);
           opts.verify_and_reconstruct_read = true;
-          io_s = file->Read(opts, handle.offset(), BlockSizeWithTrailer(handle),
-                            &result, const_cast<char*>(data), nullptr, &dbg);
+          io_s = file->Read(handle.offset(), BlockSizeWithTrailer(handle), opts,
+                            &result, const_cast<char*>(data), &dbg);
           if (io_s.ok()) {
             assert(result.data() == data);
             assert(result.size() == BlockSizeWithTrailer(handle));
@@ -1040,7 +1049,15 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
     // disabled. (Limited options as element type is not default contructible.)
     std::vector<BlockCacheLookupContext> data_lookup_contexts;
     MultiGetContext::Mask reused_mask = 0;
-    char stack_buf[kMultiGetReadStackBufSize];
+#ifdef WITH_COROUTINES
+    // Coroutine mode allocates scratch on the heap, so allocate the required
+    // size when I/O is needed instead of embedding an 8 KiB buffer in the
+    // frame.
+    constexpr size_t kStackBufSize = 0;
+#else
+    constexpr size_t kStackBufSize = kMultiGetReadStackBufSize;
+#endif
+    std::array<char, kStackBufSize> stack_buf;
     std::unique_ptr<char[]> block_buf;
     if (block_cache_tracer_ && block_cache_tracer_->is_tracing_enabled()) {
       // Awkward because BlockCacheLookupContext is not CopyAssignable
@@ -1215,11 +1232,11 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
         //    alloc heap bufs
         // 2. If blocks are uncompressed, alloc heap bufs
         // 3. If blocks are compressed and no compressed block cache, use
-        //    stack buf
+        //    scratch storage
         if (!use_fs_scratch && !rep_->file->use_direct_io() &&
             rep_->decompressor) {
-          if (total_len <= kMultiGetReadStackBufSize) {
-            scratch = stack_buf;
+          if (total_len <= stack_buf.size()) {
+            scratch = stack_buf.data();
           } else {
             scratch = new char[total_len];
             block_buf.reset(scratch);
@@ -1321,6 +1338,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           // Update Saver.state to Found because we are only looking for
           // whether we can guarantee the key is not there with kBlockCacheTier
           get_context->MarkKeyMayExist();
+          s = biter->status();
           break;
         }
         if (!biter->status().ok()) {

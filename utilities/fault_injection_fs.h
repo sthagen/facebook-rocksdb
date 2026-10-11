@@ -44,6 +44,8 @@ namespace ROCKSDB_NAMESPACE {
 // A binary log that records injected errors directly to a file.
 // Thread-safe for concurrent writes. The log file can be flushed on exit or
 // from a signal handler so records survive clean exits and crash paths.
+// Disabled on big-endian platforms because the decoder expects little-endian
+// fields in the native Entry layout.
 class InjectedErrorLog {
  public:
   static constexpr size_t kMaxOpNameLen = 32;
@@ -90,8 +92,6 @@ class InjectedErrorLog {
 
   static_assert(sizeof(Entry) == 256,
                 "Injected error log entry size must stay stable");
-  static_assert(port::kLittleEndian,
-                "Injected error log requires little-endian platforms");
 
   explicit InjectedErrorLog(const std::string& path);
   ~InjectedErrorLog();
@@ -249,7 +249,7 @@ class TestFSWritableFile : public FSWritableFile {
                               std::unique_ptr<FSWritableFile>&& f,
                               FaultInjectionTestFS* fs,
                               bool reopened_for_write = false);
-  virtual ~TestFSWritableFile();
+  ~TestFSWritableFile() override;
   IOStatus Append(const Slice& data, const IOOptions&,
                   IODebugContext*) override;
   IOStatus Append(const Slice& data, const IOOptions& options,
@@ -305,7 +305,7 @@ class TestFSRandomRWFile : public FSRandomRWFile {
   explicit TestFSRandomRWFile(const std::string& fname,
                               std::unique_ptr<FSRandomRWFile>&& f,
                               FaultInjectionTestFS* fs);
-  virtual ~TestFSRandomRWFile();
+  ~TestFSRandomRWFile() override;
   IOStatus Write(uint64_t offset, const Slice& data, const IOOptions& options,
                  IODebugContext* dbg) override;
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
@@ -389,7 +389,7 @@ class TestFSDirectory : public FSDirectory {
   explicit TestFSDirectory(FaultInjectionTestFS* fs, std::string dirname,
                            FSDirectory* dir)
       : fs_(fs), dirname_(std::move(dirname)), dir_(dir) {}
-  ~TestFSDirectory() {}
+  ~TestFSDirectory() override {}
 
   IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override;
 
@@ -422,10 +422,12 @@ class FaultInjectionTestFS : public FileSystemWrapper {
             DeleteThreadLocalErrorContext),
         injected_thread_local_metadata_write_error_(
             DeleteThreadLocalErrorContext),
+        inject_file_scope_on_wal_write_error_(false),
+        inject_write_faults_only_on_wal_(false),
         ingest_data_corruption_before_write_(false),
         checksum_handoff_func_type_(kCRC32c),
         injected_error_log_(injected_error_log_path) {}
-  virtual ~FaultInjectionTestFS() override { fs_error_.PermitUncheckedError(); }
+  ~FaultInjectionTestFS() override { fs_error_.PermitUncheckedError(); }
 
   static const char* kClassName() { return "FaultInjectionTestFS"; }
   const char* Name() const override { return kClassName(); }
@@ -801,6 +803,21 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     file_types_excluded_from_fault_injection_ = types;
   }
 
+  // Marks injected WAL write errors as file-scoped so stress tests can
+  // exercise recovery that replaces an unusable WAL handle. Other injected
+  // write errors keep the default file-system scope.
+  void SetInjectFileScopeOnWALWriteError(bool enabled) {
+    inject_file_scope_on_wal_write_error_.store(enabled,
+                                                std::memory_order_relaxed);
+  }
+
+  // Restricts write fault injection to parsed WAL file names. This keeps the
+  // recovery flush and MANIFEST writes healthy in the dedicated stress mode.
+  void SetInjectWriteFaultsOnlyOnWAL(bool enabled) {
+    MutexLock l(&mutex_);
+    inject_write_faults_only_on_wal_ = enabled;
+  }
+
   void EnableThreadLocalErrorInjection(FaultInjectionIOType type) {
     ErrorContext* ctx = GetErrorContextFromFaultInjectionIOType(type);
     if (ctx) {
@@ -926,6 +943,8 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   ThreadLocalPtr injected_thread_local_write_error_;
   ThreadLocalPtr injected_thread_local_metadata_read_error_;
   ThreadLocalPtr injected_thread_local_metadata_write_error_;
+  std::atomic<bool> inject_file_scope_on_wal_write_error_;
+  bool inject_write_faults_only_on_wal_;
   bool ingest_data_corruption_before_write_;
   ChecksumType checksum_handoff_func_type_;
   bool fail_get_file_unique_id_ = false;
@@ -952,13 +971,18 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     FileType file_type = kTempFile;
     uint64_t file_number = 0;
     if (!TryParseFileName(file_name, &file_number, &file_type)) {
-      return false;
+      return type == FaultInjectionIOType::kWrite &&
+             inject_write_faults_only_on_wal_;
     }
     if (file_types_excluded_from_fault_injection_.count(file_type) > 0) {
       return true;
     }
     switch (type) {
       case FaultInjectionIOType::kWrite:
+        if (inject_write_faults_only_on_wal_ &&
+            file_type != FileType::kWalFile) {
+          return true;
+        }
         return file_types_excluded_from_write_fault_injection_.count(
                    file_type) > 0;
       case FaultInjectionIOType::kRead:
